@@ -136,10 +136,24 @@ async def _probe_codex(
                 "authenticated" if account_ok else "unavailable",
             ),
         )
-        await client.request("experimentalFeature/list", {})
-        results.append(DoctorCheck("codex_features", "ok", "available"))
-        await client.request("thread/realtime/listVoices", {})
-        results.append(DoctorCheck("codex_voices", "ok", "available"))
+        features = await client.request("experimentalFeature/list", {})
+        features_ok = _realtime_feature_available(features)
+        results.append(
+            DoctorCheck(
+                "codex_features",
+                "ok" if features_ok else "error",
+                "available" if features_ok else "unavailable",
+            ),
+        )
+        voices = await client.request("thread/realtime/listVoices", {})
+        voices_ok = _realtime_voices_available(voices)
+        results.append(
+            DoctorCheck(
+                "codex_voices",
+                "ok" if voices_ok else "error",
+                "available" if voices_ok else "unavailable",
+            ),
+        )
     except Exception:  # noqa: BLE001
         existing = {check.code for check in results}
         results.extend(
@@ -153,6 +167,34 @@ async def _probe_codex(
         except Exception as error:  # noqa: BLE001
             logger.warning("Doctor Codex cleanup failed (type=%s)", type(error).__name__)
     return results
+
+
+def _realtime_feature_available(response: object) -> bool:
+    if not isinstance(response, dict):
+        return False
+    features = response.get("data")
+    if not isinstance(features, list):
+        return False
+    return any(
+        isinstance(feature, dict)
+        and feature.get("name") == "realtime_conversation"
+        and feature.get("enabled") is True
+        for feature in features
+    )
+
+
+def _realtime_voices_available(response: object) -> bool:
+    if not isinstance(response, dict):
+        return False
+    voices = response.get("voices")
+    if not isinstance(voices, dict):
+        return False
+    return any(
+        isinstance(options, list)
+        and any(isinstance(voice, str) and bool(voice) for voice in options)
+        for version in ("v1", "v2")
+        if (options := voices.get(version)) is not None
+    )
 
 
 async def _probe_irodori(

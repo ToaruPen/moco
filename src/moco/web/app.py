@@ -202,17 +202,19 @@ class _BrowserConnection:
             await self._send_error("already_started")
             return
         await self._send_state(LifecycleState.CONNECTING)
+        synthesizer: WebSynthesizer | None = None
+        session: RealtimeSession | None = None
         try:
             synthesizer = self._synthesizer_factory()
             session = self._session_factory()
             health = await synthesizer.health()
             if not health.model_loaded:
-                await synthesizer.close()
-                await session.close()
+                await _close_start_resources(session, synthesizer)
                 await self._send_error("irodori_not_ready")
                 return
             answer = await session.start(message.sdp)
         except (OSError, RuntimeError) as error:
+            await _close_start_resources(session, synthesizer)
             _log_boundary_failure("conversation_start", error)
             safe_event(
                 logger,
@@ -224,10 +226,12 @@ class _BrowserConnection:
             await self._send_error("conversation_start_failed")
             return
 
-        self._synthesizer = synthesizer
-        self._session = session
+        ready_synthesizer = synthesizer
+        ready_session = session
+        self._synthesizer = ready_synthesizer
+        self._session = ready_session
         self._speech = SpeechQueue(
-            synthesizer,
+            ready_synthesizer,
             deliver=self._deliver_audio,
             max_chars=self._settings.speech.segment_max_chars,
         )
@@ -398,6 +402,7 @@ class _BrowserConnection:
                 "type": "state",
                 "state": state.value,
                 "hotkeys": {
+                    "enabled": self._settings.hotkeys.enabled,
                     "pushToTalk": self._settings.hotkeys.push_to_talk,
                     "cancel": self._settings.hotkeys.cancel,
                 },
@@ -514,3 +519,19 @@ def _log_boundary_failure(boundary: str, error: BaseException) -> None:
         boundary,
         type(error).__name__,
     )
+
+
+async def _close_start_resources(
+    session: RealtimeSession | None,
+    synthesizer: WebSynthesizer | None,
+) -> None:
+    for boundary, resource in (
+        ("realtime_start_cleanup", session),
+        ("irodori_start_cleanup", synthesizer),
+    ):
+        if resource is None:
+            continue
+        try:
+            await resource.close()
+        except Exception as error:  # noqa: BLE001
+            _log_boundary_failure(boundary, error)

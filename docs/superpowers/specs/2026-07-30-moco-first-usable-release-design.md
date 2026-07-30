@@ -5,8 +5,8 @@
 Deliver a public, production-shaped macOS agent that the user can launch and
 use for push-to-talk conversation today:
 
-- `F1` enables the microphone only while held.
-- `F2` immediately stops local capture, queued speech, and the current agent
+- The configured push-to-talk control enables the microphone only while held.
+- The configured cancel control immediately stops local capture, queued speech, and the current agent
   response or delegated Codex turn.
 - GPT-Live owns the conversation and may delegate work to Codex.
 - Assistant text is synthesized by Irodori on the existing Windows GPU host.
@@ -28,8 +28,8 @@ The previous design discussions established these user-visible decisions:
   extension point for replacing speech output with local Irodori audio.
 - The daemon remains alive while GPT-Live and Codex conversation sessions are
   short-lived.
-- `F1` is push-to-talk and may interrupt current speech.
-- `F2` cancels current activity without intentionally deleting conversation
+- Push-to-talk may interrupt current speech.
+- Cancel stops current activity without intentionally deleting conversation
   context.
 - Operationally adjustable values live in strictly validated YAML. Secrets do
   not live in YAML; YAML may name environment variables or OS-managed
@@ -75,7 +75,7 @@ duplicates already proven browser media behavior.
 ```text
 macOS launchd
   └─ moco runtime
-      ├─ global F1/F2 hotkey source
+      ├─ configurable global hotkey source
       ├─ local operator HTTP/WebSocket server
       ├─ conversation lifecycle controller
       ├─ Codex App Server adapter
@@ -109,7 +109,7 @@ starting external services.
 The initial schema contains:
 
 - server loopback host and port;
-- F1/F2 key bindings and whether global hotkeys are enabled;
+- push-to-talk/cancel key bindings and whether global hotkeys are enabled;
 - idle timeout;
 - ChatGPT.app Codex binary and working directory;
 - Irodori base URL, portable speaker name, synthesis parameters, timeout, and
@@ -130,7 +130,7 @@ Startup context is disabled; moco supplies a short speech-oriented developer
 prompt.
 
 The adapter consumes user/assistant transcripts and Realtime errors. It also
-tracks delegated turn identifiers so F2 can issue `turn/interrupt` where
+tracks delegated turn identifiers so cancel can issue `turn/interrupt` where
 possible. Realtime methods remain isolated behind a protocol so a future
 stable transport can replace them.
 
@@ -143,12 +143,12 @@ audio playback permission.
 After enablement:
 
 - the microphone track starts disabled;
-- F1 down stops current local playback, enables the track, and displays
+- push-to-talk down stops current local playback, enables the track, and displays
   `recording`;
-- F1 up disables the track and displays `working`;
+- push-to-talk up disables the track and displays `working`;
 - disabled WebRTC tracks continue sending silence, allowing server VAD to
   finalize the utterance;
-- F2 disables the track, clears pending/playing WAV audio, suppresses stale
+- cancel disables the track, clears pending/playing WAV audio, suppresses stale
   assistant speech, and requests cancellation from the backend;
 - the next completed user transcript ends cancellation suppression.
 
@@ -158,7 +158,7 @@ metrics. It does not persist transcript content.
 
 ### Hotkeys
 
-A process-local hotkey service listens for global F1/F2 events and broadcasts
+A process-local hotkey service listens for configured global key events and broadcasts
 typed control messages to the connected operator page. Duplicate key-down
 events caused by key repeat are ignored. Loss of the hotkey listener is
 reported as a degraded state; the page retains equivalent visible controls.
@@ -179,13 +179,13 @@ disabled → ready → connecting → listening/recording
                              → error
 ```
 
-Activity is refreshed by F1, finalized user input, assistant output, delegated
+Activity is refreshed by push-to-talk, finalized user input, assistant output, delegated
 work progress, synthesis, and playback. The idle timer runs only when no
 recording, delegated work, synthesis, or playback is active.
 
 On expiry, moco closes the Realtime session and ephemeral Codex thread
 connection but keeps the operator WebSocket and hotkey service alive. The next
-F1 creates a fresh media and conversation session. No prior transcript is
+Push-to-talk creates a fresh media and conversation session. No prior transcript is
 automatically injected.
 
 ### Irodori adapter
@@ -247,7 +247,7 @@ log directory. Uninstall removes only the exact moco LaunchAgent created by
 this CLI.
 
 The README presents one golden path: clone, sync, initialize YAML, set the
-Irodori Tailscale URL, run doctor, run moco, click enable once, then hold F1.
+Irodori Tailscale URL, run doctor, run moco, click enable once, then hold the configured push-to-talk key.
 
 ## Error Handling
 
@@ -270,12 +270,12 @@ boundary.
   hotkey de-duplication, cancellation suppression, transcript segmentation,
   response limits, and redaction.
 - Contract tests: fake Codex JSON-RPC process and fake Irodori HTTP server.
-- Browser tests: Node DOM/Web API fakes for F1 down/up, F2, idle restart, audio
+- Browser tests: Node DOM/Web API fakes for semantic controls, idle restart, audio
   generation invalidation, and WebRTC track enablement.
 - Integration test: fake Codex SDP/transcripts → fake Irodori WAV → browser
   WebSocket delivery.
 - Live doctor: real ChatGPT account/features/voices and real Irodori health.
-- Live acceptance: Chrome microphone, F1/F2, multi-turn conversation, idle
+- Live acceptance: Chrome microphone, a temporary F1/F2 feature-test mapping, multi-turn conversation, idle
   session renewal, Irodori playback, and a delegated Codex request.
 
 Normal CI never requires a real account, microphone, Tailscale, GPU, or
@@ -309,12 +309,12 @@ StackChan.
    file edits.
 2. `moco doctor` confirms the local Codex account/features and Windows Irodori
    readiness without exposing sensitive values.
-3. After one browser permission action, holding F1 records and releasing F1
+3. After one browser permission action, holding the configured push-to-talk key records and releasing it
    produces an Irodori-spoken GPT-Live response.
-4. F1 during playback stops old audio before accepting new speech.
-5. F2 stops capture and local output, invalidates stale synthesis, and sends
+4. Push-to-talk during playback stops old audio before accepting new speech.
+5. Cancel stops capture and local output, invalidates stale synthesis, and sends
    cancellation to active backend work.
-6. The configured idle timeout closes only the conversation; the next F1 starts
+6. The configured idle timeout closes only the conversation; the next push-to-talk starts
    a new conversation without restarting moco.
 7. Foreground terminal output shows safe state/latency/trace events without
    audio or transcript content.

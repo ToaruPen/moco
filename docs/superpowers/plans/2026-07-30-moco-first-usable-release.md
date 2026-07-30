@@ -6,7 +6,7 @@
 > checkbox (`- [ ]`) syntax for tracking.
 
 **Goal:** Ship a public macOS push-to-talk voice agent that uses Codex Realtime
-for conversation and work, Irodori for speech, F1/F2 global controls, an
+for conversation and work, Irodori for speech, configurable semantic controls, an
 idle-expiring conversation lifecycle, YAML configuration, safe telemetry, and
 launchd service controls.
 
@@ -46,7 +46,7 @@ src/moco/codex/session.py               thread-scoped Realtime adapter
 src/moco/speech/text.py                 transcript cleanup/segmentation
 src/moco/speech/irodori.py              bounded Irodori HTTP adapter
 src/moco/speech/queue.py                generation-aware synthesis queue
-src/moco/runtime/hotkeys.py             F1/F2 source and key de-duplication
+src/moco/runtime/hotkeys.py             configurable key source and de-duplication
 src/moco/runtime/lifecycle.py           activity/state/idle controller
 src/moco/runtime/telemetry.py           redacted logs and OpenTelemetry
 src/moco/service/launchd.py             exact user LaunchAgent management
@@ -179,7 +179,7 @@ def test_operator_server_must_bind_loopback(tmp_path: Path) -> None:
         load_config(path)
 ```
 
-Also cover positive timeouts, `F1 != F2`, absolute Codex/cwd paths, no URL
+Also cover positive timeouts, distinct control bindings, absolute Codex/cwd paths, no URL
 credentials, synthesis ranges, safe OTLP URL schemes, and default config path.
 
 - [ ] **Step 2: Verify RED**
@@ -393,7 +393,7 @@ Define typed controls `PTT_DOWN`, `PTT_UP`, and `CANCEL`. Tests must prove:
 
 - repeated OS key-down does not emit repeated PTT events;
 - key-up without a matching down is ignored;
-- F2 emits once per physical press;
+- cancel emits once per physical press;
 - activity during recording, active delegated work, synthesis, or playback
   prevents idle expiry;
 - idle expiry fires once after the configured duration;
@@ -422,7 +422,7 @@ Expected: imports fail for `moco.runtime`.
 - [ ] **Step 3: Implement pure logic, then pynput adapter**
 
 Keep `HotkeyMapper` independent of pynput so all behavior is deterministic.
-`GlobalHotkeyListener` converts `Key.f1`/`Key.f2` into canonical strings and
+`GlobalHotkeyListener` converts configured pynput keys into canonical strings and
 uses `loop.call_soon_threadsafe` to cross from the listener thread.
 
 `LifecycleController` uses an injected monotonic clock and async callback. It
@@ -466,14 +466,14 @@ generation invalidation, and cleanup.
 Add server tests for:
 
 - hotkey controls broadcast as `{"type":"control","control":"ptt_down"}`;
-- F2 calls both speech cancellation and Codex cancellation;
+- cancel calls both speech cancellation and Codex cancellation;
 - idle expiry closes the current call resources but keeps the WebSocket ready;
 - a subsequent start creates fresh Codex and Irodori adapters.
 
 Add JS tests:
 
 ```javascript
-it("enables the microphone only while F1 is held", async () => {
+it("enables the microphone only while push-to-talk is held", async () => {
   await controller.applyControl("ptt_down");
   expect(controller.stream.getAudioTracks()[0].enabled).toBe(true);
 
@@ -481,7 +481,7 @@ it("enables the microphone only while F1 is held", async () => {
   expect(controller.stream.getAudioTracks()[0].enabled).toBe(false);
 });
 
-it("F2 disables capture and invalidates old audio", async () => {
+it("cancel disables capture and invalidates old audio", async () => {
   const generation = controller.audioGeneration;
   await controller.applyControl("cancel");
 
@@ -704,7 +704,7 @@ uv run moco run
 ```
 
 Document the local Tailscale Irodori URL edit, Chrome microphone permission,
-macOS Input Monitoring permission, F1/F2 behavior, foreground first run,
+macOS Input Monitoring permission, configurable control behavior, foreground first run,
 launchd install, troubleshooting codes, Realtime experimental caveat, and
 privacy boundary.
 
@@ -735,7 +735,7 @@ git commit -m "ci: complete public repository quality gates"
 
 **Files:**
 
-- Create locally, ignored: `~/Library/Application Support/moco/config.yaml`
+- Create locally, ignored: `~/Library/Application Support/moco/moco.yaml`
 - Modify if needed: runtime code and tests discovered by live failures
 - Update: `README.md` troubleshooting only when evidence requires it
 
@@ -776,7 +776,7 @@ Run: `uv run moco run`
 
 Verify manually with the real browser/microphone:
 
-1. Click enable once and grant microphone access.
+1. Bind the feature-test profile to F1/F2, click enable once, and grant microphone access.
 2. Hold F1, say a short Japanese question, release F1.
 3. Hear only Irodori audio and see the current transcript.
 4. Hold F1 during speech and confirm old playback stops.

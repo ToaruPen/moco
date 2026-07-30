@@ -56,6 +56,16 @@ class FakeSynthesizer:
         self.closed = True
 
 
+class StartFailureError(RuntimeError):
+    """Synthetic realtime startup failure."""
+
+
+class FailingSession(FakeSession):
+    async def start(self, sdp: str) -> str:
+        del sdp
+        raise StartFailureError
+
+
 def websocket_context(
     client: TestClient,
     *,
@@ -102,7 +112,11 @@ def test_start_cancel_and_hotkey_broadcast() -> None:
     ):
         ready = socket.receive_json()
         assert ready["state"] == "ready"
-        assert ready["hotkeys"] == {"pushToTalk": "f1", "cancel": "f2"}
+        assert ready["hotkeys"] == {
+            "enabled": True,
+            "pushToTalk": "f1",
+            "cancel": "f2",
+        }
         socket.send_json({"type": "start", "sdp": "offer-sdp"})
         assert socket.receive_json()["state"] == "connecting"
         assert socket.receive_json() == {"type": "sdp_answer", "sdp": "answer-sdp"}
@@ -177,3 +191,28 @@ def test_only_one_operator_client_is_admitted() -> None:
         first.receive_json()
         message = second.receive_json()
         assert message["code"] == "single_operator_only"
+
+
+def test_failed_conversation_start_closes_partial_resources() -> None:
+    session = FailingSession()
+    synthesizer = FakeSynthesizer()
+    app = create_app(
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+        capability_token=CAPABILITY,
+    )
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        socket.receive_json()
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        assert socket.receive_json()["state"] == "connecting"
+        assert socket.receive_json() == {
+            "type": "error",
+            "code": "conversation_start_failed",
+        }
+
+    assert session.closed
+    assert synthesizer.closed

@@ -45,7 +45,7 @@ class SpeechQueue:
         self._suppressed = False
         self._assistant_has_streamed = False
         self._worker: asyncio.Task[None] | None = None
-        self._active: asyncio.Task[bytes] | None = None
+        self._active: asyncio.Task[None] | None = None
         self._busy = False
         self._closed = False
         self._error_codes: list[str] = []
@@ -151,33 +151,54 @@ class SpeechQueue:
                 item = self._items.popleft()
                 self._busy = True
                 self._active = asyncio.create_task(
-                    self._synthesizer.synthesize(item.text),
-                    name="moco-synthesis",
+                    self._process_item(item),
+                    name="moco-speech-delivery",
                 )
                 active = self._active
 
-            wav: bytes | None = None
             try:
-                wav = await active
+                await active
             except asyncio.CancelledError:
-                wav = None
-            except IrodoriError as error:
-                self._error_codes.append(error.code)
-                safe_event(
-                    logger,
-                    "synthesis_failed",
-                    component="speech",
-                    boundary="irodori_http",
-                    event_code=error.code,
-                    result="error",
-                )
+                continue
+            finally:
+                async with self._condition:
+                    if self._active is active:
+                        self._active = None
+                    self._busy = False
+                    self._condition.notify_all()
 
-            if wav is not None and item.generation == self._generation:
-                result = self._deliver(wav)
-                if inspect.isawaitable(result):
-                    await cast("Awaitable[object]", result)
+    async def _process_item(self, item: _SpeechItem) -> None:
+        try:
+            wav = await self._synthesizer.synthesize(item.text)
+        except asyncio.CancelledError:
+            raise
+        except IrodoriError as error:
+            self._error_codes.append(error.code)
+            safe_event(
+                logger,
+                "synthesis_failed",
+                component="speech",
+                boundary="irodori_http",
+                event_code=error.code,
+                result="error",
+            )
+            return
 
-            async with self._condition:
-                self._active = None
-                self._busy = False
-                self._condition.notify_all()
+        if item.generation != self._generation:
+            return
+        try:
+            result = self._deliver(wav)
+            if inspect.isawaitable(result):
+                await cast("Awaitable[object]", result)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001
+            self._error_codes.append("audio_delivery_failed")
+            safe_event(
+                logger,
+                "audio_delivery_failed",
+                component="speech",
+                boundary="browser_audio",
+                event_code="audio_delivery_failed",
+                result="error",
+            )

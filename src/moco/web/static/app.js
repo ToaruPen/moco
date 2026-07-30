@@ -1,5 +1,7 @@
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
+const ICE_GATHERING_TIMEOUT_MS = 10_000;
+const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
 
 export class AudioPlaybackQueue {
   constructor(context, onState) {
@@ -58,6 +60,51 @@ export class AudioPlaybackQueue {
     this.sources.clear();
     this.nextStart = this.context.currentTime;
     this.onState(false);
+  }
+}
+
+export class BrowserHotkeyMapper {
+  constructor({ globalHotkeysEnabled, pttKey, cancelKey }) {
+    this.configure({ globalHotkeysEnabled, pttKey, cancelKey });
+  }
+
+  configure({ globalHotkeysEnabled, pttKey, cancelKey }) {
+    const canonicalPtt = pttKey.toLowerCase();
+    const canonicalCancel = cancelKey.toLowerCase();
+    const changed =
+      this.globalHotkeysEnabled !== globalHotkeysEnabled ||
+      this.pttKey !== canonicalPtt ||
+      this.cancelKey !== canonicalCancel;
+    this.globalHotkeysEnabled = globalHotkeysEnabled;
+    this.pttKey = canonicalPtt;
+    this.cancelKey = canonicalCancel;
+    if (changed) {
+      this.pressed = new Set();
+    }
+  }
+
+  handles(key) {
+    const canonical = key.toLowerCase();
+    return (
+      !this.globalHotkeysEnabled && (canonical === this.pttKey || canonical === this.cancelKey)
+    );
+  }
+
+  keyDown(key) {
+    const canonical = key.toLowerCase();
+    if (!this.handles(canonical) || this.pressed.has(canonical)) {
+      return null;
+    }
+    this.pressed.add(canonical);
+    return canonical === this.pttKey ? "ptt_down" : "cancel";
+  }
+
+  keyUp(key) {
+    const canonical = key.toLowerCase();
+    if (!this.handles(canonical) || !this.pressed.delete(canonical)) {
+      return null;
+    }
+    return canonical === this.pttKey ? "ptt_up" : null;
   }
 }
 
@@ -157,19 +204,64 @@ class TranscriptView {
   }
 }
 
-function waitForIce(peer) {
+function namedError(code) {
+  const error = new Error(code);
+  error.name = code;
+  return error;
+}
+
+export function waitForIce(peer, { timeoutMs = ICE_GATHERING_TIMEOUT_MS } = {}) {
   if (peer.iceGatheringState === "complete") {
     return Promise.resolve();
   }
-  return new Promise((resolve) => {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      peer.removeEventListener("icegatheringstatechange", listener);
+    };
     const listener = () => {
       if (peer.iceGatheringState === "complete") {
-        peer.removeEventListener("icegatheringstatechange", listener);
+        cleanup();
         resolve();
       }
     };
+    const timer = setTimeout(() => {
+      cleanup();
+      reject(namedError("ice_gathering_timeout"));
+    }, timeoutMs);
     peer.addEventListener("icegatheringstatechange", listener);
   });
+}
+
+export function waitForSocketOpen(socket, { timeoutMs = WEBSOCKET_OPEN_TIMEOUT_MS } = {}) {
+  return new Promise((resolve, reject) => {
+    const cleanup = () => {
+      clearTimeout(timer);
+      socket.removeEventListener("open", opened);
+      socket.removeEventListener("error", failed);
+      socket.removeEventListener("close", closed);
+    };
+    const opened = () => {
+      cleanup();
+      resolve();
+    };
+    const fail = (code) => {
+      cleanup();
+      reject(namedError(code));
+    };
+    const failed = () => fail("websocket_failed");
+    const closed = () => fail("websocket_closed_before_open");
+    const timer = setTimeout(() => fail("websocket_open_timeout"), timeoutMs);
+    socket.addEventListener("open", opened, { once: true });
+    socket.addEventListener("error", failed, { once: true });
+    socket.addEventListener("close", closed, { once: true });
+  });
+}
+
+export async function closeAudioContext(context) {
+  if (context && context.state !== "closed") {
+    await context.close();
+  }
 }
 
 function boot() {
@@ -197,8 +289,11 @@ function boot() {
   let context;
   let controller;
   let openPromise;
-  let pttKey = null;
-  let cancelKey = null;
+  const hotkeyMapper = new BrowserHotkeyMapper({
+    globalHotkeysEnabled: true,
+    pttKey: "",
+    cancelKey: "",
+  });
 
   const showError = (code) => {
     dom.error.hidden = false;
@@ -215,54 +310,55 @@ function boot() {
     if (openPromise) {
       return openPromise;
     }
-    openPromise = new Promise((resolve, reject) => {
-      const url = new URL("/ws", window.location.href);
-      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-      socket = new WebSocket(url, [WEBSOCKET_PROTOCOL, `${CAPABILITY_PREFIX}${capability}`]);
-      socket.binaryType = "arraybuffer";
-      socket.addEventListener(
-        "open",
-        () => {
-          dom.connection.textContent = "SOCKET ONLINE";
-          resolve();
-        },
-        { once: true },
-      );
-      socket.addEventListener("error", () => reject(new Error("websocket_failed")), {
-        once: true,
-      });
-      socket.addEventListener("close", () => {
-        dom.connection.textContent = "SOCKET OFFLINE";
-        openPromise = null;
-      });
-      socket.addEventListener("message", async (event) => {
-        if (typeof event.data !== "string") {
-          controller?.consumeAudio(event.data);
-          return;
-        }
-        const message = JSON.parse(event.data);
-        if (message.type === "state") {
-          dom.state.textContent = message.state.toUpperCase();
-          controller.idleExpired = message.state === "idle_expired";
-          pttKey = message.hotkeys.pushToTalk.toLowerCase();
-          cancelKey = message.hotkeys.cancel.toLowerCase();
-          dom.pttKey.textContent = pttKey.toUpperCase();
-          dom.cancelKey.textContent = cancelKey.toUpperCase();
-        } else if (message.type === "sdp_answer") {
-          await peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
-        } else if (message.type === "control") {
-          await controller.applyControl(message.control);
-        } else if (message.type === "audio") {
-          controller.acceptAudio(message);
-        } else if (message.type === "audio_invalidate") {
-          controller.invalidateAudio(message.generation);
-        } else if (message.type === "transcript") {
-          transcript.append(message.role, message.delta, message.done);
-        } else if (message.type === "error") {
-          showError(message.code);
-        }
-      });
+    const url = new URL("/ws", window.location.href);
+    url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+    socket = new WebSocket(url, [WEBSOCKET_PROTOCOL, `${CAPABILITY_PREFIX}${capability}`]);
+    socket.binaryType = "arraybuffer";
+    socket.addEventListener("close", () => {
+      dom.connection.textContent = "SOCKET OFFLINE";
+      openPromise = null;
     });
+    socket.addEventListener("message", async (event) => {
+      if (typeof event.data !== "string") {
+        controller?.consumeAudio(event.data);
+        return;
+      }
+      const message = JSON.parse(event.data);
+      if (message.type === "state") {
+        dom.state.textContent = message.state.toUpperCase();
+        controller.idleExpired = message.state === "idle_expired";
+        const pttKey = message.hotkeys.pushToTalk.toLowerCase();
+        const cancelKey = message.hotkeys.cancel.toLowerCase();
+        hotkeyMapper.configure({
+          globalHotkeysEnabled: message.hotkeys.enabled,
+          pttKey,
+          cancelKey,
+        });
+        dom.pttKey.textContent = pttKey.toUpperCase();
+        dom.cancelKey.textContent = cancelKey.toUpperCase();
+      } else if (message.type === "sdp_answer") {
+        await peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
+      } else if (message.type === "control") {
+        await controller.applyControl(message.control);
+      } else if (message.type === "audio") {
+        controller.acceptAudio(message);
+      } else if (message.type === "audio_invalidate") {
+        controller.invalidateAudio(message.generation);
+      } else if (message.type === "transcript") {
+        transcript.append(message.role, message.delta, message.done);
+      } else if (message.type === "error") {
+        showError(message.code);
+      }
+    });
+    openPromise = waitForSocketOpen(socket)
+      .then(() => {
+        dom.connection.textContent = "SOCKET ONLINE";
+      })
+      .catch((error) => {
+        openPromise = null;
+        socket.close();
+        throw error;
+      });
     return openPromise;
   };
 
@@ -299,6 +395,17 @@ function boot() {
       dom.cancel.disabled = false;
       dom.enable.textContent = "音声卓は有効です";
     } catch (error) {
+      peer?.close();
+      socket?.close();
+      for (const track of stream?.getTracks() ?? []) {
+        track.stop();
+      }
+      await closeAudioContext(context);
+      peer = undefined;
+      socket = undefined;
+      stream = undefined;
+      context = undefined;
+      controller = undefined;
       showError(error.name || "enable_failed");
       dom.enable.disabled = false;
     }
@@ -312,24 +419,22 @@ function boot() {
     await controller.applyControl(control);
   };
 
-  const pressed = new Set();
   window.addEventListener("keydown", (event) => {
-    const key = event.key.toLowerCase();
-    if (pressed.has(key)) {
-      return;
-    }
-    if (key === pttKey || key === cancelKey) {
+    if (hotkeyMapper.handles(event.key)) {
       event.preventDefault();
-      pressed.add(key);
-      void apply(key === pttKey ? "ptt_down" : "cancel");
+      const control = hotkeyMapper.keyDown(event.key);
+      if (control !== null) {
+        void apply(control);
+      }
     }
   });
   window.addEventListener("keyup", (event) => {
-    const key = event.key.toLowerCase();
-    pressed.delete(key);
-    if (key === pttKey) {
+    if (hotkeyMapper.handles(event.key)) {
       event.preventDefault();
-      void apply("ptt_up");
+      const control = hotkeyMapper.keyUp(event.key);
+      if (control !== null) {
+        void apply(control);
+      }
     }
   });
   dom.ptt.addEventListener("pointerdown", () => void apply("ptt_down"));
