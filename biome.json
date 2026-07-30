@@ -1,12 +1,7 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.5.6/schema.json",
   "files": {
-    "includes": [
-      "package.json",
-      "src/moco/web/static/**/*.js",
-      "tests/js/**/*.js",
-      "!!.worktrees"
-    ]
+    "includes": ["package.json", "src/moco/web/static/**/*.js", "tests/js/**/*.js", "!!.worktrees"]
   },
   "formatter": {
     "enabled": true,

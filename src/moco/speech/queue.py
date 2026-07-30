@@ -52,6 +52,10 @@ class SpeechQueue:
         return len(self._items)
 
     @property
+    def is_busy(self) -> bool:
+        return self._busy or bool(self._items)
+
+    @property
     def pending_texts(self) -> tuple[str, ...]:
         return tuple(item.text for item in self._items)
 
