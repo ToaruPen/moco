@@ -100,7 +100,9 @@ def test_start_cancel_and_hotkey_broadcast() -> None:
         TestClient(app, base_url="http://127.0.0.1:8765") as client,
         websocket_context(client) as socket,
     ):
-        assert socket.receive_json()["state"] == "ready"
+        ready = socket.receive_json()
+        assert ready["state"] == "ready"
+        assert ready["hotkeys"] == {"pushToTalk": "f1", "cancel": "f2"}
         socket.send_json({"type": "start", "sdp": "offer-sdp"})
         assert socket.receive_json()["state"] == "connecting"
         assert socket.receive_json() == {"type": "sdp_answer", "sdp": "answer-sdp"}

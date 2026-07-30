@@ -178,7 +178,9 @@ function boot() {
     state: document.querySelector("#state"),
     connection: document.querySelector("#connection"),
     ptt: document.querySelector("#ptt"),
+    pttKey: document.querySelector("#ptt-key"),
     cancel: document.querySelector("#cancel"),
+    cancelKey: document.querySelector("#cancel-key"),
     error: document.querySelector("#error"),
     transcript: document.querySelector("#transcript"),
     clear: document.querySelector("#clear"),
@@ -195,6 +197,8 @@ function boot() {
   let context;
   let controller;
   let openPromise;
+  let pttKey = null;
+  let cancelKey = null;
 
   const showError = (code) => {
     dom.error.hidden = false;
@@ -240,6 +244,10 @@ function boot() {
         if (message.type === "state") {
           dom.state.textContent = message.state.toUpperCase();
           controller.idleExpired = message.state === "idle_expired";
+          pttKey = message.hotkeys.pushToTalk.toLowerCase();
+          cancelKey = message.hotkeys.cancel.toLowerCase();
+          dom.pttKey.textContent = pttKey.toUpperCase();
+          dom.cancelKey.textContent = cancelKey.toUpperCase();
         } else if (message.type === "sdp_answer") {
           await peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
         } else if (message.type === "control") {
@@ -310,16 +318,16 @@ function boot() {
     if (pressed.has(key)) {
       return;
     }
-    if (key === "f1" || key === "f2") {
+    if (key === pttKey || key === cancelKey) {
       event.preventDefault();
       pressed.add(key);
-      void apply(key === "f1" ? "ptt_down" : "cancel");
+      void apply(key === pttKey ? "ptt_down" : "cancel");
     }
   });
   window.addEventListener("keyup", (event) => {
     const key = event.key.toLowerCase();
     pressed.delete(key);
-    if (key === "f1") {
+    if (key === pttKey) {
       event.preventDefault();
       void apply("ptt_up");
     }

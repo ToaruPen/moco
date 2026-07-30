@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import asyncio
 import inspect
+import logging
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import Literal, Protocol, cast
 
+from moco.runtime.telemetry import safe_event
 from moco.speech.irodori import IrodoriError
 from moco.speech.text import TranscriptSegmenter
 
 type TranscriptRole = Literal["assistant", "user"]
 type Delivery = Callable[[bytes], object | Awaitable[object]]
+logger = logging.getLogger(__name__)
 
 
 class Synthesizer(Protocol):
@@ -96,6 +99,13 @@ class SpeechQueue:
         await self._enqueue(segments)
 
     async def cancel(self) -> None:
+        safe_event(
+            logger,
+            "speech_cancelled",
+            component="speech",
+            control="cancel",
+            state="cancelling",
+        )
         async with self._condition:
             self._generation += 1
             self._suppressed = True
@@ -153,6 +163,14 @@ class SpeechQueue:
                 pass
             except IrodoriError as error:
                 self._error_codes.append(error.code)
+                safe_event(
+                    logger,
+                    "synthesis_failed",
+                    component="speech",
+                    boundary="irodori_http",
+                    event_code=error.code,
+                    result="error",
+                )
 
             if wav is not None and item.generation == self._generation:
                 result = self._deliver(wav)

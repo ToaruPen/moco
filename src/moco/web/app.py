@@ -23,6 +23,7 @@ from moco.codex.session import (
 )
 from moco.config import MocoSettings
 from moco.runtime.lifecycle import BusyKind, LifecycleController, LifecycleState
+from moco.runtime.telemetry import safe_event
 from moco.speech.irodori import IrodoriSynthesizer
 from moco.speech.queue import SpeechQueue
 from moco.speech.text import strip_control_emojis
@@ -132,6 +133,12 @@ class _BrowserConnection:
         )
 
     async def run(self) -> None:
+        safe_event(
+            logger,
+            "operator_connected",
+            component="web",
+            state="ready",
+        )
         await self._send_state(LifecycleState.READY)
         self._idle_task = asyncio.create_task(self._idle_loop(), name="moco-idle-loop")
         try:
@@ -159,6 +166,12 @@ class _BrowserConnection:
                 await idle_task
         await self._close_conversation_resources()
         self._lifecycle.disable()
+        safe_event(
+            logger,
+            "operator_disconnected",
+            component="web",
+            state="disabled",
+        )
 
     async def _handle(self, payload: str) -> bool:
         try:
@@ -201,6 +214,13 @@ class _BrowserConnection:
             answer = await session.start(message.sdp)
         except (OSError, RuntimeError) as error:
             _log_boundary_failure("conversation_start", error)
+            safe_event(
+                logger,
+                "conversation_start_failed",
+                component="web",
+                event_code="conversation_start_failed",
+                result="error",
+            )
             await self._send_error("conversation_start_failed")
             return
 
@@ -219,8 +239,21 @@ class _BrowserConnection:
             self._consume_notifications(),
             name="moco-realtime-events",
         )
+        safe_event(
+            logger,
+            "conversation_ready",
+            component="web",
+            state="ready",
+            result="ok",
+        )
 
     async def _apply_control(self, control: ClientControl) -> None:
+        safe_event(
+            logger,
+            "control_received",
+            component="web",
+            control=control.value,
+        )
         if control is ClientControl.PTT_DOWN:
             if self._session is None:
                 await self._send_error("conversation_not_started")
@@ -329,6 +362,12 @@ class _BrowserConnection:
     async def _expire_conversation(self) -> None:
         await self._close_conversation_resources()
         await self._send_state(LifecycleState.IDLE_EXPIRED)
+        safe_event(
+            logger,
+            "conversation_expired",
+            component="runtime",
+            state="idle_expired",
+        )
 
     async def _close_conversation_resources(self) -> None:
         async with self._resource_lock:
@@ -359,7 +398,16 @@ class _BrowserConnection:
                 await synthesizer.close()
 
     async def _send_state(self, state: LifecycleState) -> None:
-        await self._send_json({"type": "state", "state": state.value})
+        await self._send_json(
+            {
+                "type": "state",
+                "state": state.value,
+                "hotkeys": {
+                    "pushToTalk": self._settings.hotkeys.push_to_talk,
+                    "cancel": self._settings.hotkeys.cancel,
+                },
+            },
+        )
 
     async def _send_error(self, code: str) -> None:
         await self._send_json({"type": "error", "code": code})

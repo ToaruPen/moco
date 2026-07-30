@@ -44,3 +44,14 @@ def test_unconfigured_keys_are_ignored() -> None:
     mapper.key_up("f3")
 
     assert emitted == []
+
+
+def test_bindings_are_not_coupled_to_function_key_defaults() -> None:
+    emitted: list[Control] = []
+    mapper = HotkeyMapper(ptt_key="space", cancel_key="escape", emit=emitted.append)
+
+    mapper.key_down("space")
+    mapper.key_up("space")
+    mapper.key_down("escape")
+
+    assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]

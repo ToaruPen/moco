@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from moco.errors import CodexRpcError, CodexRpcTimeoutError
+from moco.runtime.telemetry import safe_event
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
@@ -24,6 +26,7 @@ type TranscriptKind = Literal["delta", "done"]
 type TranscriptRole = Literal["assistant", "user"]
 
 _EVENTS_END = object()
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True, slots=True)
@@ -151,6 +154,13 @@ class CodexRealtimeSession:
                 },
             )
             self._realtime_started = True
+            safe_event(
+                logger,
+                "conversation_started",
+                component="codex",
+                boundary="codex_stdio",
+                state="ready",
+            )
             try:
                 return await asyncio.wait_for(
                     asyncio.shield(self._sdp_future),
@@ -179,6 +189,13 @@ class CodexRealtimeSession:
     async def cancel_current(self) -> None:
         if self._thread_id is None or not self._realtime_started:
             return
+        safe_event(
+            logger,
+            "conversation_cancelled",
+            component="codex",
+            control="cancel",
+            state="cancelling",
+        )
         if self._active_turn_id is not None:
             await self._rpc.request(
                 "turn/interrupt",
@@ -217,6 +234,12 @@ class CodexRealtimeSession:
             await self._finish_notification_task()
             self._closed = True
             self._end_events()
+            safe_event(
+                logger,
+                "conversation_closed",
+                component="codex",
+                state="ready",
+            )
             if stop_error is not None:
                 raise stop_error
 
