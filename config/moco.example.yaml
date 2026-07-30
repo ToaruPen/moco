@@ -1,0 +1,41 @@
+# moco configuration. Unknown keys are rejected.
+server:
+  # The operator server is intentionally loopback-only.
+  host: 127.0.0.1
+  port: 8765
+
+hotkeys:
+  enabled: true
+  push_to_talk: f1
+  cancel: f2
+
+runtime:
+  # Close only the conversation after five inactive minutes.
+  idle_timeout_seconds: 300
+
+codex:
+  binary: /Applications/ChatGPT.app/Contents/Resources/codex
+  working_directory: /Users/your-name
+
+irodori:
+  # Replace with the Windows host's Tailscale URL for normal use.
+  base_url: http://127.0.0.1:8923
+  # Portable speaker name; null uses the Irodori server default.
+  speaker: null
+  num_steps: 24
+  duration_scale: 1.0
+  cfg_scale_text: 3.0
+  cfg_scale_speaker: 5.0
+  timeout_seconds: 30
+  max_wav_bytes: 33554432
+
+speech:
+  segment_max_chars: 80
+  vad_threshold: 0.04
+  vad_hold_ms: 120
+
+telemetry:
+  console: true
+  # Optional HTTP(S) OpenTelemetry collector endpoint.
+  otlp_endpoint: null
+  service_name: moco
