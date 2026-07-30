@@ -192,11 +192,17 @@ async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
         ),
     )
     listener = GlobalHotkeyListener(loop=loop, mapper=mapper)
+    global_hotkeys_active = False
     if settings.hotkeys.enabled:
         try:
             listener.start()
         except (OSError, RuntimeError):
+            global_hotkeys_active = False
+        else:
+            global_hotkeys_active = listener.running
+        if not global_hotkeys_active:
             typer.echo("WARN [hotkeys]: Input Monitoring permission may be required")
+    operator_app.state.global_hotkeys_active = global_hotkeys_active
 
     server = uvicorn.Server(
         uvicorn.Config(

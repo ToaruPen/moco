@@ -247,7 +247,8 @@ class FakeTelemetry:
 
 
 class FakeHotkeyListener:
-    def __init__(self, **_kwargs: object) -> None:
+    def __init__(self, *, running: bool = False, **_kwargs: object) -> None:
+        self.running = running
         self.stopped = False
 
     def start(self) -> None:
@@ -312,6 +313,36 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     assert telemetry.closed
     assert listener.stopped
     assert not state_path.exists()
+
+
+async def test_runtime_enables_browser_fallback_when_global_listener_is_denied(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    operator_app = SimpleNamespace(
+        state=SimpleNamespace(
+            control_hub=SimpleNamespace(publish=lambda _control: None),
+            global_hotkeys_active=True,
+        ),
+    )
+    listener = FakeHotkeyListener(running=False)
+    server = FakeServer()
+
+    monkeypatch.setattr(cli, "configure_telemetry", lambda _settings: FakeTelemetry())
+    monkeypatch.setattr(
+        cli,
+        "create_app",
+        lambda *_args, **_kwargs: operator_app,
+    )
+    monkeypatch.setattr(cli, "GlobalHotkeyListener", lambda **_kwargs: listener)
+    monkeypatch.setattr(uvicorn, "Config", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(uvicorn, "Server", lambda _config: server)
+
+    await _run_runtime(MocoSettings(), state_path=tmp_path / "runtime.json")
+
+    assert operator_app.state.global_hotkeys_active is False
+    assert "Input Monitoring permission may be required" in capsys.readouterr().out
 
 
 def test_remove_state_file_is_idempotent(tmp_path: Path) -> None:

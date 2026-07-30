@@ -82,10 +82,14 @@ class FakeListener:
         self.on_release = on_release
         self.running = False
         self.stopped = False
+        self.waited = False
         self.instances.append(self)
 
     def start(self) -> None:
         self.running = True
+
+    def wait(self) -> None:
+        self.waited = True
 
     def stop(self) -> None:
         self.running = False
@@ -120,9 +124,33 @@ def test_global_listener_maps_named_and_character_keys(
 
     assert listener.running
     assert len(FakeListener.instances) == 1
+    assert backend.waited
     assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]
 
     listener.stop()
     listener.stop()
     assert backend.stopped
+    assert not listener.running
+
+
+class DeniedListener(FakeListener):
+    IS_TRUSTED = False
+
+
+def test_global_listener_reports_denied_platform_trust(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    DeniedListener.instances.clear()
+    monkeypatch.setattr(keyboard, "Listener", DeniedListener)
+    listener = GlobalHotkeyListener(
+        loop=cast("asyncio.AbstractEventLoop", ImmediateLoop()),
+        mapper=HotkeyMapper(
+            ptt_key="v",
+            cancel_key="escape",
+            emit=lambda _control: None,
+        ),
+    )
+
+    listener.start()
+
     assert not listener.running

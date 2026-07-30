@@ -63,7 +63,11 @@ class GlobalHotkeyListener:
     @property
     def running(self) -> bool:
         listener = self._listener
-        return listener is not None and listener.running
+        return (
+            listener is not None
+            and listener.running
+            and bool(getattr(listener, "IS_TRUSTED", True))
+        )
 
     def start(self) -> None:
         if self._listener is not None:
@@ -73,6 +77,7 @@ class GlobalHotkeyListener:
             on_release=self._on_release,
         )
         self._listener.start()
+        self._listener.wait()
 
     def stop(self) -> None:
         listener = self._listener

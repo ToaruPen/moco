@@ -193,6 +193,21 @@ def test_only_one_operator_client_is_admitted() -> None:
         assert message["code"] == "single_operator_only"
 
 
+def test_browser_keyboard_fallback_is_advertised_when_global_listener_is_inactive() -> None:
+    app = create_app(
+        global_hotkeys_active=False,
+        capability_token=CAPABILITY,
+    )
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        ready = socket.receive_json()
+
+    assert ready["hotkeys"]["enabled"] is False
+
+
 def test_failed_conversation_start_closes_partial_resources() -> None:
     session = FailingSession()
     synthesizer = FakeSynthesizer()

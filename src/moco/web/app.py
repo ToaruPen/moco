@@ -106,11 +106,13 @@ class _BrowserConnection:
         websocket: WebSocket,
         *,
         settings: MocoSettings,
+        global_hotkeys_active: bool,
         session_factory: SessionFactory,
         synthesizer_factory: SynthesizerFactory,
     ) -> None:
         self._websocket = websocket
         self._settings = settings
+        self._global_hotkeys_active = global_hotkeys_active
         self._session_factory = session_factory
         self._synthesizer_factory = synthesizer_factory
         self._session: RealtimeSession | None = None
@@ -402,7 +404,7 @@ class _BrowserConnection:
                 "type": "state",
                 "state": state.value,
                 "hotkeys": {
-                    "enabled": self._settings.hotkeys.enabled,
+                    "enabled": self._global_hotkeys_active,
                     "pushToTalk": self._settings.hotkeys.push_to_talk,
                     "cancel": self._settings.hotkeys.cancel,
                 },
@@ -423,6 +425,7 @@ def create_app(
     session_factory: SessionFactory | None = None,
     synthesizer_factory: SynthesizerFactory | None = None,
     capability_token: str | None = None,
+    global_hotkeys_active: bool | None = None,
 ) -> FastAPI:
     resolved = settings or MocoSettings()
     build_session = session_factory or _codex_session_factory(resolved)
@@ -434,6 +437,9 @@ def create_app(
     app = FastAPI(title="moco", docs_url=None, redoc_url=None)
     app.state.capability_token = capability_token or secrets.token_urlsafe(32)
     app.state.control_hub = control_hub
+    app.state.global_hotkeys_active = (
+        resolved.hotkeys.enabled if global_hotkeys_active is None else global_hotkeys_active
+    )
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
@@ -452,6 +458,7 @@ def create_app(
         connection = _BrowserConnection(
             websocket,
             settings=resolved,
+            global_hotkeys_active=app.state.global_hotkeys_active,
             session_factory=build_session,
             synthesizer_factory=build_synthesizer,
         )
