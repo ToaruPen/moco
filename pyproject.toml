@@ -1,0 +1,142 @@
+[build-system]
+requires = ["hatchling==1.28.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "moco"
+version = "0.1.0"
+description = "A macOS-first push-to-talk voice agent powered by Codex and Irodori."
+requires-python = "==3.13.*"
+license = "MIT"
+authors = [{ name = "ToaruPen" }]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: MacOS",
+  "Programming Language :: Python :: 3.13",
+  "Typing :: Typed",
+]
+dependencies = [
+  "fastapi>=0.116,<1",
+  "httpx>=0.28,<1",
+  "irodori-tts-infra @ git+https://github.com/ToaruPen/irodori-tts-infra.git@672565a959beba02d9cd5aa71c5a5f40b3fa4992",
+  "opentelemetry-api>=1.36,<2",
+  "opentelemetry-exporter-otlp-proto-http>=1.36,<2",
+  "opentelemetry-sdk>=1.36,<2",
+  "pydantic>=2.11,<3",
+  "pynput>=1.8,<2",
+  "pyyaml>=6.0,<7",
+  "typer>=0.16,<1",
+  "uvicorn[standard]>=0.35,<1",
+]
+
+[project.scripts]
+moco = "moco.cli:app"
+
+[dependency-groups]
+dev = [
+  "coverage[toml]>=7.10,<8",
+  "deptry>=0.23,<1",
+  "mypy>=1.17,<2",
+  "pytest>=8.4,<10",
+  "pytest-asyncio>=1.1,<2",
+  "pytest-cov>=6.2,<8",
+  "ruff>=0.12,<0.16",
+  "vulture>=2.14,<3",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/moco"]
+
+[tool.hatch.metadata]
+allow-direct-references = true
+
+[tool.pytest.ini_options]
+addopts = [
+  "--strict-config",
+  "--strict-markers",
+  "-m",
+  "not integration and not live and not slow",
+]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+markers = [
+  "integration: crosses a process, HTTP, or WebSocket boundary",
+  "live: requires a real Codex account or Irodori host",
+  "slow: unsuitable for the default feedback loop",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["moco"]
+
+[tool.coverage.report]
+fail_under = 90
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]
+
+[tool.ruff]
+required-version = ">=0.12,<0.16"
+target-version = "py313"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["ALL"]
+ignore = [
+  "COM812",
+  "CPY001",
+  "D100",
+  "D101",
+  "D102",
+  "D103",
+  "D104",
+  "D105",
+  "D107",
+  "D203",
+  "D213",
+  "ISC001",
+  "RUF001",
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/**" = ["D", "FBT001", "PLR2004", "S101", "TC001", "TC002", "TC003"]
+"src/**/__init__.py" = ["F401", "RUF067"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["moco"]
+required-imports = ["from __future__ import annotations"]
+
+[tool.ruff.lint.pylint]
+max-args = 8
+
+[tool.ruff.format]
+docstring-code-format = true
+line-ending = "lf"
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src", "tests"]
+mypy_path = "$MYPY_CONFIG_FILE_DIR/src"
+strict = true
+warn_unreachable = true
+local_partial_types = true
+show_error_codes = true
+pretty = true
+
+[[tool.mypy.overrides]]
+module = ["irodori_tts_infra.*", "pynput.*", "uvicorn.*", "yaml"]
+ignore_missing_imports = true
+
+[tool.vulture]
+min_confidence = 80
+paths = ["src", "tests"]
+exclude = [".worktrees", ".venv"]
+
+[tool.deptry]
+known_first_party = ["moco"]
+extend_exclude = [".worktrees"]

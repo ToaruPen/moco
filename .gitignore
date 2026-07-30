@@ -1,1 +1,16 @@
 .worktrees/
+.coverage
+.DS_Store
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.venv/
+__pycache__/
+build/
+config/moco.yaml
+dist/
+htmlcov/
+moco-state/
+node_modules/
+*.egg-info/
+coverage.xml
