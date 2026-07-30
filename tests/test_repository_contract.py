@@ -58,6 +58,8 @@ def test_workflows_have_minimal_permissions_concurrency_and_pinned_actions() -> 
     )
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "extractions/setup-just@" in ci
+    ci_payload = yaml.safe_load(ci)
+    assert ci_payload["jobs"]["quality"]["env"]["PYNPUT_BACKEND"] == "dummy"
     assert "uv build" in release
     assert "actions/upload-artifact" in release
 
