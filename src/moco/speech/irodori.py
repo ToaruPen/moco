@@ -68,7 +68,7 @@ class _LimitedResponseTransport(httpx.AsyncBaseTransport):
                 message = "Irodori response exceeded the configured size limit"
                 raise httpx.ReadError(message, request=request)
         if not isinstance(response.stream, httpx.AsyncByteStream):
-            await response.aclose()
+            response.close()
             message = "Irodori transport returned a synchronous response stream"
             raise httpx.ReadError(message, request=request)
         return httpx.Response(
@@ -168,11 +168,7 @@ def _invalid_response_error() -> IrodoriError:
 
 
 def _is_complete_wav(data: bytes) -> bool:
-    if (
-        len(data) < _WAV_HEADER_SIZE
-        or data[:4] != b"RIFF"
-        or data[8:_WAV_HEADER_SIZE] != b"WAVE"
-    ):
+    if len(data) < _WAV_HEADER_SIZE or data[:4] != b"RIFF" or data[8:_WAV_HEADER_SIZE] != b"WAVE":
         return False
     declared_size = int.from_bytes(data[4:8], byteorder="little")
     return declared_size + 8 == len(data)

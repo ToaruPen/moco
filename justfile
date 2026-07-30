@@ -40,16 +40,23 @@ dead-code:
 dependencies:
     uv run deptry .
 
+ast-grep:
+    npm exec -- ast-grep test --skip-snapshot-tests
+    npm exec -- ast-grep scan src
+
 secret-scan:
     npm exec -- secretlint .
 
-check: format-check lint typecheck dead-code dependencies test-cov secret-scan
+check: format-check lint typecheck dead-code dependencies ast-grep test-cov secret-scan build
 
 doctor *args:
     uv run moco doctor {{args}}
 
-serve *args:
-    uv run moco serve {{args}}
+run *args:
+    uv run moco run {{args}}
+
+open *args:
+    uv run moco open {{args}}
 
 install-service *args:
     uv run moco service install {{args}}

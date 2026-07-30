@@ -27,7 +27,8 @@ Use Python 3.13 through `uv`. Run repository commands through `just`:
 - `just test`: run the normal test suite
 - `just check`: run all local and CI quality gates
 - `just doctor`: inspect local Codex, Irodori, and hotkey readiness
-- `just serve`: run the foreground operator service
+- `just run`: run the foreground daemon and operator service
+- `just open`: open the active browser media companion
 
 For behavior changes, work test-first: demonstrate RED, implement the smallest
 complete change, then refactor while GREEN. Keep boundary contracts typed and

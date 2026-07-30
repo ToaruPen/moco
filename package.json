@@ -10,6 +10,7 @@
     "test:frontend": "node --test tests/js/*.test.js"
   },
   "devDependencies": {
+    "@ast-grep/cli": "0.45.0",
     "@biomejs/biome": "2.5.6",
     "@secretlint/secretlint-rule-preset-recommend": "13.0.4",
     "jsdom": "29.0.1",

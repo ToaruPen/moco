@@ -160,7 +160,7 @@ class SpeechQueue:
             try:
                 wav = await active
             except asyncio.CancelledError:
-                pass
+                wav = None
             except IrodoriError as error:
                 self._error_codes.append(error.code)
                 safe_event(

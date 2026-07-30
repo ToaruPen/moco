@@ -23,8 +23,7 @@ def test_load_config_applies_defaults(tmp_path: Path) -> None:
 def test_load_config_applies_yaml_values(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
     path.write_text(
-        "runtime:\n  idle_timeout_seconds: 42\n"
-        "irodori:\n  base_url: http://100.64.0.1:8923\n",
+        "runtime:\n  idle_timeout_seconds: 42\nirodori:\n  base_url: http://100.64.0.1:8923\n",
         encoding="utf-8",
     )
 

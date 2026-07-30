@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections.abc import AsyncIterator, Iterator
 from typing import cast
 
 import httpx
@@ -12,6 +13,8 @@ from moco.speech.irodori import (
     IrodoriClient,
     IrodoriError,
     IrodoriSynthesizer,
+    _is_complete_wav,
+    _LimitedResponseStream,
     _LimitedResponseTransport,
 )
 
@@ -146,3 +149,121 @@ async def test_close_delegates_to_client() -> None:
     await synthesizer.close()
 
     assert client.closed
+
+
+async def test_health_validation_failure_is_safely_mapped() -> None:
+    client = FakeIrodoriClient()
+    client.error = TypeError("unexpected shape")
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.health()
+
+    assert caught.value.code == "invalid_response"
+
+
+async def test_synthesis_client_error_and_explicit_overrides() -> None:
+    failing = FakeIrodoriClient()
+    failing.error = ClientError("timeout", code="timeout")
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", failing),
+        settings=MocoSettings(),
+    )
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
+    assert caught.value.code == "timeout"
+
+    client = FakeIrodoriClient()
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+    await synthesizer.synthesize(
+        "test",
+        speaker="override",
+        num_steps=3,
+        duration_scale=1.1,
+        cfg_scale_text=2.2,
+        cfg_scale_speaker=4.4,
+    )
+    request = client.requests[0]
+    assert (
+        request.speaker,
+        request.num_steps,
+        request.duration_scale,
+        request.cfg_scale_text,
+        request.cfg_scale_speaker,
+    ) == ("override", 3, 1.1, 2.2, 4.4)
+
+
+class ChunkStream(httpx.AsyncByteStream):
+    def __init__(self, chunks: list[bytes]) -> None:
+        self.chunks = chunks
+        self.closed = False
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in self.chunks:
+            yield chunk
+
+    async def aclose(self) -> None:
+        self.closed = True
+
+
+async def read_stream(stream: httpx.AsyncByteStream) -> None:
+    async for chunk in stream:
+        _ = chunk
+
+
+async def test_stream_limit_closes_oversized_response() -> None:
+    request = httpx.Request("GET", "http://127.0.0.1/test")
+    inner = ChunkStream([b"123", b"456"])
+    stream = _LimitedResponseStream(inner, max_bytes=5, request=request)
+
+    with pytest.raises(httpx.ReadError, match="size limit"):
+        await read_stream(stream)
+
+    assert inner.closed
+    await stream.aclose()
+
+
+class SyncOnlyStream(httpx.SyncByteStream):
+    def __iter__(self) -> Iterator[bytes]:
+        yield b"ok"
+
+
+class SyncStreamTransport(httpx.AsyncBaseTransport):
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, stream=SyncOnlyStream(), request=request)
+
+
+async def test_transport_rejects_sync_stream_and_ignores_bad_length() -> None:
+    request = httpx.Request("GET", "http://127.0.0.1/test")
+    transport = _LimitedResponseTransport(SyncStreamTransport(), max_bytes=10)
+    with pytest.raises(httpx.ReadError, match="synchronous"):
+        await transport.handle_async_request(request)
+    await transport.aclose()
+
+    inner = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            headers={"content-length": "unknown"},
+            content=b"ok",
+        ),
+    )
+    accepted = _LimitedResponseTransport(inner, max_bytes=10)
+    response = await accepted.handle_async_request(request)
+    assert await response.aread() == b"ok"
+    await accepted.aclose()
+
+
+async def test_from_settings_builds_real_client_without_network() -> None:
+    synthesizer = IrodoriSynthesizer.from_settings(MocoSettings())
+    await synthesizer.close()
+
+
+def test_wav_validator_rejects_mismatched_declared_size() -> None:
+    assert _is_complete_wav(valid_wav())
+    assert not _is_complete_wav(b"RIFF\x05\x00\x00\x00WAVE")

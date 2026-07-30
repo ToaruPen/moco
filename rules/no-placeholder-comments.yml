@@ -1,0 +1,7 @@
+id: no-placeholder-comments
+language: Python
+severity: error
+message: Replace placeholder comments with complete code or a tracked issue.
+rule:
+  kind: comment
+  regex: (?i)(todo|fixme|placeholder)

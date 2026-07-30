@@ -37,13 +37,7 @@ app.add_typer(service_app, name="service")
 
 
 def default_state_path() -> Path:
-    return (
-        Path.home()
-        / "Library"
-        / "Application Support"
-        / "moco"
-        / "runtime.json"
-    )
+    return Path.home() / "Library" / "Application Support" / "moco" / "runtime.json"
 
 
 _DEFAULT_CONFIG_PATH = default_config_path()
@@ -219,14 +213,10 @@ async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
         if not server.started:
             await task
             return
-        url = (
-            f"http://{settings.server.host}:{settings.server.port}/"
-            f"#{capability_value}"
-        )
+        url = f"http://{settings.server.host}:{settings.server.port}/#{capability_value}"
         _atomic_write(state_path, json.dumps({"url": url}).encode())
         typer.echo(
-            f"moco is ready on {settings.server.host}:{settings.server.port}; "
-            "run `moco open`"
+            f"moco is ready on {settings.server.host}:{settings.server.port}; run `moco open`"
         )
         await task
     finally:

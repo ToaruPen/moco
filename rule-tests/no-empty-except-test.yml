@@ -1,0 +1,13 @@
+id: no-empty-except
+valid:
+  - |
+    try:
+      operation()
+    except RuntimeError:
+      recover()
+invalid:
+  - |
+    try:
+      operation()
+    except RuntimeError:
+      pass

@@ -58,10 +58,7 @@ def test_production_sanitizer_drops_forbidden_and_unknown_keys() -> None:
 
 
 def test_irodori_url_is_reduced_to_boundary_label() -> None:
-    assert (
-        boundary_label("irodori", "http://user:password@100.64.0.1:8923")
-        == "irodori_http"
-    )
+    assert boundary_label("irodori", "http://user:password@100.64.0.1:8923") == "irodori_http"
 
 
 def test_safe_event_logs_only_sanitized_attributes(

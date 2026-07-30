@@ -89,6 +89,33 @@ for line in sys.stdin:
         continue
     elif method == "malformed":
         print("{not-json", flush=True)
+    elif method == "non-object":
+        send(["not", "an", "object"])
+    elif method == "invalid-constant":
+        print('{"id":NaN,"result":{}}', flush=True)
+    elif method == "invalid-id":
+        send({"id": True, "result": {}})
+    elif method == "missing-result":
+        send({"id": request_id})
+    elif method == "invalid-error":
+        send({"id": request_id, "error": "not-an-object"})
+    elif method == "invalid-error-message":
+        send({"id": request_id, "error": {"code": -32000, "message": 42}})
+    elif method == "invalid-error-code":
+        send({"id": request_id, "error": {"code": True, "message": "bad code"}})
+    elif method == "unknown-response":
+        send({"id": 99999, "result": {"ignored": True}})
+        send({"id": request_id, "result": {"accepted": True}})
+    elif method == "notification-default-params":
+        send({"method": "fake/default-params"})
+        send({"id": request_id, "result": {}})
+    elif method == "notification-without-method":
+        send({"params": {}})
+    elif method == "notification-invalid-params":
+        send({"method": "fake/invalid", "params": []})
+    elif method == "client/status":
+        if request_id is not None or params != {"ready": True}:
+            fail("invalid client status")
     elif method == "stderr":
         sensitive_value = "RPC_" + "SENSITIVE"
         print(

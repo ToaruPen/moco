@@ -1,0 +1,16 @@
+id: no-empty-except
+language: Python
+severity: error
+message: Exception handlers must report, translate, or recover from the failure.
+rule:
+  any:
+    - pattern: |
+        try:
+          $$$BODY
+        except $$$ERROR:
+          pass
+    - pattern: |
+        try:
+          $$$BODY
+        except:
+          pass

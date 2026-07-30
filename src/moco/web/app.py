@@ -351,9 +351,7 @@ class _BrowserConnection:
             if speech_busy != self._synthesis_busy:
                 self._synthesis_busy = speech_busy
                 self._lifecycle.set_busy(BusyKind.SYNTHESIS, active=speech_busy)
-            delegated_busy = (
-                self._session is not None and self._session.active_turn_id is not None
-            )
+            delegated_busy = self._session is not None and self._session.active_turn_id is not None
             if delegated_busy != self._delegated_busy:
                 self._delegated_busy = delegated_busy
                 self._lifecycle.set_busy(BusyKind.DELEGATED, active=delegated_busy)
@@ -373,10 +371,7 @@ class _BrowserConnection:
         async with self._resource_lock:
             notification_task = self._notifications_task
             self._notifications_task = None
-            if (
-                notification_task is not None
-                and notification_task is not asyncio.current_task()
-            ):
+            if notification_task is not None and notification_task is not asyncio.current_task():
                 notification_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await notification_task

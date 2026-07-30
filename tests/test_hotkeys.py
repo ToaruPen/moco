@@ -1,6 +1,14 @@
 from __future__ import annotations
 
-from moco.runtime.hotkeys import Control, HotkeyMapper
+import asyncio
+from collections.abc import Callable
+from types import SimpleNamespace
+from typing import ClassVar, cast
+
+import pytest
+from pynput import keyboard
+
+from moco.runtime.hotkeys import Control, GlobalHotkeyListener, HotkeyMapper
 
 
 def test_key_repeat_emits_one_ptt_pair() -> None:
@@ -55,3 +63,66 @@ def test_bindings_are_not_coupled_to_function_key_defaults() -> None:
     mapper.key_down("escape")
 
     assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]
+
+
+class ImmediateLoop:
+    def call_soon_threadsafe(
+        self,
+        callback: Callable[..., object],
+        *args: object,
+    ) -> None:
+        callback(*args)
+
+
+class FakeListener:
+    instances: ClassVar[list[FakeListener]] = []
+
+    def __init__(self, *, on_press: object, on_release: object) -> None:
+        self.on_press = on_press
+        self.on_release = on_release
+        self.running = False
+        self.stopped = False
+        self.instances.append(self)
+
+    def start(self) -> None:
+        self.running = True
+
+    def stop(self) -> None:
+        self.running = False
+        self.stopped = True
+
+
+def test_global_listener_maps_named_and_character_keys(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    FakeListener.instances.clear()
+    monkeypatch.setattr(keyboard, "Listener", FakeListener)
+    emitted: list[Control] = []
+    mapper = HotkeyMapper(ptt_key="f1", cancel_key="x", emit=emitted.append)
+    listener = GlobalHotkeyListener(
+        loop=cast("asyncio.AbstractEventLoop", ImmediateLoop()),
+        mapper=mapper,
+    )
+
+    listener.start()
+    listener.start()
+    backend = FakeListener.instances[0]
+    cast("Callable[[object], None]", backend.on_press)(
+        SimpleNamespace(name="f1"),
+    )
+    cast("Callable[[object], None]", backend.on_release)(
+        SimpleNamespace(name="f1"),
+    )
+    cast("Callable[[object], None]", backend.on_press)(
+        SimpleNamespace(char="X"),
+    )
+    cast("Callable[[object], None]", backend.on_press)(object())
+
+    assert listener.running
+    assert len(FakeListener.instances) == 1
+    assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]
+
+    listener.stop()
+    listener.stop()
+    assert backend.stopped
+    assert not listener.running

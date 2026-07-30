@@ -1,0 +1,9 @@
+id: no-placeholder-comments
+valid:
+  - |
+    # Explain why the branch is safe.
+    operation()
+invalid:
+  - |
+    # TODO: implement this later.
+    operation()
