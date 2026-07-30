@@ -56,6 +56,8 @@ def test_workflows_have_minimal_permissions_concurrency_and_pinned_actions() -> 
     release = (ROOT / ".github" / "workflows" / "release.yml").read_text(
         encoding="utf-8",
     )
+    ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    assert "extractions/setup-just@" in ci
     assert "uv build" in release
     assert "actions/upload-artifact" in release
 

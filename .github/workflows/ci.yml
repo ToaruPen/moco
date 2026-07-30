@@ -31,6 +31,7 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
       - name: Install dependencies
         run: |
           uv sync --frozen
