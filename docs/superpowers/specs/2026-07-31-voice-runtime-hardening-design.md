@@ -1,5 +1,10 @@
 # moco 音声ランタイム安定化設計
 
+> **現行の Irodori 契約:** 本文の静的 `speaker` / `speakers` と null narrator の契約は、
+> `2026-08-04-irodori-v4-dynamic-caption-migration-design.md` に置き換えられた。
+> 現行実装は runtime capability catalog と canonical voice ID を使い、caption mode は
+> `off` である。入力制御、割り込み、timeout なしの合成に関する記述だけを引き続き適用する。
+
 ## 位置づけ
 
 本設計は、`2026-07-30-moco-first-usable-release-design.md` のブラウザ認証、

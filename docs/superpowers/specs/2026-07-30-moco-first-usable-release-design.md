@@ -1,5 +1,12 @@
 # moco First Usable Release Design
 
+> **Historical Irodori contract:** The static portable-speaker and `/health`
+> contract in this document was superseded by
+> `docs/superpowers/specs/2026-08-04-irodori-v4-dynamic-caption-migration-design.md`.
+> The current migration uses the runtime capability catalog, conditional
+> generation, and caption mode `off`; do not implement the old adapter contract
+> below.
+
 ## Goal
 
 Deliver a public, production-shaped macOS agent that the user can launch and

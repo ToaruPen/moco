@@ -76,9 +76,10 @@ F1/F2を使う機能テストでは、次のように操作します。
 F2 はマイク入力だけを停止します。進行中の応答、Irodori の読み上げ、Realtime の
 会話コンテキストは中止しません。
 
-操作バーの `VOICE` は、Windows 側で利用できる話者モデルを表示します。会話中でも
-変更でき、次の読み上げから反映されます。`NARRATOR / DEFAULT` はサーバー既定の
-ナレーター音声です。
+操作バーの `VOICE` は、Irodori が実行時に公開する話者カタログをそのまま表示します。
+候補、表示順、既定話者は Irodori が所有し、moco は固定の話者やナレーターを追加しません。
+会話中の変更は次の読み上げから反映されます。選択中の話者がカタログから消えた場合は、
+別の話者へ自動で切り替えず音声を停止します。
 
 操作画面の進捗帯とアクティビティ欄には、Codex のターン、コマンドやファイル操作などの
 処理種別、音声生成、再生、マイク、接続状態を表示します。経過時間と最終更新から、返答後も
@@ -147,19 +148,25 @@ irodori:
   # macOS の MagicDNS が利用できない環境だけ指定します。
   # 接続先だけを上書きし、Host、SNI、証明書検証は base_url の名前を使います。
   connect_ip: null
+  # 実行時カタログの preferred canonical ID。移行時は一意な alias も解決します。
   speaker: null
-  speakers:
-    - カスミ
-    - チヅル
+  caption_mode: "off"
 ```
 
-`speaker` は起動時の選択、`speakers` はブラウザに表示する候補です。どちらにも
-サーバーが認識する portable speaker 名だけを指定してください。Windows ローカルの
-embedding パスは送信しません。URL にユーザー名やパスワードを埋め込む設定は
+`speaker` は起動時に優先する canonical voice ID です。旧名を移行するための alias は、
+カタログ内で一意な場合だけ同じ ID へ解決します。`null` の場合は Irodori が示す default を
+使い、default がなければ明示選択まで会話開始を拒否します。候補を列挙する旧 `speakers`
+キーは削除してください。残っていると厳格な設定検証が失敗します。
+
+初期 v4 移行では `caption_mode` は `off` だけです。moco は自由記述 caption や
+`calm` / `cheerful` / `clear` のような独自プリセットを送らず、Irodori の neutral な既定条件と
+本文中の emoji を使います。checkpoint、tokenizer、generation、alias、embedding パスは
+Irodori 内に留まり、ブラウザへ公開しません。URL にユーザー名やパスワードを埋め込む設定は
 拒否されます。
 
-`timeout_seconds` は readiness 確認だけに使われます。音声合成には期限を設けず、
-新しいユーザー発話または会話終了時に古い結果を無効化します。
+`timeout_seconds` は capability/readiness 確認だけに使われます。音声合成には期限を設けず、
+新しいユーザー発話または会話終了時に古い結果を無効化します。各合成要求は取得済みの
+voice ID と runtime generation を条件にするため、不一致時は別話者や v3 へ fallback しません。
 
 疎通確認だけでなく合成まで試す場合は、音声を保存せず WAV バイト数だけを確認できます。
 
@@ -216,15 +223,16 @@ uninstall はラベルと実行ファイルが moco のものと一致する pli
 | `codex_binary` | ChatGPT.app 同梱 Codex の実行可否 |
 | `codex_account` | 認証済みかどうか。メールアドレス等は表示しません |
 | `codex_features` / `codex_voices` | experimental API と Realtime voice |
-| `irodori_health` / `irodori_synthesis` | モデルの読込状態と任意の合成 |
+| `irodori_capabilities` / `irodori_synthesis` | runtime readiness、話者選択可否、任意の条件付き合成 |
 | `irodori_route` | OS DNS または明示した接続先 override |
 | `hotkeys` | グローバルキー監視。失敗時は Input Monitoring を確認します |
 
-`conversation_start_failed` は Codex または Irodori に接続できない状態、
-`irodori_not_ready` はモデル未読込、`codex_realtime_error` は実験 API の会話接続が
-終了した状態です。音声合成またはブラウザへの音声配送に失敗した場合も、安定した
-エラーコードが音声卓に表示されます。まず `uv run moco doctor` を再実行し、
-Irodori サービスと ChatGPT.app の状態を確認してください。
+`model_loading` / `model_not_loaded` / `voice_bank_invalid` は Irodori の準備状態、
+`configured_voice_unavailable` / `voice_not_found` は話者カタログの不一致、
+`runtime_generation_mismatch` は取得後に runtime が更新された状態です。これらの場合は
+音声を停止し、別話者や旧モデルへ自動で切り替えません。`codex_realtime_error` は実験 API の
+会話接続が終了した状態です。まず `uv run moco doctor` を再実行し、Irodori サービスと
+ChatGPT.app の状態を確認してください。
 
 ## プライバシーと観測
 
