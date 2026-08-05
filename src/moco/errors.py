@@ -14,6 +14,10 @@ class CodexError(MocoError):
     """Base error for Codex process and protocol failures."""
 
 
+class CodexPromptError(CodexError):
+    """A local Realtime prompt file could not be used safely."""
+
+
 class CodexRpcError(CodexError):
     """A JSON-RPC server or protocol error."""
 

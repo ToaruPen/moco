@@ -128,11 +128,35 @@ class RuntimeSettings(StrictSettings):
 class CodexSettings(StrictSettings):
     binary: Path = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
     working_directory: Path = Field(default_factory=Path.cwd)
+    prompt_file: Path | None = None
+
+    @field_validator("prompt_file", mode="before")
+    @classmethod
+    def _expand_prompt_file(cls, value: object) -> object:
+        if isinstance(value, (str, Path)):
+            try:
+                path = Path(value).expanduser()
+            except RuntimeError as error:
+                msg = "prompt path uses an unknown home directory"
+                raise ValueError(msg) from error
+            if "\0" in str(path):
+                msg = "prompt path must not contain NUL"
+                raise ValueError(msg)
+            return path
+        return value
 
     @field_validator("binary", "working_directory")
     @classmethod
     def _require_absolute_path(cls, value: Path) -> Path:
         if not value.is_absolute():
+            msg = "path must be absolute"
+            raise ValueError(msg)
+        return value
+
+    @field_validator("prompt_file")
+    @classmethod
+    def _require_absolute_prompt_file(cls, value: Path | None) -> Path | None:
+        if value is not None and not value.is_absolute():
             msg = "path must be absolute"
             raise ValueError(msg)
         return value
@@ -239,6 +263,11 @@ class MocoSettings(StrictSettings):
 def default_config_path() -> Path:
     home = Path(os.environ.get("HOME", str(Path.home())))
     return home / "Library" / "Application Support" / "moco" / "moco.yaml"
+
+
+def default_prompt_path() -> Path:
+    home = Path(os.environ.get("HOME", str(Path.home())))
+    return home / ".moco" / "prompt.md"
 
 
 def _format_validation_error(error: ValidationError) -> str:

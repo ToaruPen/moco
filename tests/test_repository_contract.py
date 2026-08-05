@@ -20,7 +20,13 @@ def test_agent_instruction_link_and_public_example() -> None:
     example = (ROOT / "config" / "moco.example.yaml").read_text(encoding="utf-8")
     assert "https://windows-node.example.ts.net" in example
     assert "connect_ip: null" in example
+    assert "prompt_file: null" in example
     assert "100." not in example
+    prompt_example = (ROOT / "config" / "moco.prompt.example.md").read_text(
+        encoding="utf-8",
+    )
+    assert prompt_example.strip()
+    assert "Irodori-supported emoji" in prompt_example
 
 
 def test_readme_documents_golden_path_and_browser_boundary() -> None:
@@ -37,6 +43,8 @@ def test_readme_documents_golden_path_and_browser_boundary() -> None:
     assert "ブラウザは常駐本体ではありません" in readme
     assert "Input Monitoring" in readme
     assert "experimental" in readme.lower()
+    assert "~/.moco/prompt.md" in readme
+    assert "codex.prompt_file" in readme
 
 
 def test_workflows_have_minimal_permissions_concurrency_and_pinned_actions() -> None:

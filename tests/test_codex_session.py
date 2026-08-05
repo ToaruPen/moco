@@ -18,7 +18,7 @@ from moco.codex.session import (
     TranscriptEvent,
 )
 from moco.config import CodexSettings, MocoSettings
-from moco.errors import CodexRpcError, CodexRpcTimeoutError
+from moco.errors import CodexPromptError, CodexRpcError, CodexRpcTimeoutError
 
 _QUEUE_END = object()
 
@@ -82,12 +82,23 @@ class FakeRpc:
 
 
 def make_settings(tmp_path: Path) -> MocoSettings:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text(DEFAULT_REALTIME_PROMPT, encoding="utf-8")
     return MocoSettings(
         codex=CodexSettings(
             binary=tmp_path / "unused-codex",
             working_directory=tmp_path,
+            prompt_file=prompt_file,
         ),
     )
+
+
+async def _started_prompt(rpc: FakeRpc, settings: MocoSettings) -> str:
+    session = CodexRealtimeSession(rpc, settings=settings)
+    await session.start("offer-sdp")
+    prompt = cast("str", rpc.requests[1][1]["prompt"])
+    await session.close()
+    return prompt
 
 
 async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> None:
@@ -122,38 +133,134 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
     await session.close()
 
 
-async def test_uses_explicit_realtime_prompt_without_changing_session_guards(
+async def test_uses_built_in_prompt_when_implicit_file_is_absent(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    rpc = FakeRpc()
-    session = CodexRealtimeSession(
-        rpc,
-        settings=make_settings(tmp_path),
-        prompt="Probe prompt",
+    monkeypatch.setenv("HOME", str(tmp_path))
+
+    assert await _started_prompt(FakeRpc(), MocoSettings()) == DEFAULT_REALTIME_PROMPT
+
+
+async def test_reads_implicit_dot_moco_prompt(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    prompt_file = tmp_path / ".moco" / "prompt.md"
+    prompt_file.parent.mkdir()
+    prompt_file.write_text("Implicit persona", encoding="utf-8")
+
+    assert await _started_prompt(FakeRpc(), MocoSettings()) == "Implicit persona"
+
+
+async def test_reads_configured_prompt_again_for_each_new_session(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_text("First persona", encoding="utf-8")
+    settings = MocoSettings(
+        codex=CodexSettings(
+            binary=tmp_path / "unused-codex",
+            working_directory=tmp_path,
+            prompt_file=prompt_file,
+        ),
     )
 
-    await session.start("offer-sdp")
+    first = await _started_prompt(FakeRpc(), settings)
+    prompt_file.write_text("Second persona", encoding="utf-8")
+    second = await _started_prompt(FakeRpc(), settings)
 
-    method, request = rpc.requests[1]
-    assert method == "thread/realtime/start"
-    assert request == {
-        "threadId": "thr_test",
-        "outputModality": "audio",
-        "includeStartupContext": False,
-        "prompt": "Probe prompt",
-        "transport": {"type": "webrtc", "sdp": "offer-sdp"},
-        "version": "v3",
-    }
-    await session.close()
+    assert (first, second) == ("First persona", "Second persona")
 
 
-def test_rejects_blank_realtime_prompt(tmp_path: Path) -> None:
-    with pytest.raises(ValueError, match="prompt must not be blank"):
-        CodexRealtimeSession(
-            FakeRpc(),
-            settings=make_settings(tmp_path),
-            prompt="  ",
-        )
+async def test_reads_utf8_bom_without_forwarding_it(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_bytes(b"\xef\xbb\xbfBOM persona")
+    settings = MocoSettings(
+        codex=CodexSettings(
+            binary=tmp_path / "unused-codex",
+            working_directory=tmp_path,
+            prompt_file=prompt_file,
+        ),
+    )
+
+    assert await _started_prompt(FakeRpc(), settings) == "BOM persona"
+
+
+@pytest.mark.parametrize(
+    ("payload", "message"),
+    [
+        (b" \n\t", "blank"),
+        (b"\xef\xbb\xbf \n", "blank"),
+        (b"\xff", "UTF-8"),
+        (b"x" * 65_537, "64 KiB"),
+    ],
+    ids=["blank", "bom-only", "non_utf8", "oversized"],
+)
+async def test_rejects_invalid_prompt_before_rpc_start(
+    tmp_path: Path,
+    payload: bytes,
+    message: str,
+) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_bytes(payload)
+    settings = MocoSettings(
+        codex=CodexSettings(
+            binary=tmp_path / "unused-codex",
+            working_directory=tmp_path,
+            prompt_file=prompt_file,
+        ),
+    )
+    rpc = FakeRpc()
+
+    with pytest.raises(CodexPromptError, match=message):
+        await CodexRealtimeSession(rpc, settings=settings).start("offer-sdp")
+
+    assert rpc.started is False
+    assert rpc.requests == []
+
+
+async def test_unusable_programmatic_prompt_path_is_a_prompt_error(tmp_path: Path) -> None:
+    unsafe_codex = CodexSettings.model_construct(
+        binary=tmp_path / "unused-codex",
+        working_directory=tmp_path,
+        prompt_file=tmp_path / "moco\0prompt",
+    )
+    settings = MocoSettings(codex=unsafe_codex)
+    rpc = FakeRpc()
+
+    with pytest.raises(CodexPromptError, match="could not be read"):
+        await CodexRealtimeSession(rpc, settings=settings).start("offer-sdp")
+
+    assert rpc.started is False
+    assert rpc.requests == []
+
+
+@pytest.mark.parametrize(
+    ("kind", "message"),
+    [("missing", "not found"), ("directory", "could not be read")],
+)
+async def test_rejects_unreadable_configured_prompt_before_rpc_start(
+    tmp_path: Path,
+    kind: str,
+    message: str,
+) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    if kind == "directory":
+        prompt_file.mkdir()
+    settings = MocoSettings(
+        codex=CodexSettings(
+            binary=tmp_path / "unused-codex",
+            working_directory=tmp_path,
+            prompt_file=prompt_file,
+        ),
+    )
+    rpc = FakeRpc()
+
+    with pytest.raises(CodexPromptError, match=message):
+        await CodexRealtimeSession(rpc, settings=settings).start("offer-sdp")
+
+    assert rpc.started is False
+    assert rpc.requests == []
 
 
 async def test_exposes_transcript_and_error_notifications(tmp_path: Path) -> None:

@@ -18,6 +18,9 @@ runtime:
 codex:
   binary: /Applications/ChatGPT.app/Contents/Resources/codex
   working_directory: /Users/your-name
+  # null checks ~/.moco/prompt.md and falls back to the built-in prompt when absent.
+  # Set an absolute path (or a path beginning with ~) to require another prompt file.
+  prompt_file: null
 
 irodori:
   # Replace with the Windows node's portless Tailscale Serve URL.

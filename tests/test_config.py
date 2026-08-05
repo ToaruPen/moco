@@ -5,10 +5,12 @@ from pathlib import Path
 import pytest
 
 from moco.config import (
+    CodexSettings,
     ConfigError,
     IrodoriSettings,
     ServerSettings,
     default_config_path,
+    default_prompt_path,
     load_config,
 )
 
@@ -123,6 +125,57 @@ def test_codex_paths_must_be_absolute(tmp_path: Path, field: str) -> None:
     path.write_text(f"codex:\n  {field}: relative/path\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match=f"codex.{field}"):
+        load_config(path)
+
+
+def test_default_prompt_path_uses_dot_moco(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HOME", "/Users/example")
+
+    assert default_prompt_path() == Path("/Users/example/.moco/prompt.md")
+
+
+def test_codex_prompt_file_defaults_to_implicit_path() -> None:
+    assert CodexSettings().prompt_file is None
+
+
+def test_codex_prompt_file_expands_home(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("HOME", "/Users/example")
+
+    settings = CodexSettings(prompt_file=Path("~/.moco/character.md"))
+
+    assert settings.prompt_file == Path("/Users/example/.moco/character.md")
+
+
+def test_codex_prompt_file_rejects_relative_path(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("codex:\n  prompt_file: prompts/moco.md\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"codex\.prompt_file"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    ("raw_prompt_file", "message"),
+    [
+        ('"~moco-user-that-does-not-exist/prompt.md"', "home directory"),
+        ('"/tmp/moco\\0prompt"', "NUL"),
+    ],
+    ids=["unknown-home", "nul"],
+)
+def test_codex_prompt_file_rejects_unusable_path(
+    tmp_path: Path,
+    raw_prompt_file: str,
+    message: str,
+) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(
+        f"codex:\n  prompt_file: {raw_prompt_file}\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match=rf"codex\.prompt_file.*{message}"):
         load_config(path)
 
 
