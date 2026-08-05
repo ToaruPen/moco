@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from collections.abc import AsyncIterator, Mapping
 from pathlib import Path
 from typing import cast
@@ -435,6 +436,62 @@ async def test_invalid_notification_surfaces_protocol_error(tmp_path: Path) -> N
     with pytest.raises(CodexRpcError, match="invalid 'role'"):
         await anext(events)
     assert rpc.closed
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    ("method", "params"),
+    [
+        (
+            "item/started",
+            {
+                "threadId": "thr_test",
+                "turnId": "turn-1",
+                "item": {"type": "commandExecution"},
+            },
+        ),
+        (
+            "item/reasoning/summaryTextDelta",
+            {
+                "threadId": "thr_test",
+                "turnId": "turn-1",
+                "itemId": "reasoning-1",
+                "delta": "",
+            },
+        ),
+    ],
+)
+async def test_discards_invalid_auxiliary_notifications_without_ending_conversation(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    method: str,
+    params: dict[str, JsonValue],
+) -> None:
+    caplog.set_level(logging.INFO, logger="moco.codex.session")
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
+    await session.start("offer-sdp")
+    events = session.notifications()
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    assert isinstance(await anext(events), ActivityEvent)
+
+    await rpc.emit(method, params)
+    await rpc.emit(
+        "thread/realtime/transcript/done",
+        {"threadId": "thr_test", "role": "assistant", "text": "継続中です。"},
+    )
+
+    assert await anext(events) == TranscriptEvent(
+        "done",
+        "thr_test",
+        "assistant",
+        "継続中です。",
+    )
+    assert not rpc.closed
+    assert "event=codex_auxiliary_notification_discarded" in caplog.text
     await session.close()
 
 

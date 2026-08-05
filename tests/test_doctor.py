@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from collections.abc import Mapping
+import subprocess
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import cast
 
@@ -90,6 +91,10 @@ class FakeRpc:
 
     async def close(self) -> None:
         self.closed = True
+
+
+def raise_cloudflared_timeout() -> tuple[bool, bool]:
+    raise subprocess.TimeoutExpired(cmd="launchctl", timeout=5)
 
 
 class FakeSynthesizer:
@@ -239,20 +244,25 @@ async def test_doctor_reports_public_operator_boundary(tmp_path: Path) -> None:
     ("probe", "binary_check", "service_check"),
     [
         (
-            (False, False),
+            lambda: (False, False),
             DoctorCheck("cloudflared_binary", "error", "unavailable"),
             DoctorCheck("cloudflared_service", "blocked", "binary_unavailable"),
         ),
         (
-            (True, False),
+            lambda: (True, False),
             DoctorCheck("cloudflared_binary", "ok", "available"),
             DoctorCheck("cloudflared_service", "error", "not_running"),
+        ),
+        (
+            raise_cloudflared_timeout,
+            DoctorCheck("cloudflared_binary", "error", "probe_failed"),
+            DoctorCheck("cloudflared_service", "blocked", "probe_failed"),
         ),
     ],
 )
 async def test_doctor_distinguishes_cloudflared_failures(
     tmp_path: Path,
-    probe: tuple[bool, bool],
+    probe: Callable[[], tuple[bool, bool]],
     binary_check: DoctorCheck,
     service_check: DoctorCheck,
 ) -> None:
@@ -272,7 +282,7 @@ async def test_doctor_distinguishes_cloudflared_failures(
             FakeSynthesizer(),
         ),
         hotkey_probe=lambda: True,
-        cloudflared_probe=lambda: probe,
+        cloudflared_probe=probe,
     )
 
     assert binary_check in checks

@@ -734,6 +734,7 @@ async def test_synthesis_bounds_unknown_client_error(code: str) -> None:
 
 
 def test_legacy_speaker_selection_interfaces_are_removed() -> None:
+    # Keep legacy identifiers split so the migration gate does not match this negative test.
     legacy_selector = "select_" + "speaker"
     legacy_override = "speak" + "er"
     assert not hasattr(IrodoriSynthesizer, legacy_selector)

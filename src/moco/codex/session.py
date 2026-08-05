@@ -286,10 +286,26 @@ class CodexRealtimeSession:
             self._handle_turn_notification(notification)
             return
         if notification.method in {"item/started", "item/completed"}:
-            self._handle_item_notification(notification)
+            try:
+                self._handle_item_notification(notification)
+            except CodexRpcError:
+                safe_event(
+                    logger,
+                    "codex_auxiliary_notification_discarded",
+                    component="codex",
+                    event_code="invalid_activity",
+                )
             return
         if notification.method == "item/reasoning/summaryTextDelta":
-            self._handle_reasoning_summary(notification)
+            try:
+                self._handle_reasoning_summary(notification)
+            except CodexRpcError:
+                safe_event(
+                    logger,
+                    "codex_auxiliary_notification_discarded",
+                    component="codex",
+                    event_code="invalid_reasoning_summary",
+                )
             return
         if notification.method == "item/reasoning/textDelta":
             return

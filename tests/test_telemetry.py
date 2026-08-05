@@ -41,6 +41,13 @@ def test_allows_only_bounded_irodori_capability_metadata() -> None:
             sanitize_attributes({forbidden: "fixture-sensitive"}, strict=True)
 
 
+@pytest.mark.parametrize("readiness", ["loading", "capability_mismatch", "unavailable"])
+def test_allows_bounded_web_capability_readiness(readiness: str) -> None:
+    assert sanitize_attributes({"readiness": readiness}, strict=True) == {
+        "readiness": readiness,
+    }
+
+
 @pytest.mark.parametrize(
     "attributes",
     [

@@ -6,6 +6,7 @@ from contextlib import suppress
 
 import pytest
 
+from moco.speech import queue as speech_queue
 from moco.speech.irodori import IrodoriError
 from moco.speech.queue import SpeechQueue
 
@@ -162,7 +163,7 @@ async def test_forged_irodori_error_is_bounded_before_reporting(
             self.calls.append(text)
             raise IrodoriError(private_message, code=private_code)
 
-    caplog.set_level(logging.INFO, logger="moco.speech.queue")
+    caplog.set_level(logging.INFO, logger=speech_queue.logger.name)
     reported: list[str] = []
     queue = SpeechQueue(
         ForgedSynthesizer(),

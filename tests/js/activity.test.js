@@ -219,4 +219,39 @@ describe("activity DOM views", () => {
       ["MIC · 開始", "WORK · 完了", "REASON · 更新"],
     );
   });
+
+  it("updates one reasoning row without rebuilding stable activity rows", () => {
+    const dom = new JSDOM('<div id="activity"></div><button id="latest"></button>');
+    const document = dom.window.document;
+    let created = 0;
+    const view = new ActivityView({
+      container: document.querySelector("#activity"),
+      latestButton: document.querySelector("#latest"),
+      createElement: (tag) => {
+        created += 1;
+        return document.createElement(tag);
+      },
+      formatTime: () => "20:14:08",
+    });
+    const stable = { kind: "work", phase: "started", label: "検索", occurredAtMs: 1 };
+    const firstSummary = {
+      kind: "reasoning",
+      phase: "updated",
+      label: "確認中",
+      occurredAtMs: 2,
+      itemId: "reasoning-1",
+    };
+    view.render([stable, firstSummary]);
+    const stableRow = document.querySelector(".activity-row--work");
+    const initialCreated = created;
+
+    view.render([stable, { ...firstSummary, label: "確認を続けています", occurredAtMs: 3 }]);
+
+    assert.equal(document.querySelector(".activity-row--work"), stableRow);
+    assert.equal(
+      document.querySelector(".activity-row--reasoning .activity-label").textContent,
+      "確認を続けています",
+    );
+    assert.equal(created - initialCreated, 4);
+  });
 });

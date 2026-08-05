@@ -355,16 +355,16 @@ async def _check_irodori_capabilities(
     except Exception:  # noqa: BLE001
         return DoctorCheck("irodori_capabilities", "error", "irodori_unavailable"), None
 
-    selected_voice_id, selection_detail = _resolve_irodori_voice(
-        capabilities,
-        configured=configured,
-    )
     if not capabilities.ready:
         return DoctorCheck(
             "irodori_capabilities",
             "error",
             capabilities.readiness,
         ), None
+    selected_voice_id, selection_detail = _resolve_irodori_voice(
+        capabilities,
+        configured=configured,
+    )
     if selection_detail is not None:
         return DoctorCheck("irodori_capabilities", "error", selection_detail), None
     return DoctorCheck("irodori_capabilities", "ok", "ready"), selected_voice_id

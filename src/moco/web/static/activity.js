@@ -207,6 +207,8 @@ export class ActivityView {
     this.createElement = createElement;
     this.formatTime = formatTime;
     this.autoFollow = true;
+    this.items = [];
+    this.rows = [];
     this.container.addEventListener("scroll", () => this.#handleScroll());
     this.latestButton.addEventListener("click", () => this.scrollToLatest());
   }
@@ -216,8 +218,16 @@ export class ActivityView {
       this.clear();
       return;
     }
-    const rows = items.map((item) => this.#createRow(item));
-    this.container.replaceChildren(...rows);
+    const reasoningUpdate = this.#reasoningUpdateIndex(items);
+    if (reasoningUpdate !== -1) {
+      const row = this.#createRow(items[reasoningUpdate]);
+      this.rows[reasoningUpdate].replaceWith(row);
+      this.rows[reasoningUpdate] = row;
+    } else {
+      this.rows = items.map((item) => this.#createRow(item));
+      this.container.replaceChildren(...this.rows);
+    }
+    this.items = [...items];
     if (this.autoFollow) {
       this.scrollToLatest();
     }
@@ -228,6 +238,8 @@ export class ActivityView {
     empty.className = "activity-empty";
     empty.textContent = "接続後の処理状況がここに表示されます。";
     this.container.replaceChildren(empty);
+    this.items = [];
+    this.rows = [];
     this.autoFollow = true;
     this.latestButton.hidden = true;
   }
@@ -256,6 +268,27 @@ export class ActivityView {
       row.append(cell);
     }
     return row;
+  }
+
+  #reasoningUpdateIndex(items) {
+    if (items.length !== this.items.length) {
+      return -1;
+    }
+    let changed = -1;
+    for (let index = 0; index < items.length; index += 1) {
+      if (items[index] === this.items[index]) {
+        continue;
+      }
+      if (
+        changed !== -1 ||
+        items[index].kind !== "reasoning" ||
+        items[index].itemId !== this.items[index]?.itemId
+      ) {
+        return -1;
+      }
+      changed = index;
+    }
+    return changed;
   }
 
   #handleScroll() {

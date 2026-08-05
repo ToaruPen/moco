@@ -78,6 +78,7 @@ def test_fake_codex_transcript_reaches_browser_as_irodori_wav() -> None:
     capability_value = "integration-capability"
 
     def synthesizer_factory() -> WebSynthesizer:
+        assert clients, "synthesizer_factory was called more than twice"
         synthesizer = IrodoriSynthesizer(
             cast("IrodoriClient", clients.pop(0)),
             settings=MocoSettings(),

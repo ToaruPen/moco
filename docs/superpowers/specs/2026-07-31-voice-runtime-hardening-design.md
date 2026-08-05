@@ -67,13 +67,14 @@ Windows GPU 上で推論が継続しても、古い WAV は再生しない。
 
 ### 話者モデルの選択
 
-Irodori の基盤モデルは Windows サービス起動時に一つだけロードする。moco から
-実行中に切り替えられる「音声モデル」は、公開合成契約の `speaker`、すなわち
-話者埋め込みとする。
+Irodori が返す runtime capability catalog を唯一の話者情報源とする。moco は
+canonical voice ID、表示ラベル、default の有無だけをブラウザへ投影し、話者名、
+件数、表示順、ナレーターを固定しない。
 
-- `irodori.speaker`: 起動時の選択。`null` はナレーター。
-- `irodori.speakers`: ブラウザに表示する portable speaker 名。
-- ブラウザは `select_voice` を送り、サーバーは設定候補にない値を拒否する。
+- `irodori.speaker`: 起動時に優先する canonical voice ID または一意な alias。
+- ブラウザは `select_voice` と canonical `voice_id` を送る。
+- catalog にない ID、消失した選択、generation 不一致は fail-closed とし、別話者へ
+  fallback しない。
 - 選択は次の合成から反映し、会話や WebSocket の再作成を要求しない。
 
 ### Windows Irodori の所有権
@@ -134,7 +135,8 @@ TCP 接続成功や任意の HTTP 200 だけでは ready とみなさない。
 - Web: 常時入力中の新しいユーザー発話で、古い Irodori 音声だけを無効化する。
 - Irodori: health client は有限 timeout、synthesis client は `None`。
 - Irodori transport: connect address を上書きしても Host と SNI は FQDN を維持する。
-- Web: 設定候補だけを選択でき、会話中の変更が次の合成へ反映される。
+- Web: runtime catalog の canonical ID だけを選択でき、会話中の変更が次の合成へ
+  反映される。generation 不一致と話者消失では合成を拒否し、fallback しない。
 - Speech queue: 合成エラーコードが callback へ通知される。
 - 通常ゲート: `just check`。
 - 実機: Tailscale HTTPS 経由の health、合成、ブラウザ WAV 再生、F1/F2 の

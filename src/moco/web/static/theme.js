@@ -67,7 +67,7 @@ const PRESET_COLORS = Object.freeze({
     accent: "#95586c",
     actionAccent: "#916020",
   }),
-  midnight: Object.freeze({
+  midnight: palette({
     background: "#090c12",
     surface: "#111721",
     surfaceRaised: "#171f2c",
@@ -314,24 +314,18 @@ export class ThemeController {
   }
 
   apply() {
-    const resolvedPreset =
-      this.theme.preset === "system"
-        ? this.prefersDark()
-          ? "midnight"
-          : "porcelain"
-        : this.theme.preset;
-    const palette = { ...PRESET_COLORS[resolvedPreset], ...this.theme.overrides };
+    const { palette: colors, resolvedPreset } = this.#resolvedTheme();
     this.root.dataset.theme = this.theme.preset;
     this.root.dataset.polarity = PRESET_OPTIONS.find(({ id }) => id === resolvedPreset).polarity;
     this.root.style.colorScheme = this.root.dataset.polarity;
     for (const token of EDITABLE_TOKENS) {
-      this.root.style.setProperty(CSS_PROPERTIES[token], palette[token]);
+      this.root.style.setProperty(CSS_PROPERTIES[token], colors[token]);
     }
-    return palette;
+    return colors;
   }
 
   contrastWarnings() {
-    const palette = this.apply();
+    const { palette: colors } = this.#resolvedTheme();
     const checks = [
       ["text", "surface", 4.5],
       ["textMuted", "surface", 3],
@@ -344,9 +338,22 @@ export class ThemeController {
         foreground,
         background,
         minimum,
-        ratio: contrastRatio(palette[foreground], palette[background]),
+        ratio: contrastRatio(colors[foreground], colors[background]),
       }))
       .filter((check) => check.ratio < check.minimum);
+  }
+
+  #resolvedTheme() {
+    const resolvedPreset =
+      this.theme.preset === "system"
+        ? this.prefersDark()
+          ? "midnight"
+          : "porcelain"
+        : this.theme.preset;
+    return {
+      palette: { ...PRESET_COLORS[resolvedPreset], ...this.theme.overrides },
+      resolvedPreset,
+    };
   }
 
   #persist() {

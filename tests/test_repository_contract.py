@@ -59,10 +59,24 @@ def test_workflows_have_minimal_permissions_concurrency_and_pinned_actions() -> 
     )
     ci = (ROOT / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
     assert "extractions/setup-just@" in ci
+    assert "npx playwright install --with-deps chromium webkit" in ci
     ci_payload = yaml.safe_load(ci)
     assert ci_payload["jobs"]["quality"]["env"]["PYNPUT_BACKEND"] == "dummy"
     assert "uv build" in release
     assert "actions/upload-artifact" in release
+
+
+def test_migration_plan_uses_a_portable_irodori_checkout_path() -> None:
+    plan = (
+        ROOT
+        / "docs"
+        / "superpowers"
+        / "plans"
+        / "2026-08-04-irodori-capability-client-migration.md"
+    ).read_text(encoding="utf-8")
+
+    assert "/Users/" not in plan
+    assert "IRODORI_CONTRACT_REPO:?" in plan
 
 
 def test_just_check_covers_every_repository_gate() -> None:

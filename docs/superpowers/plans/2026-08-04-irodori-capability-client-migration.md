@@ -13,7 +13,7 @@
 ## 前提、非目標、編集境界
 
 - 設計の source of truth は `docs/superpowers/specs/2026-08-04-irodori-v4-dynamic-caption-migration-design.md`。
-- Irodori の先行計画は `/Users/sankenbisha/Dev/irodori-tts-infra/docs/superpowers/plans/2026-08-04-capability-driven-voice-catalog.md`。
+- Irodori の先行計画は `${IRODORI_CONTRACT_REPO}/docs/superpowers/plans/2026-08-04-capability-driven-voice-catalog.md`。`IRODORI_CONTRACT_REPO` は各作業者が自分の clone 先へ設定する。
 - この計画は Irodori capability contract が accepted commit に存在するまで開始しない。未コミットの Irodori source を moco dependency として参照しない。
 - `irodori.speakers` は削除する。`irodori.speaker` は portable name ではなく preferred voice ID または旧 alias として読み、catalog 取得後は canonical ID に解決する。
 - production 話者名、12/13件、表示順を moco の code、config example、test expectation に固定しない。test catalog は helper が requested count から生成する。
@@ -89,7 +89,7 @@ browser readiness は Irodori の4状態に加え、moco-local の `loading`、`
 Run:
 
 ```bash
-IRODORI_CONTRACT_REPO=/Users/sankenbisha/Dev/irodori-tts-infra
+: "${IRODORI_CONTRACT_REPO:?set IRODORI_CONTRACT_REPO to the irodori-tts-infra clone path}"
 git -C "$IRODORI_CONTRACT_REPO" diff --quiet -- \
   src/irodori_tts_infra/contracts/capabilities.py \
   src/irodori_tts_infra/contracts/synthesis.py \
@@ -107,7 +107,7 @@ Expected: 対象 contract/client files に HEAD 外の差分がなく、capabili
 Run:
 
 ```bash
-IRODORI_CONTRACT_REPO=/Users/sankenbisha/Dev/irodori-tts-infra
+: "${IRODORI_CONTRACT_REPO:?set IRODORI_CONTRACT_REPO to the irodori-tts-infra clone path}"
 IRODORI_CONTRACT_COMMIT=$(git -C "$IRODORI_CONTRACT_REPO" rev-parse HEAD)
 uv add "irodori-tts-infra @ git+https://github.com/ToaruPen/irodori-tts-infra.git@${IRODORI_CONTRACT_COMMIT}"
 ```

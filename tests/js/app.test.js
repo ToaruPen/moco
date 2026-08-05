@@ -24,6 +24,7 @@ const {
   renderPresetChoices,
   resetConnectionAttempt,
   setConnectionAction,
+  setTransportOffline,
   shouldHandleHotkey,
   ThemePanel,
   VoiceModelController,
@@ -348,6 +349,27 @@ describe("operator status", () => {
     assert.equal(progress.snapshot().active, false);
     assert.equal(progress.snapshot().label, "会話が終了しました");
   });
+
+  it("renders the stable setup failure code with user-facing copy", () => {
+    const dom = new JSDOM(`
+      <section id="error" hidden><span id="error-text"></span></section>
+    `);
+    const status = new OperatorStatus({
+      activityBuffer: new ActivityBuffer(),
+      activityView: { render: () => {} },
+      error: dom.window.document.querySelector("#error"),
+      errorText: dom.window.document.querySelector("#error-text"),
+      progress: new ProgressTracker(),
+      progressView: { render: () => {} },
+    });
+
+    status.showError("enable_failed");
+
+    assert.equal(
+      status.errorText.textContent,
+      "enable_failed — 音声セッションを開始できませんでした",
+    );
+  });
 });
 
 describe("operator console DOM", () => {
@@ -444,6 +466,7 @@ describe("operator console DOM", () => {
       document.querySelector("#listen-stop").getAttribute("aria-label"),
       "音声入力を停止",
     );
+    assert.equal(document.querySelector("#voice").getAttribute("aria-label"), "音声モデル");
     assert.equal(document.querySelector("#pairing-panel").getAttribute("role"), "dialog");
   });
 
@@ -567,6 +590,16 @@ describe("VoiceModelController", () => {
     return [...select.options].map(({ disabled, label, value }) => ({ disabled, label, value }));
   }
 
+  it("is safe before the first runtime catalog arrives", () => {
+    const { controller, select } = voiceHarness();
+
+    controller.confirm(null);
+
+    assert.equal(select.disabled, true);
+    assert.equal(select.value, "");
+    assert.equal(select.options[0].label, "音声モデルを読み込み中");
+  });
+
   it("renders runtime labels and IDs in server order without a built-in voice", () => {
     const { controller, select } = voiceHarness();
     const options = voiceOptions("表示 B", "表示 A", "表示 C");
@@ -652,6 +685,16 @@ describe("VoiceModelController", () => {
 });
 
 describe("browser connection timeouts", () => {
+  it("resets transport indicators after setup fails", () => {
+    const connection = { textContent: "WS ONLINE", dataset: { status: "ok" } };
+    const micState = { textContent: "MIC ON", dataset: { status: "ok" } };
+
+    setTransportOffline({ connection, micState });
+
+    assert.deepEqual(connection, { textContent: "WS OFFLINE", dataset: { status: "error" } });
+    assert.deepEqual(micState, { textContent: "MIC OFF", dataset: { status: "muted" } });
+  });
+
   it("does not replace an already displayed root cause with a disconnect error", () => {
     assert.equal(
       connectionCloseErrorCode({ code: "irodori_not_ready", displayed: true }, true),

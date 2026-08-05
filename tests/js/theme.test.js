@@ -194,6 +194,29 @@ describe("ThemeController", () => {
     );
   });
 
+  it("computes contrast warnings without writing theme state to the DOM", () => {
+    const dom = new JSDOM("<!doctype html><html></html>");
+    const root = dom.window.document.documentElement;
+    const controller = new ThemeController({
+      root,
+      storage: {
+        getItem: () => null,
+        removeItem: () => {},
+        setItem: () => {},
+      },
+      onWarning: () => {},
+      prefersDark: () => true,
+    });
+    controller.load();
+    root.dataset.theme = "sentinel";
+    root.style.setProperty("--c-accent", "#123456");
+
+    controller.contrastWarnings();
+
+    assert.equal(root.dataset.theme, "sentinel");
+    assert.equal(root.style.getPropertyValue("--c-accent"), "#123456");
+  });
+
   it("reapplies System when the OS color preference changes", () => {
     let listener;
     let removed;

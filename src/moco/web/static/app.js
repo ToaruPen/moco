@@ -49,6 +49,7 @@ const ERROR_COPY = Object.freeze({
   microphone_failed: "マイクを開始できませんでした",
   synthesis_failed: "音声生成中に予期しないエラーが発生しました",
   pairing_failed: "スマートフォン接続用QRを取得できませんでした",
+  enable_failed: "音声セッションを開始できませんでした",
 });
 
 const CONVERSATION_START_ERRORS = new Set([
@@ -274,6 +275,10 @@ export class VoiceModelController {
     this.element = select;
     this.send = send;
     this.createOption = createOption;
+    this.options = [];
+    this.ready = false;
+    this.readiness = "loading";
+    this.selected = "";
   }
 
   configure({ options, selected, ready, readiness }) {
@@ -620,6 +625,13 @@ export function setConnectionAction({ row, button }, state) {
     button.disabled = false;
     button.textContent = state === "disconnected" ? "再接続" : "接続";
   }
+}
+
+export function setTransportOffline({ connection, micState }) {
+  connection.textContent = "WS OFFLINE";
+  connection.dataset.status = "error";
+  micState.textContent = "MIC OFF";
+  micState.dataset.status = "muted";
 }
 
 export function loadCapability({ location, history, storage }) {
@@ -987,10 +999,7 @@ function boot() {
       const disconnectError = socketCloseError;
       const disconnectCode = disconnectError?.code;
       socketCloseError = undefined;
-      dom.connection.textContent = "WS OFFLINE";
-      dom.connection.dataset.status = "error";
-      dom.micState.textContent = "MIC OFF";
-      dom.micState.dataset.status = "muted";
+      setTransportOffline(dom);
       clearInterval(progressTimer);
       progressTimer = undefined;
       openPromise = null;
@@ -1187,6 +1196,7 @@ function boot() {
       const failedSocket = socket;
       socket = undefined;
       failedSocket?.close();
+      setTransportOffline(dom);
       for (const track of stream?.getTracks() ?? []) {
         track.stop();
       }

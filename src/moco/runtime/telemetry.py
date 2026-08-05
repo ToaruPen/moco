@@ -42,7 +42,15 @@ _ALLOWED_ATTRIBUTES = frozenset(
 )
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9_.:/-]{1,64}$")
 _SAFE_READINESS = frozenset(
-    {"ready", "model_loading", "model_not_loaded", "voice_bank_invalid"},
+    {
+        "ready",
+        "loading",
+        "model_loading",
+        "model_not_loaded",
+        "voice_bank_invalid",
+        "capability_mismatch",
+        "unavailable",
+    },
 )
 
 
