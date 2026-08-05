@@ -291,7 +291,7 @@ wheels = [
 [[package]]
 name = "irodori-tts-infra"
 version = "0.1.0"
-source = { git = "https://github.com/ToaruPen/irodori-tts-infra.git?rev=672565a959beba02d9cd5aa71c5a5f40b3fa4992#672565a959beba02d9cd5aa71c5a5f40b3fa4992" }
+source = { git = "https://github.com/ToaruPen/irodori-tts-infra.git?rev=2f169719a6491c83bd08e6d3bd58dafc825eb11d#2f169719a6491c83bd08e6d3bd58dafc825eb11d" }
 dependencies = [
     { name = "httpx" },
     { name = "huggingface-hub" },
@@ -380,7 +380,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
-    { name = "irodori-tts-infra", git = "https://github.com/ToaruPen/irodori-tts-infra.git?rev=672565a959beba02d9cd5aa71c5a5f40b3fa4992" },
+    { name = "irodori-tts-infra", git = "https://github.com/ToaruPen/irodori-tts-infra.git?rev=2f169719a6491c83bd08e6d3bd58dafc825eb11d" },
     { name = "opentelemetry-api", specifier = ">=1.36,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.36,<2" },
     { name = "opentelemetry-sdk", specifier = ">=1.36,<2" },
