@@ -32,18 +32,16 @@ class PlaybackMessage(_ClientMessage):
 
 class SelectVoiceMessage(_ClientMessage):
     type: Literal["select_voice"] = "select_voice"
-    speaker: str | None
+    voice_id: str
 
-    @field_validator("speaker")
+    @field_validator("voice_id")
     @classmethod
-    def _normalize_speaker(cls, value: str | None) -> str | None:
-        if value is None:
-            return None
-        speaker = value.strip()
-        if not speaker:
-            msg = "speaker must not be blank"
+    def _normalize_voice_id(cls, value: str) -> str:
+        voice_id = value.strip()
+        if not voice_id:
+            msg = "voice_id must not be blank"
             raise ValueError(msg)
-        return speaker
+        return voice_id
 
 
 class StopMessage(_ClientMessage):

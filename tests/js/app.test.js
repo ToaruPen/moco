@@ -543,39 +543,111 @@ describe("operator console DOM", () => {
 });
 
 describe("VoiceModelController", () => {
-  it("renders configured models and sends an immediate selection", () => {
+  function voiceOptions(...labels) {
+    return labels.map((label, index) => ({
+      id: `fixture-${index}`,
+      label,
+      default: index === labels.length - 1,
+    }));
+  }
+
+  function voiceHarness() {
+    const dom = new JSDOM("<select></select>");
     const messages = [];
-    const select = {
-      disabled: true,
-      options: [],
-      value: "",
-      replaceChildren(...options) {
-        this.options = options;
-      },
-    };
+    const select = dom.window.document.querySelector("select");
     const controller = new VoiceModelController({
       select,
       send: (message) => messages.push(message),
-      createOption: (label, value) => ({ label, value }),
+      createOption: (label, value) => new dom.window.Option(label, value),
     });
+    return { controller, messages, select };
+  }
+
+  function renderedOptions(select) {
+    return [...select.options].map(({ disabled, label, value }) => ({ disabled, label, value }));
+  }
+
+  it("renders runtime labels and IDs in server order without a built-in voice", () => {
+    const { controller, select } = voiceHarness();
+    const options = voiceOptions("表示 B", "表示 A", "表示 C");
 
     controller.configure({
-      options: ["kasumi", "alternate"],
-      selected: "kasumi",
+      options,
+      selected: options[1].id,
+      ready: true,
+      readiness: "ready",
     });
-    select.value = "alternate";
-    controller.select("alternate");
 
     assert.equal(select.disabled, false);
-    assert.deepEqual(select.options, [
-      { label: "NARRATOR / DEFAULT", value: "" },
-      { label: "kasumi", value: "kasumi" },
-      { label: "alternate", value: "alternate" },
+    assert.deepEqual(renderedOptions(select), [
+      { disabled: false, label: "表示 B", value: "fixture-0" },
+      { disabled: false, label: "表示 A", value: "fixture-1" },
+      { disabled: false, label: "表示 C", value: "fixture-2" },
     ]);
-    assert.equal(select.value, "kasumi");
-    assert.deepEqual(messages, [{ type: "select_voice", speaker: "alternate" }]);
-    controller.confirm("alternate");
-    assert.equal(select.value, "alternate");
+    assert.equal(select.value, options[1].id);
+  });
+
+  it("disables selection with an accessible status for loading, unready, and empty catalogs", () => {
+    const { controller, select } = voiceHarness();
+    const options = voiceOptions("表示 X");
+
+    for (const state of [
+      { options, ready: false, readiness: "loading", label: "音声モデルを読み込み中" },
+      {
+        options,
+        ready: false,
+        readiness: "voice_bank_invalid",
+        label: "音声モデルを利用できません",
+      },
+      { options: [], ready: true, readiness: "ready", label: "利用可能な音声モデルがありません" },
+    ]) {
+      controller.configure({ ...state, selected: null });
+      assert.equal(select.disabled, true);
+      assert.deepEqual(renderedOptions(select), [
+        { disabled: true, label: state.label, value: "" },
+      ]);
+    }
+  });
+
+  it("keeps an absent or unknown confirmed selection unselected", () => {
+    const { controller, select } = voiceHarness();
+    const options = voiceOptions("表示 1", "表示 2");
+
+    controller.configure({ options, selected: null, ready: true, readiness: "ready" });
+    assert.equal(select.value, "");
+    assert.equal(select.options[0].label, "音声モデルを選択してください");
+    assert.equal(select.options[0].disabled, true);
+
+    controller.confirm("unknown-fixture");
+    assert.equal(select.value, "");
+    assert.deepEqual(
+      [...select.options].slice(1).map((option) => option.value),
+      options.map((option) => option.id),
+    );
+  });
+
+  it("rolls back pending UI selection and sends only nonblank opaque IDs", () => {
+    const { controller, messages, select } = voiceHarness();
+    const options = voiceOptions("表示 α", "表示 β");
+    controller.configure({
+      options,
+      selected: options[0].id,
+      ready: true,
+      readiness: "ready",
+    });
+
+    select.value = options[1].id;
+    controller.select(options[1].id);
+    assert.equal(select.value, options[0].id);
+    assert.deepEqual(messages, [{ type: "select_voice", voice_id: options[1].id }]);
+
+    controller.select("");
+    controller.select("   ");
+    controller.select(null);
+    assert.deepEqual(messages, [{ type: "select_voice", voice_id: options[1].id }]);
+
+    controller.confirm(options[1].id);
+    assert.equal(select.value, options[1].id);
   });
 });
 

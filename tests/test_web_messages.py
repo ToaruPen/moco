@@ -26,12 +26,12 @@ def test_parses_start_control_and_playback_messages() -> None:
     assert parse_client_message(
         {"type": "playback", "active": True},
     ) == PlaybackMessage(active=True)
+
+
+def test_parses_and_normalizes_an_opaque_voice_id() -> None:
     assert parse_client_message(
-        {"type": "select_voice", "speaker": "kasumi"},
-    ) == SelectVoiceMessage(speaker="kasumi")
-    assert parse_client_message(
-        {"type": "select_voice", "speaker": None},
-    ) == SelectVoiceMessage(speaker=None)
+        {"type": "select_voice", "voice_id": "  fixture-0  "},
+    ) == SelectVoiceMessage(voice_id="fixture-0")
 
 
 @pytest.mark.parametrize(
@@ -40,7 +40,18 @@ def test_parses_start_control_and_playback_messages() -> None:
         {"type": "start", "sdp": ""},
         {"type": "control", "control": "unknown"},
         {"type": "playback", "active": "yes"},
-        {"type": "select_voice", "speaker": ""},
+        {"type": "select_voice", "voice_id": None},
+        {"type": "select_voice", "voice_id": ""},
+        {"type": "select_voice", "voice_id": "   "},
+        {
+            "type": "select_voice",
+            "speaker": "fixture-0",
+        },
+        {
+            "type": "select_voice",
+            "voice_id": "fixture-0",
+            "speaker": "fixture-0",
+        },
         {"type": "stop", "extra": True},
         {"type": "unknown"},
     ],

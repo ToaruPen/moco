@@ -258,24 +258,51 @@ export class VoiceModelController {
     this.createOption = createOption;
   }
 
-  configure({ options, selected }) {
-    const choices = [
-      this.createOption("NARRATOR / DEFAULT", ""),
-      ...options.map((speaker) => this.createOption(speaker, speaker)),
-    ];
-    this.element.replaceChildren(...choices);
+  configure({ options, selected, ready, readiness }) {
+    this.options = options;
+    this.ready = ready;
+    this.readiness = readiness;
     this.confirm(selected);
-    this.element.disabled = false;
   }
 
   confirm(selected) {
-    this.selected = selected ?? "";
-    this.element.value = this.selected;
+    this.selected = typeof selected === "string" ? selected : "";
+    this.render();
   }
 
   select(value) {
     this.element.value = this.selected;
-    this.send({ type: "select_voice", speaker: value || null });
+    if (typeof value === "string" && value.trim()) {
+      this.send({ type: "select_voice", voice_id: value });
+    }
+  }
+
+  render() {
+    if (!this.ready || this.options.length === 0) {
+      let label = "音声モデルを利用できません";
+      if (this.ready) {
+        label = "利用可能な音声モデルがありません";
+      } else if (this.readiness === "loading" || this.readiness === "model_loading") {
+        label = "音声モデルを読み込み中";
+      }
+      const status = this.createOption(label, "");
+      status.disabled = true;
+      this.element.replaceChildren(status);
+      this.element.value = "";
+      this.element.disabled = true;
+      return;
+    }
+
+    const selectedIsAvailable = this.options.some(({ id }) => id === this.selected);
+    const choices = this.options.map(({ id, label }) => this.createOption(label, id));
+    if (!selectedIsAvailable) {
+      const prompt = this.createOption("音声モデルを選択してください", "");
+      prompt.disabled = true;
+      choices.unshift(prompt);
+    }
+    this.element.replaceChildren(...choices);
+    this.element.value = selectedIsAvailable ? this.selected : "";
+    this.element.disabled = false;
   }
 }
 
