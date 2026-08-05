@@ -18,7 +18,8 @@ def test_agent_instruction_link_and_public_example() -> None:
     assert claude.readlink() == Path("AGENTS.md")
 
     example = (ROOT / "config" / "moco.example.yaml").read_text(encoding="utf-8")
-    assert "127.0.0.1:8923" in example
+    assert "https://windows-node.example.ts.net" in example
+    assert "connect_ip: null" in example
     assert "100." not in example
 
 

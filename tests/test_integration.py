@@ -21,9 +21,6 @@ class TranscriptSession:
         yield TranscriptEvent("done", "thr_test", "assistant", "こんにちは。")
         await asyncio.Event().wait()
 
-    async def cancel_current(self) -> None:
-        return None
-
     async def close(self) -> None:
         return None
 
@@ -35,6 +32,9 @@ class WavSynthesizer:
     async def synthesize(self, text: str) -> bytes:
         assert text == "こんにちは。"
         return b"RIFF\x04\x00\x00\x00WAVE"
+
+    def select_speaker(self, speaker: str | None) -> None:
+        del speaker
 
     async def close(self) -> None:
         return None

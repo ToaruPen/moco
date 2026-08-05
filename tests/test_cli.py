@@ -12,7 +12,7 @@ from typer.testing import CliRunner
 
 from moco import cli
 from moco.cli import _is_safe_operator_url, _remove_state_file, _run_runtime, app
-from moco.config import HotkeySettings, MocoSettings, load_config
+from moco.config import MocoSettings, load_config
 from moco.doctor import DoctorCheck
 from moco.service.launchd import LaunchdError, ServiceStatus
 
@@ -30,7 +30,7 @@ def test_config_init_is_non_destructive_and_generated_yaml_validates(
     assert first.exit_code == 0
     assert second.exit_code == 1
     assert "exists" in second.output
-    assert load_config(path).hotkeys.push_to_talk == "f1"
+    assert load_config(path).hotkeys.start_listening == "f1"
     assert isinstance(yaml.safe_load(path.read_text(encoding="utf-8")), dict)
 
     forced = runner.invoke(
@@ -60,7 +60,12 @@ def test_open_uses_private_state_without_printing_capability(
     state_path = tmp_path / "runtime.json"
     capability_value = "private-capability"
     state_path.write_text(
-        json.dumps({"url": f"http://127.0.0.1:8765/#{capability_value}"}),
+        json.dumps(
+            {
+                "url": f"http://127.0.0.1:8765/#{capability_value}",
+                "mobile_url": f"https://voice.example.com/#{capability_value}",
+            },
+        ),
         encoding="utf-8",
     )
     state_path.chmod(0o600)
@@ -273,7 +278,7 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     telemetry = FakeTelemetry()
     listener = FakeHotkeyListener()
     server = FakeServer()
-    removed_payloads: list[dict[str, str]] = []
+    removed_payloads: list[dict[str, object]] = []
     operator_app = SimpleNamespace(
         state=SimpleNamespace(
             control_hub=SimpleNamespace(publish=lambda _control: None),
@@ -296,20 +301,27 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
 
     def capture_state(path: Path) -> None:
         removed_payloads.append(
-            cast("dict[str, str]", json.loads(path.read_text(encoding="utf-8"))),
+            cast("dict[str, object]", json.loads(path.read_text(encoding="utf-8"))),
         )
         path.unlink()
 
     monkeypatch.setattr(cli, "_remove_state_file", capture_state)
     state_path = tmp_path / "runtime.json"
 
-    await _run_runtime(
-        MocoSettings(hotkeys=HotkeySettings(enabled=False)),
-        state_path=state_path,
+    settings = MocoSettings.model_validate(
+        {
+            "hotkeys": {"enabled": False},
+            "server": {"public_url": "https://voice.example.com"},
+        },
     )
+    await _run_runtime(settings, state_path=state_path)
 
-    assert removed_payloads[0]["url"].startswith("http://127.0.0.1:")
-    assert _is_safe_operator_url(removed_payloads[0]["url"])
+    local_url = cast("str", removed_payloads[0]["url"])
+    mobile_url = cast("str", removed_payloads[0]["mobile_url"])
+    assert local_url.startswith("http://127.0.0.1:")
+    assert mobile_url.startswith("https://voice.example.com/#")
+    assert local_url.split("#", 1)[1] == mobile_url.split("#", 1)[1]
+    assert _is_safe_operator_url(local_url)
     assert telemetry.closed
     assert listener.stopped
     assert not state_path.exists()

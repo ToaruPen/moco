@@ -4,6 +4,7 @@ default:
 sync:
     uv sync --all-groups
     npm ci
+    npm exec playwright install chromium webkit
 
 format:
     uv run ruff format .
@@ -34,6 +35,9 @@ test-cov:
     uv run pytest -m "not live and not slow" --cov --cov-report=term-missing --cov-report=xml
     npm run test:frontend
 
+test-browser:
+    npm run test:e2e
+
 dead-code:
     uv run vulture
 
@@ -47,7 +51,7 @@ ast-grep:
 secret-scan:
     npm exec -- secretlint .
 
-check: format-check lint typecheck dead-code dependencies ast-grep test-cov secret-scan build
+check: format-check lint typecheck dead-code dependencies ast-grep test-cov test-browser secret-scan build
 
 doctor *args:
     uv run moco doctor {{args}}

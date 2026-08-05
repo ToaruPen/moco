@@ -2,99 +2,128 @@
 <html lang="ja">
   <head>
     <meta charset="utf-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1">
-    <meta name="color-scheme" content="dark">
-    <title>moco — voice console</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="color-scheme" content="dark light">
+    <title>moco — operator console</title>
     <link rel="stylesheet" href="/static/styles.css">
   </head>
   <body>
-    <header class="masthead">
-      <a class="wordmark" href="/" aria-label="moco home">
-        <span class="wordmark-mark" aria-hidden="true">m</span>
-        <span>moco</span>
-      </a>
-      <div class="system-id">
-        <span class="status-lamp" aria-hidden="true"></span>
-        <span>LOCAL VOICE CONSOLE</span>
+    <header class="operator-bar">
+      <span class="wordmark">moco</span>
+      <span id="state" class="status-chip" data-status="muted" role="status" aria-live="polite">
+        未接続
+      </span>
+      <span id="mic-state" class="status-chip" data-status="muted">MIC OFF</span>
+      <span id="connection" class="status-chip" data-status="muted">WS OFFLINE</span>
+      <div class="operator-actions">
+        <label class="voice-control" for="voice">
+          <span>VOICE</span>
+          <select id="voice" disabled>
+            <option>接続待ち</option>
+          </select>
+        </label>
+        <button
+          id="listen-start"
+          type="button"
+          aria-label="音声入力を開始"
+          aria-pressed="false"
+          disabled
+        >
+          <span id="start-key" class="keycap">—</span>
+          <span class="desktop-action-label">開始</span>
+          <span class="mobile-action-label">入力開始</span>
+        </button>
+        <button id="listen-stop" type="button" aria-label="音声入力を停止" disabled>
+          <span id="stop-key" class="keycap">—</span>
+          <span class="desktop-action-label">停止</span>
+          <span class="mobile-action-label">入力停止</span>
+        </button>
+        <button id="pairing-open" type="button" hidden>スマホ接続</button>
+        <button
+          id="theme-toggle"
+          type="button"
+          aria-haspopup="dialog"
+          aria-expanded="false"
+          aria-controls="theme-panel"
+        >
+          配色
+        </button>
       </div>
     </header>
 
-    <main>
-      <section class="hero" aria-labelledby="hero-title">
-        <p class="kicker">CODEX × IRODORI / CHANNEL 01</p>
-        <h1 id="hero-title">声で、作業を<br>前へ進める。</h1>
-        <p class="hero-copy">
-          設定したトークキーを押している間だけ話し、離すとmocoが考えます。
-          応答は設定したキャンセルキーで停止できます。
-        </p>
-        <button id="enable" class="enable-button" type="button">
-          <span>音声卓を有効にする</span>
-          <span aria-hidden="true">↗</span>
-        </button>
-        <p class="permission-note">初回のみ、ブラウザのマイク許可が必要です。</p>
-      </section>
+    <div id="connection-row" class="connection-row">
+      <button id="enable" class="connection-action" type="button">接続</button>
+      <p>マイク停止後も、Codex の処理と音声再生は継続します。</p>
+    </div>
 
-      <section class="console" aria-label="moco 音声卓">
-        <div class="console-header">
+    <section class="progress-band" aria-label="現在の処理状況">
+      <span id="progress-label">接続を待っています</span>
+      <span id="progress-elapsed" class="progress-time">00:00</span>
+      <span id="progress-updated">更新なし</span>
+    </section>
+
+    <section id="error" class="error-band" role="alert" hidden>
+      <span id="error-text"></span>
+      <button id="error-close" type="button">閉じる</button>
+    </section>
+
+    <main class="workspace">
+      <section class="conversation-pane panel" aria-labelledby="conversation-title">
+        <header class="panel-header">
           <div>
-            <p class="label">CONVERSATION SIGNAL</p>
-            <p id="state" class="state" role="status" aria-live="polite">DISABLED</p>
+            <h2 id="conversation-title">会話</h2>
+            <p>この画面のみ・保存されません</p>
           </div>
-          <p id="connection" class="connection">SOCKET OFFLINE</p>
-        </div>
-
-        <div class="signal-rail" aria-hidden="true">
-          <span class="signal-node signal-node--input"></span>
-          <span class="signal-line"></span>
-          <span class="signal-node signal-node--core"></span>
-          <span class="signal-line"></span>
-          <span class="signal-node signal-node--output"></span>
-        </div>
-        <div class="signal-labels" aria-hidden="true">
-          <span>YOU</span>
-          <span>CODEX</span>
-          <span>IRODORI</span>
-        </div>
-
-        <div class="controls">
-          <button id="ptt" class="control-key control-key--ptt" type="button" disabled>
-            <span id="ptt-key" class="keycap">—</span>
-            <span>
-              <strong>HOLD TO TALK</strong>
-              <small>押している間だけ録音</small>
-            </span>
-          </button>
-          <button id="cancel" class="control-key control-key--cancel" type="button" disabled>
-            <span id="cancel-key" class="keycap">—</span>
-            <span>
-              <strong>CANCEL</strong>
-              <small>応答と読み上げを停止</small>
-            </span>
-          </button>
-        </div>
-
-        <p id="error" class="error" role="alert" hidden></p>
-      </section>
-
-      <section class="transcript-panel" aria-labelledby="transcript-title">
-        <div class="panel-heading">
-          <div>
-            <p class="label">LIVE / NOT SAVED</p>
-            <h2 id="transcript-title">現在の会話</h2>
-          </div>
-          <button id="clear" class="text-button" type="button">消去</button>
-        </div>
+          <button id="clear" type="button">消去</button>
+        </header>
         <div id="transcript" class="transcript" role="log" aria-live="polite">
-          <p class="transcript-empty">音声卓を有効にすると、ここに会話が表示されます。</p>
+          <p class="transcript-empty">接続後、開始を押すか設定キーで話しかけると表示されます。</p>
+        </div>
+      </section>
+
+      <section class="activity-pane panel" aria-labelledby="activity-title">
+        <header class="panel-header">
+          <div>
+            <h2 id="activity-title">アクティビティ</h2>
+            <p>一時ログ・最大200件</p>
+          </div>
+          <button id="activity-latest" type="button" hidden>最新へ</button>
+        </header>
+        <div id="activity" class="activity" role="log" aria-live="off">
+          <p class="activity-empty">接続後の処理状況がここに表示されます。</p>
         </div>
       </section>
     </main>
 
-    <footer>
-      <span>LOOPBACK ONLY</span>
-      <span>TRANSCRIPTS ARE NOT PERSISTED</span>
-      <span>moco / 0.1</span>
-    </footer>
+    <section id="theme-panel" class="theme-panel" data-theme-panel role="dialog" aria-label="配色" hidden>
+      <header class="theme-header">
+        <div>
+          <h2>配色</h2>
+          <p>このブラウザだけに保存されます</p>
+        </div>
+        <button id="theme-close" type="button">閉じる</button>
+      </header>
+      <fieldset id="theme-presets" class="theme-presets">
+        <legend>プリセット</legend>
+      </fieldset>
+      <details>
+        <summary>詳細配色</summary>
+        <div id="theme-colors" class="theme-colors"></div>
+      </details>
+      <p id="theme-validation" class="theme-validation" role="status" aria-live="polite"></p>
+      <button id="theme-reset" type="button">プリセットに戻す</button>
+    </section>
+
+    <section id="pairing-panel" class="pairing-panel" role="dialog" aria-label="スマホ接続" hidden>
+      <header class="pairing-header">
+        <div>
+          <h2>スマホ接続</h2>
+          <p>Cloudflare Access 認証後、この端末だけで使用します</p>
+        </div>
+        <button id="pairing-close" type="button">閉じる</button>
+      </header>
+      <img id="pairing-image" alt="スマートフォン接続用QRコード">
+    </section>
 
     <script type="module" src="/static/app.js"></script>
   </body>

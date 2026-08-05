@@ -9,10 +9,11 @@ import pytest
 
 from moco.codex.rpc import JsonValue, RpcNotification
 from moco.codex.session import (
-    CANCEL_INSTRUCTION,
     DEFAULT_REALTIME_PROMPT,
+    ActivityEvent,
     CodexRealtimeSession,
     RealtimeErrorEvent,
+    ReasoningSummaryEvent,
     TranscriptEvent,
 )
 from moco.config import CodexSettings, MocoSettings
@@ -57,11 +58,7 @@ class FakeRpc:
                     {"threadId": "thr_test", "sdp": "answer-sdp"},
                 )
             return {}
-        if method in {
-            "thread/realtime/stop",
-            "turn/interrupt",
-            "thread/realtime/appendText",
-        }:
+        if method == "thread/realtime/stop":
             return {}
         msg = f"unexpected request: {method}"
         raise AssertionError(msg)
@@ -124,6 +121,40 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
     await session.close()
 
 
+async def test_uses_explicit_realtime_prompt_without_changing_session_guards(
+    tmp_path: Path,
+) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(
+        rpc,
+        settings=make_settings(tmp_path),
+        prompt="Probe prompt",
+    )
+
+    await session.start("offer-sdp")
+
+    method, request = rpc.requests[1]
+    assert method == "thread/realtime/start"
+    assert request == {
+        "threadId": "thr_test",
+        "outputModality": "audio",
+        "includeStartupContext": False,
+        "prompt": "Probe prompt",
+        "transport": {"type": "webrtc", "sdp": "offer-sdp"},
+        "version": "v3",
+    }
+    await session.close()
+
+
+def test_rejects_blank_realtime_prompt(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="prompt must not be blank"):
+        CodexRealtimeSession(
+            FakeRpc(),
+            settings=make_settings(tmp_path),
+            prompt="  ",
+        )
+
+
 async def test_exposes_transcript_and_error_notifications(tmp_path: Path) -> None:
     rpc = FakeRpc()
     session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
@@ -154,9 +185,192 @@ async def test_exposes_transcript_and_error_notifications(tmp_path: Path) -> Non
     await session.close()
 
 
-async def test_cancel_interrupts_active_turn_and_appends_stop_request(
+async def test_exposes_safe_turn_and_work_activity(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
+    await session.start("offer-sdp")
+    events = session.notifications()
+
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    await rpc.emit(
+        "item/started",
+        {
+            "threadId": "thr_test",
+            "turnId": "turn-1",
+            "startedAtMs": 1_785_496_800_000,
+            "item": {
+                "id": "item-1",
+                "type": "commandExecution",
+                "command": "private command must not escape",
+                "commandActions": [],
+                "cwd": "/private/path",
+                "status": "inProgress",
+            },
+        },
+    )
+    await rpc.emit(
+        "item/completed",
+        {
+            "threadId": "thr_test",
+            "turnId": "turn-1",
+            "completedAtMs": 1_785_496_801_000,
+            "item": {
+                "id": "item-1",
+                "type": "commandExecution",
+                "command": "private command must not escape",
+                "commandActions": [],
+                "cwd": "/private/path",
+                "status": "completed",
+            },
+        },
+    )
+    await rpc.emit(
+        "turn/completed",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "started",
+        "thr_test",
+        "turn-1",
+        None,
+    )
+    assert await anext(events) == ActivityEvent(
+        "command_execution",
+        "started",
+        "thr_test",
+        "turn-1",
+        1_785_496_800_000,
+    )
+    assert await anext(events) == ActivityEvent(
+        "command_execution",
+        "completed",
+        "thr_test",
+        "turn-1",
+        1_785_496_801_000,
+    )
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "completed",
+        "thr_test",
+        "turn-1",
+        None,
+    )
+    await session.close()
+
+
+async def test_exposes_reasoning_summary_but_not_raw_reasoning(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
+    await session.start("offer-sdp")
+    events = session.notifications()
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "started",
+        "thr_test",
+        "turn-1",
+        None,
+    )
+    await rpc.emit(
+        "item/reasoning/textDelta",
+        {
+            "threadId": "thr_test",
+            "turnId": "turn-1",
+            "itemId": "r-1",
+            "delta": "raw reasoning must not escape",
+        },
+    )
+    await rpc.emit(
+        "item/reasoning/summaryTextDelta",
+        {
+            "threadId": "thr_test",
+            "turnId": "turn-1",
+            "itemId": "r-1",
+            "summaryIndex": 0,
+            "delta": "設定を確認しています。",
+        },
+    )
+
+    assert await anext(events) == ReasoningSummaryEvent(
+        "thr_test",
+        "turn-1",
+        "r-1",
+        "設定を確認しています。",
+    )
+    await session.close()
+
+
+@pytest.mark.parametrize(
+    ("item_type", "expected_kind"),
+    [
+        ("reasoning", "reasoning"),
+        ("commandExecution", "command_execution"),
+        ("fileChange", "file_change"),
+        ("mcpToolCall", "external_tool"),
+        ("dynamicToolCall", "external_tool"),
+        ("collabAgentToolCall", "subagent"),
+        ("subAgentActivity", "subagent"),
+        ("webSearch", "web_search"),
+        ("imageView", "image_view"),
+        ("imageGeneration", "image_generation"),
+        ("contextCompaction", "context_compaction"),
+        ("futureItem", "codex_work"),
+    ],
+)
+async def test_maps_item_types_without_forwarding_payload(
     tmp_path: Path,
+    item_type: str,
+    expected_kind: str,
 ) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
+    await session.start("offer-sdp")
+    events = session.notifications()
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "started",
+        "thr_test",
+        "turn-1",
+        None,
+    )
+    await rpc.emit(
+        "item/started",
+        {
+            "threadId": "thr_test",
+            "turnId": "turn-1",
+            "startedAtMs": 1234,
+            "item": {
+                "id": "item-1",
+                "type": item_type,
+                "command": "private",
+                "cwd": "/private",
+                "arguments": {"secret": True},
+                "query": "private search",
+                "result": "private result",
+            },
+        },
+    )
+
+    event = await anext(events)
+    assert isinstance(event, ActivityEvent)
+    assert event.kind == expected_kind
+    assert "private" not in repr(event)
+    await session.close()
+
+
+async def test_tracks_active_turn_without_sending_control_requests(tmp_path: Path) -> None:
     rpc = FakeRpc()
     session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
     await session.start("offer-sdp")
@@ -166,19 +380,29 @@ async def test_cancel_interrupts_active_turn_and_appends_stop_request(
     )
     await asyncio.sleep(0)
 
-    await session.cancel_current()
+    assert session.active_turn_id == "turn-1"
+    assert all(method != "turn/interrupt" for method, _params in rpc.requests)
+    assert all(method != "thread/realtime/appendText" for method, _params in rpc.requests)
+    await session.close()
 
-    assert rpc.requests[-2:] == [
-        ("turn/interrupt", {"threadId": "thr_test", "turnId": "turn-1"}),
-        (
-            "thread/realtime/appendText",
-            {
-                "threadId": "thr_test",
-                "role": "user",
-                "text": CANCEL_INSTRUCTION,
-            },
-        ),
-    ]
+
+async def test_ignores_completion_for_a_different_active_turn(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
+    await session.start("offer-sdp")
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    await asyncio.sleep(0)
+
+    await rpc.emit(
+        "turn/completed",
+        {"threadId": "thr_test", "turn": {"id": "turn-2"}},
+    )
+    await asyncio.sleep(0)
+
+    assert session.active_turn_id == "turn-1"
     await session.close()
 
 
@@ -357,15 +581,18 @@ async def test_turn_completion_clears_active_turn(tmp_path: Path) -> None:
     await session.close()
 
 
-async def test_cancel_without_active_turn_still_appends_instruction(
-    tmp_path: Path,
-) -> None:
+async def test_close_active_turn_does_not_append_a_cancel_instruction(tmp_path: Path) -> None:
     rpc = FakeRpc()
     session = CodexRealtimeSession(rpc, settings=make_settings(tmp_path))
     await session.start("offer-sdp")
-    await session.cancel_current()
-    assert rpc.requests[-1][0] == "thread/realtime/appendText"
+    await rpc.emit("turn/started", {"threadId": "thr_test", "turn": {"id": "turn-1"}})
+    await asyncio.sleep(0)
     await session.close()
+
+    methods = [method for method, _params in rpc.requests]
+    assert "thread/realtime/stop" in methods
+    assert "thread/realtime/appendText" not in methods
+    assert "turn/interrupt" not in methods
 
 
 async def test_notification_stream_failure_surfaces_and_closes(tmp_path: Path) -> None:

@@ -4,6 +4,8 @@ import asyncio
 import logging
 import os
 import platform
+import shutil
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
@@ -45,7 +47,9 @@ class DoctorSynthesizer(Protocol):
 
 type RpcFactory = Callable[[Path], DoctorRpcClient]
 type SynthesizerFactory = Callable[[MocoSettings], DoctorSynthesizer]
+type CloudflaredProbe = Callable[[], tuple[bool, bool]]
 logger = logging.getLogger(__name__)
+_CLOUDFLARED_SERVICE_LABEL = "dev.toarupen.moco-cloudflared"
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,12 +65,19 @@ async def run_doctor(
     rpc_factory: RpcFactory | None = None,
     synthesizer_factory: SynthesizerFactory | None = None,
     hotkey_probe: Callable[[], bool] | None = None,
+    cloudflared_probe: CloudflaredProbe | None = None,
     synthesize: str | None = None,
 ) -> list[DoctorCheck]:
     checks = [
         DoctorCheck("python", "ok", platform.python_version()),
         DoctorCheck("config", "ok", "loaded"),
     ]
+    checks.extend(
+        _check_public_operator(
+            settings,
+            probe=cloudflared_probe or _default_cloudflared_probe,
+        ),
+    )
     binary = settings.codex.binary
     binary_ok = binary.is_file() and os.access(binary, os.X_OK)
     checks.append(
@@ -99,6 +110,17 @@ async def run_doctor(
             synthesize=synthesize,
         ),
     )
+    checks.append(
+        DoctorCheck(
+            "irodori_route",
+            "ok",
+            (
+                "address_override_active"
+                if settings.irodori.connect_ip is not None
+                else "system_dns"
+            ),
+        ),
+    )
     probe = hotkey_probe or (lambda: _default_hotkey_probe(settings))
     try:
         hotkeys_ok = probe()
@@ -112,6 +134,62 @@ async def run_doctor(
         ),
     )
     return checks
+
+
+def _check_public_operator(
+    settings: MocoSettings,
+    *,
+    probe: CloudflaredProbe,
+) -> list[DoctorCheck]:
+    if settings.server.public_url is None:
+        return [
+            DoctorCheck("operator_public_url", "ok", "not_configured"),
+            DoctorCheck("cloudflared_binary", "ok", "not_configured"),
+            DoctorCheck("cloudflared_service", "ok", "not_configured"),
+        ]
+    try:
+        binary_available, service_running = probe()
+    except (OSError, subprocess.SubprocessError):
+        return [
+            DoctorCheck("operator_public_url", "ok", "configured"),
+            DoctorCheck("cloudflared_binary", "error", "probe_failed"),
+            DoctorCheck("cloudflared_service", "blocked", "probe_failed"),
+        ]
+    return [
+        DoctorCheck("operator_public_url", "ok", "configured"),
+        DoctorCheck(
+            "cloudflared_binary",
+            "ok" if binary_available else "error",
+            "available" if binary_available else "unavailable",
+        ),
+        DoctorCheck(
+            "cloudflared_service",
+            "ok" if service_running else ("error" if binary_available else "blocked"),
+            (
+                "running"
+                if service_running
+                else ("not_running" if binary_available else "binary_unavailable")
+            ),
+        ),
+    ]
+
+
+def _default_cloudflared_probe() -> tuple[bool, bool]:
+    binary_available = shutil.which("cloudflared") is not None
+    if not binary_available:
+        return False, False
+    completed = subprocess.run(  # noqa: S603
+        [
+            "/bin/launchctl",
+            "print",
+            f"gui/{os.getuid()}/{_CLOUDFLARED_SERVICE_LABEL}",
+        ],
+        check=False,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        timeout=5,
+    )
+    return True, completed.returncode == 0 and b"state = running" in completed.stdout
 
 
 async def _probe_codex(
@@ -241,8 +319,8 @@ def _default_synthesizer_factory(settings: MocoSettings) -> DoctorSynthesizer:
 def _default_hotkey_probe(settings: MocoSettings) -> bool:
     loop = asyncio.get_running_loop()
     mapper = HotkeyMapper(
-        ptt_key=settings.hotkeys.push_to_talk,
-        cancel_key=settings.hotkeys.cancel,
+        start_key=settings.hotkeys.start_listening,
+        stop_key=settings.hotkeys.stop_listening,
         emit=lambda _control: None,
     )
     listener = GlobalHotkeyListener(loop=loop, mapper=mapper)

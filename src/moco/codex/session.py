@@ -20,10 +20,36 @@ DEFAULT_REALTIME_PROMPT = (
     "Use clear punctuation. Use Irodori-supported emoji only when expression requires it. "
     "Do not respond with structured JSON or Markdown."
 )
-CANCEL_INSTRUCTION = "現在の応答と作業を中止してください。"
-
 type TranscriptKind = Literal["delta", "done"]
 type TranscriptRole = Literal["assistant", "user"]
+type ActivityKind = Literal[
+    "turn",
+    "reasoning",
+    "command_execution",
+    "file_change",
+    "external_tool",
+    "subagent",
+    "web_search",
+    "image_view",
+    "image_generation",
+    "context_compaction",
+    "codex_work",
+]
+type ActivityPhase = Literal["started", "completed"]
+
+_ITEM_ACTIVITY: dict[str, ActivityKind] = {
+    "reasoning": "reasoning",
+    "commandExecution": "command_execution",
+    "fileChange": "file_change",
+    "mcpToolCall": "external_tool",
+    "dynamicToolCall": "external_tool",
+    "collabAgentToolCall": "subagent",
+    "subAgentActivity": "subagent",
+    "webSearch": "web_search",
+    "imageView": "image_view",
+    "imageGeneration": "image_generation",
+    "contextCompaction": "context_compaction",
+}
 
 _EVENTS_END = object()
 logger = logging.getLogger(__name__)
@@ -43,7 +69,24 @@ class RealtimeErrorEvent:
     message: str
 
 
-type RealtimeEvent = TranscriptEvent | RealtimeErrorEvent
+@dataclass(frozen=True, slots=True)
+class ActivityEvent:
+    kind: ActivityKind
+    phase: ActivityPhase
+    thread_id: str
+    turn_id: str
+    occurred_at_ms: int | None
+
+
+@dataclass(frozen=True, slots=True)
+class ReasoningSummaryEvent:
+    thread_id: str
+    turn_id: str
+    item_id: str
+    delta: str
+
+
+type RealtimeEvent = TranscriptEvent | RealtimeErrorEvent | ActivityEvent | ReasoningSummaryEvent
 
 
 class RpcClient(Protocol):
@@ -69,13 +112,18 @@ class CodexRealtimeSession:
         *,
         settings: MocoSettings,
         sdp_timeout: float = 10.0,
+        prompt: str = DEFAULT_REALTIME_PROMPT,
     ) -> None:
         if sdp_timeout <= 0:
             msg = "sdp_timeout must be positive"
             raise ValueError(msg)
+        if not prompt.strip():
+            msg = "realtime prompt must not be blank"
+            raise ValueError(msg)
         self._rpc = rpc
         self._settings = settings
         self._sdp_timeout = sdp_timeout
+        self._prompt = prompt
         self._thread_id: str | None = None
         self._active_turn_id: str | None = None
         self._notification_task: asyncio.Task[None] | None = None
@@ -148,7 +196,7 @@ class CodexRealtimeSession:
                     "threadId": self._thread_id,
                     "outputModality": "audio",
                     "includeStartupContext": False,
-                    "prompt": DEFAULT_REALTIME_PROMPT,
+                    "prompt": self._prompt,
                     "transport": {"type": "webrtc", "sdp": offer_sdp},
                     "version": "v3",
                 },
@@ -185,34 +233,6 @@ class CodexRealtimeSession:
             if isinstance(item, CodexRpcError):
                 raise item
             yield cast("RealtimeEvent", item)
-
-    async def cancel_current(self) -> None:
-        if self._thread_id is None or not self._realtime_started:
-            return
-        safe_event(
-            logger,
-            "conversation_cancelled",
-            component="codex",
-            control="cancel",
-            state="cancelling",
-        )
-        if self._active_turn_id is not None:
-            await self._rpc.request(
-                "turn/interrupt",
-                {
-                    "threadId": self._thread_id,
-                    "turnId": self._active_turn_id,
-                },
-            )
-            self._active_turn_id = None
-        await self._rpc.request(
-            "thread/realtime/appendText",
-            {
-                "threadId": self._thread_id,
-                "role": "user",
-                "text": CANCEL_INSTRUCTION,
-            },
-        )
 
     async def close(self) -> None:
         async with self._close_lock:
@@ -265,8 +285,19 @@ class CodexRealtimeSession:
         if notification.method in {"turn/started", "turn/completed"}:
             self._handle_turn_notification(notification)
             return
+        if notification.method in {"item/started", "item/completed"}:
+            self._handle_item_notification(notification)
+            return
+        if notification.method == "item/reasoning/summaryTextDelta":
+            self._handle_reasoning_summary(notification)
+            return
+        if notification.method == "item/reasoning/textDelta":
+            return
         if not notification.method.startswith("thread/realtime/"):
             return
+        self._handle_realtime_notification(notification)
+
+    def _handle_realtime_notification(self, notification: RpcNotification) -> None:
         thread_id = _required_string(notification.params, "threadId", notification.method)
         if self._thread_id is None or thread_id != self._thread_id:
             return
@@ -313,8 +344,66 @@ class CodexRealtimeSession:
         turn_id = _required_string(raw_turn, "id", notification.method)
         if notification.method == "turn/started":
             self._active_turn_id = turn_id
+            self._events.put_nowait(
+                ActivityEvent("turn", "started", thread_id, turn_id, None),
+            )
         elif turn_id == self._active_turn_id:
             self._active_turn_id = None
+            self._events.put_nowait(
+                ActivityEvent("turn", "completed", thread_id, turn_id, None),
+            )
+
+    def _handle_item_notification(self, notification: RpcNotification) -> None:
+        thread_id = _required_string(notification.params, "threadId", notification.method)
+        if thread_id != self._thread_id:
+            return
+        turn_id = _required_string(notification.params, "turnId", notification.method)
+        if turn_id != self._active_turn_id:
+            return
+        raw_item = notification.params.get("item")
+        if not isinstance(raw_item, dict):
+            msg = f"Codex notification {notification.method!r} had an invalid 'item'"
+            raise CodexRpcError(msg)
+        item_type = _required_string(raw_item, "type", notification.method)
+        kind = _ITEM_ACTIVITY.get(item_type, "codex_work")
+        if notification.method == "item/started":
+            phase: ActivityPhase = "started"
+            timestamp_field = "startedAtMs"
+        else:
+            phase = "completed"
+            timestamp_field = "completedAtMs"
+        occurred_at_ms = _required_int(
+            notification.params,
+            timestamp_field,
+            notification.method,
+        )
+        self._events.put_nowait(
+            ActivityEvent(kind, phase, thread_id, turn_id, occurred_at_ms),
+        )
+
+    def _handle_reasoning_summary(self, notification: RpcNotification) -> None:
+        thread_id = _required_string(notification.params, "threadId", notification.method)
+        if thread_id != self._thread_id:
+            return
+        turn_id = _required_string(notification.params, "turnId", notification.method)
+        if turn_id != self._active_turn_id:
+            return
+        self._events.put_nowait(
+            ReasoningSummaryEvent(
+                thread_id=thread_id,
+                turn_id=turn_id,
+                item_id=_required_string(
+                    notification.params,
+                    "itemId",
+                    notification.method,
+                ),
+                delta=_required_string(
+                    notification.params,
+                    "delta",
+                    notification.method,
+                ),
+            ),
+        )
 
     def _fail_session(self, error: CodexRpcError) -> None:
         if self._sdp_future is not None and not self._sdp_future.done():
@@ -359,6 +448,18 @@ def _required_string(
 ) -> str:
     value = params.get(field)
     if not isinstance(value, str) or not value:
+        msg = f"Codex notification {method!r} had an invalid {field!r}"
+        raise CodexRpcError(msg)
+    return value
+
+
+def _required_int(
+    params: Mapping[str, JsonValue],
+    field: str,
+    method: str,
+) -> int:
+    value = params.get(field)
+    if not isinstance(value, int) or isinstance(value, bool):
         msg = f"Codex notification {method!r} had an invalid {field!r}"
         raise CodexRpcError(msg)
     return value

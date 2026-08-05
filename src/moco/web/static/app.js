@@ -1,12 +1,76 @@
+import { ActivityBuffer, ActivityView, ProgressTracker, ProgressView } from "./activity.js";
+import {
+  EDITABLE_TOKENS,
+  isEditableTarget,
+  PRESET_OPTIONS,
+  PRESETS,
+  ThemeController,
+  watchSystemTheme,
+} from "./theme.js";
+
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
+const CAPABILITY_STORAGE_KEY = "moco.capability";
+const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
 
+const ERROR_COPY = Object.freeze({
+  invalid_message: "受信した操作を解釈できませんでした",
+  already_started: "Realtime 会話はすでに開始しています",
+  irodori_not_ready: "Irodori の音声モデルを利用できません",
+  conversation_start_failed: "Realtime 会話を開始できませんでした",
+  conversation_not_started: "Realtime 会話が開始していません",
+  voice_not_available: "選択した音声モデルを利用できません",
+  codex_realtime_error: "Codex Realtime でエラーが発生しました",
+  invalid_realtime_event: "Codex から不正なイベントを受信しました",
+  single_operator_only: "別のオペレーター画面が接続しています",
+  websocket_disconnected: "オペレーター接続が切断されました",
+  ice_gathering_timeout: "音声接続の準備が完了しませんでした",
+  websocket_open_timeout: "オペレーター接続が時間内に開きませんでした",
+  websocket_failed: "オペレーター接続に失敗しました",
+  websocket_closed_before_open: "オペレーター接続が開始前に閉じました",
+  webrtc_connection_failed: "Realtime 音声接続が失敗しました",
+  theme_config_invalid: "保存済み配色を読み込めないため既定値へ戻しました",
+  audio_decode_failed: "受信した音声を再生できませんでした",
+  audio_start_failed: "音声出力を開始できませんでした",
+  audio_resume_failed: "音声出力を有効化できませんでした",
+  microphone_permission_denied: "マイクの使用が許可されませんでした",
+  microphone_unavailable: "利用可能なマイクが見つかりませんでした",
+  microphone_failed: "マイクを開始できませんでした",
+  synthesis_failed: "音声生成中に予期しないエラーが発生しました",
+  pairing_failed: "スマートフォン接続用QRを取得できませんでした",
+});
+
+const CONVERSATION_START_ERRORS = new Set([
+  "already_started",
+  "conversation_start_failed",
+  "irodori_not_ready",
+]);
+
+const THEME_LABELS = Object.freeze({
+  background: "背景",
+  surface: "パネル",
+  surfaceRaised: "強調パネル",
+  border: "境界線",
+  text: "本文",
+  textMuted: "補助文字",
+  accent: "情報アクセント",
+  actionAccent: "操作アクセント",
+});
+
+const THEME_GROUP_LABELS = Object.freeze({
+  automatic: "自動",
+  light: "Light",
+  dark: "Dark",
+  accessibility: "アクセシビリティ",
+});
+
 export class AudioPlaybackQueue {
-  constructor(context, onState) {
+  constructor(context, onState, onError = () => {}) {
     this.context = context;
     this.onState = onState;
+    this.onError = onError;
     this.sources = new Set();
     this.epoch = 0;
     this.chain = Promise.resolve();
@@ -19,31 +83,43 @@ export class AudioPlaybackQueue {
 
   enqueue(bytes) {
     const epoch = this.epoch;
-    this.chain = this.chain.then(async () => {
-      const buffer = await this.context.decodeAudioData(bytes.slice(0));
-      if (epoch !== this.epoch) {
-        return;
-      }
-      const source = this.context.createBufferSource();
-      source.buffer = buffer;
-      source.connect(this.context.destination);
-      const startAt = Math.max(this.context.currentTime + 0.02, this.nextStart);
-      this.nextStart = startAt + buffer.duration;
-      this.sources.add(source);
-      this.onState(true);
-      source.addEventListener(
-        "ended",
-        () => {
-          this.sources.delete(source);
-          if (!this.isPlaying) {
-            this.nextStart = this.context.currentTime;
-            this.onState(false);
-          }
-        },
-        { once: true },
-      );
-      source.start(startAt);
-    });
+    this.chain = this.chain
+      .then(async () => {
+        const buffer = await this.context.decodeAudioData(bytes.slice(0));
+        if (epoch !== this.epoch) {
+          return;
+        }
+        const source = this.context.createBufferSource();
+        source.buffer = buffer;
+        source.connect(this.context.destination);
+        const startAt = Math.max(this.context.currentTime + 0.02, this.nextStart);
+        source.addEventListener(
+          "ended",
+          () => {
+            this.sources.delete(source);
+            if (!this.isPlaying) {
+              this.nextStart = this.context.currentTime;
+              this.onState(false);
+            }
+          },
+          { once: true },
+        );
+        try {
+          source.start(startAt);
+        } catch {
+          throw namedError("audio_start_failed");
+        }
+        this.nextStart = startAt + buffer.duration;
+        this.sources.add(source);
+        this.onState(true);
+      })
+      .catch((error) => {
+        if (!this.isPlaying) {
+          this.nextStart = this.context.currentTime;
+          this.onState(false);
+        }
+        this.onError(error.name === "audio_start_failed" ? error.name : "audio_decode_failed");
+      });
   }
 
   stop() {
@@ -64,20 +140,20 @@ export class AudioPlaybackQueue {
 }
 
 export class BrowserHotkeyMapper {
-  constructor({ globalHotkeysEnabled, pttKey, cancelKey }) {
-    this.configure({ globalHotkeysEnabled, pttKey, cancelKey });
+  constructor({ globalHotkeysEnabled, startKey, stopKey }) {
+    this.configure({ globalHotkeysEnabled, startKey, stopKey });
   }
 
-  configure({ globalHotkeysEnabled, pttKey, cancelKey }) {
-    const canonicalPtt = pttKey.toLowerCase();
-    const canonicalCancel = cancelKey.toLowerCase();
+  configure({ globalHotkeysEnabled, startKey, stopKey }) {
+    const canonicalStart = startKey.toLowerCase();
+    const canonicalStop = stopKey.toLowerCase();
     const changed =
       this.globalHotkeysEnabled !== globalHotkeysEnabled ||
-      this.pttKey !== canonicalPtt ||
-      this.cancelKey !== canonicalCancel;
+      this.startKey !== canonicalStart ||
+      this.stopKey !== canonicalStop;
     this.globalHotkeysEnabled = globalHotkeysEnabled;
-    this.pttKey = canonicalPtt;
-    this.cancelKey = canonicalCancel;
+    this.startKey = canonicalStart;
+    this.stopKey = canonicalStop;
     if (changed) {
       this.pressed = new Set();
     }
@@ -86,7 +162,7 @@ export class BrowserHotkeyMapper {
   handles(key) {
     const canonical = key.toLowerCase();
     return (
-      !this.globalHotkeysEnabled && (canonical === this.pttKey || canonical === this.cancelKey)
+      !this.globalHotkeysEnabled && (canonical === this.startKey || canonical === this.stopKey)
     );
   }
 
@@ -96,7 +172,7 @@ export class BrowserHotkeyMapper {
       return null;
     }
     this.pressed.add(canonical);
-    return canonical === this.pttKey ? "ptt_down" : "cancel";
+    return canonical === this.startKey ? "listen_start" : "listen_stop";
   }
 
   keyUp(key) {
@@ -104,7 +180,102 @@ export class BrowserHotkeyMapper {
     if (!this.handles(canonical) || !this.pressed.delete(canonical)) {
       return null;
     }
-    return canonical === this.pttKey ? "ptt_up" : null;
+    return null;
+  }
+}
+
+export function shouldHandleHotkey(event, mapper) {
+  return !isEditableTarget(event.target) && mapper.handles(event.key);
+}
+
+export class OperatorStatus {
+  constructor({ activityBuffer, activityView, error, errorText, progress, progressView }) {
+    this.activityBuffer = activityBuffer;
+    this.activityView = activityView;
+    this.error = error;
+    this.errorText = errorText;
+    this.progress = progress;
+    this.progressView = progressView;
+  }
+
+  consume(message) {
+    if (message.type === "activity") {
+      this.#append(message);
+    } else if (message.type === "reasoning_summary") {
+      const item = this.activityBuffer.addSummary(message);
+      this.progress.consume(item);
+      this.#render();
+    } else if (message.type === "error") {
+      this.showError(message.code);
+    }
+  }
+
+  addLocal({ kind, phase, label, occurredAtMs = Date.now() }) {
+    this.#append({ kind, phase, label, occurredAtMs });
+  }
+
+  showError(code) {
+    const label = `${code} — ${ERROR_COPY[code] ?? "不明なエラー"}`;
+    this.errorText.textContent = label;
+    this.error.hidden = false;
+    this.addLocal({ kind: "error", phase: "completed", label });
+  }
+
+  dismissError() {
+    this.error.hidden = true;
+  }
+
+  renderProgress() {
+    this.progressView.render(this.progress.snapshot());
+  }
+
+  disconnect() {
+    this.progress.disconnect();
+    this.renderProgress();
+  }
+
+  expire() {
+    this.progress.expire();
+    this.renderProgress();
+  }
+
+  #append(event) {
+    const item = this.activityBuffer.add(event);
+    this.progress.consume(item);
+    this.#render();
+  }
+
+  #render() {
+    this.activityView.render(this.activityBuffer.items);
+    this.renderProgress();
+  }
+}
+
+export class VoiceModelController {
+  constructor({ select, send, createOption = (label, value) => new Option(label, value) }) {
+    this.element = select;
+    this.send = send;
+    this.createOption = createOption;
+  }
+
+  configure({ options, selected }) {
+    const choices = [
+      this.createOption("NARRATOR / DEFAULT", ""),
+      ...options.map((speaker) => this.createOption(speaker, speaker)),
+    ];
+    this.element.replaceChildren(...choices);
+    this.confirm(selected);
+    this.element.disabled = false;
+  }
+
+  confirm(selected) {
+    this.selected = selected ?? "";
+    this.element.value = this.selected;
+  }
+
+  select(value) {
+    this.element.value = this.selected;
+    this.send({ type: "select_voice", speaker: value || null });
   }
 }
 
@@ -117,31 +288,31 @@ export class MocoController {
     this.audioGeneration = 0;
     this.idleExpired = false;
     this.pendingAudio = null;
+    this.controlEpoch = 0;
   }
 
   async applyControl(control) {
+    const epoch = ++this.controlEpoch;
     const track = this.stream.getAudioTracks()[0];
     if (!track) {
-      return;
+      return false;
     }
-    if (control === "ptt_down") {
+    if (control === "listen_start") {
       if (this.idleExpired) {
         await this.reconnect();
+        if (epoch !== this.controlEpoch) {
+          return false;
+        }
         this.idleExpired = false;
       }
-      this.playback.stop();
-      this.audioGeneration += 1;
       track.enabled = true;
-    } else if (control === "ptt_up") {
+    } else if (control === "listen_stop") {
       track.enabled = false;
-    } else if (control === "cancel") {
-      track.enabled = false;
-      this.audioGeneration += 1;
-      this.playback.stop();
     } else {
-      return;
+      return false;
     }
     this.send({ type: "control", control });
+    return true;
   }
 
   acceptAudio(metadata) {
@@ -162,6 +333,26 @@ export class MocoController {
     this.audioGeneration = generation;
     this.pendingAudio = null;
     this.playback.stop();
+  }
+
+  disconnect() {
+    this.controlEpoch += 1;
+    const track = this.stream.getAudioTracks()[0];
+    if (track) {
+      track.enabled = false;
+    }
+    this.audioGeneration += 1;
+    this.pendingAudio = null;
+    this.playback.stop();
+  }
+
+  expire() {
+    this.controlEpoch += 1;
+    const track = this.stream.getAudioTracks()[0];
+    if (track) {
+      track.enabled = false;
+    }
+    this.idleExpired = true;
   }
 }
 
@@ -204,10 +395,55 @@ class TranscriptView {
   }
 }
 
-function namedError(code) {
+function namedError(code, { displayed = false } = {}) {
   const error = new Error(code);
   error.name = code;
+  error.displayed = displayed;
   return error;
+}
+
+export class ConversationHandshake {
+  constructor(applyAnswer) {
+    this.applyAnswer = applyAnswer;
+    this.settled = false;
+    this.promise = new Promise((resolve, reject) => {
+      this.resolve = resolve;
+      this.reject = reject;
+    });
+  }
+
+  async consume(message) {
+    if (this.settled) {
+      return false;
+    }
+    if (message.type === "sdp_answer") {
+      try {
+        await this.applyAnswer(message.sdp);
+      } catch {
+        this.#fail("webrtc_connection_failed");
+        return true;
+      }
+      this.settled = true;
+      this.resolve();
+      return true;
+    }
+    if (message.type === "error" && CONVERSATION_START_ERRORS.has(message.code)) {
+      this.#fail(message.code, true);
+    }
+    return false;
+  }
+
+  cancel(code, { displayed = false } = {}) {
+    this.#fail(code, displayed);
+  }
+
+  #fail(code, displayed = false) {
+    if (this.settled) {
+      return;
+    }
+    this.settled = true;
+    this.reject(namedError(code, { displayed }));
+  }
 }
 
 export function waitForIce(peer, { timeoutMs = ICE_GATHERING_TIMEOUT_MS } = {}) {
@@ -258,30 +494,406 @@ export function waitForSocketOpen(socket, { timeoutMs = WEBSOCKET_OPEN_TIMEOUT_M
   });
 }
 
+export function watchPeerFailure(peer, onFailure) {
+  const listener = () => {
+    if (peer.connectionState === "failed") {
+      onFailure("webrtc_connection_failed");
+    }
+  };
+  peer.addEventListener("connectionstatechange", listener);
+  return () => peer.removeEventListener("connectionstatechange", listener);
+}
+
+export function closeSocketForFailure(socket, error, onFailure) {
+  if (!socket) {
+    return false;
+  }
+  const code = error?.name && error.name !== "Error" ? error.name : "conversation_start_failed";
+  onFailure({ code, displayed: error?.displayed === true });
+  socket.close();
+  return true;
+}
+
+export function connectionCloseErrorCode(failure, wasOnline) {
+  if (failure) {
+    return failure.displayed ? null : failure.code;
+  }
+  return wasOnline ? "websocket_disconnected" : null;
+}
+
+export function beginAudioActivation(AudioContextConstructor = globalThis.AudioContext) {
+  const context = new AudioContextConstructor();
+  return { context, ready: context.resume() };
+}
+
+export function connectionSetupErrorCode(stage, error) {
+  if (stage === "audio") {
+    return "audio_resume_failed";
+  }
+  if (stage === "microphone" && error?.name === "NotAllowedError") {
+    return "microphone_permission_denied";
+  }
+  if (stage === "microphone" && error?.name === "NotFoundError") {
+    return "microphone_unavailable";
+  }
+  if (stage === "microphone") {
+    return "microphone_failed";
+  }
+  return error?.name || "enable_failed";
+}
+
 export async function closeAudioContext(context) {
   if (context && context.state !== "closed") {
     await context.close();
   }
 }
 
+export async function closeDisconnectedMedia({ context, controller, controls, peer, stream }) {
+  for (const control of controls) {
+    control.disabled = true;
+  }
+  controller?.disconnect();
+  peer?.close();
+  for (const track of stream?.getTracks() ?? []) {
+    track.stop();
+  }
+  await closeAudioContext(context);
+}
+
+export function resetConnectionAttempt(progressTimer, clearTimer = clearInterval) {
+  if (progressTimer !== undefined) {
+    clearTimer(progressTimer);
+  }
+  return { openPromise: null, progressTimer: undefined };
+}
+
+export function setConnectionAction({ row, button }, state) {
+  const connected = state === "connected";
+  row.hidden = connected;
+  if (!connected) {
+    button.disabled = false;
+    button.textContent = state === "disconnected" ? "再接続" : "接続";
+  }
+}
+
+export function loadCapability({ location, history, storage }) {
+  const capabilityFromUrl = location.hash.slice(1);
+  if (capabilityFromUrl) {
+    storage.setItem(CAPABILITY_STORAGE_KEY, capabilityFromUrl);
+    history.replaceState(null, "", location.pathname);
+    return capabilityFromUrl;
+  }
+  return storage.getItem(CAPABILITY_STORAGE_KEY) ?? "";
+}
+
+export class PairingPanel {
+  constructor({
+    capability,
+    dom,
+    fetch,
+    location,
+    createObjectURL,
+    revokeObjectURL,
+    onError = () => {},
+  }) {
+    this.capability = capability;
+    this.dom = dom;
+    this.fetch = fetch;
+    this.location = location;
+    this.createObjectURL = createObjectURL;
+    this.revokeObjectURL = revokeObjectURL;
+    this.onError = onError;
+    this.objectURL = undefined;
+  }
+
+  get options() {
+    return {
+      cache: "no-store",
+      headers: { "X-Moco-Capability": this.capability },
+    };
+  }
+
+  async probe() {
+    if (!LOOPBACK_HOSTS.has(this.location.hostname)) {
+      return;
+    }
+    try {
+      const response = await this.fetch("/pairing.svg", {
+        ...this.options,
+        method: "HEAD",
+      });
+      this.dom.open.hidden = !response.ok;
+    } catch {
+      this.dom.open.hidden = true;
+      this.onError("pairing_failed");
+    }
+  }
+
+  async open() {
+    try {
+      const response = await this.fetch("/pairing.svg", this.options);
+      if (!response.ok) {
+        throw new Error("pairing_failed");
+      }
+      this.#discardObjectURL();
+      this.objectURL = this.createObjectURL(await response.blob());
+      this.dom.image.src = this.objectURL;
+      this.dom.panel.hidden = false;
+      this.dom.close.focus();
+    } catch {
+      this.onError("pairing_failed");
+    }
+  }
+
+  close() {
+    this.dom.panel.hidden = true;
+    this.dom.image.removeAttribute("src");
+    this.#discardObjectURL();
+    this.dom.open.focus();
+  }
+
+  #discardObjectURL() {
+    if (this.objectURL !== undefined) {
+      this.revokeObjectURL(this.objectURL);
+    }
+    this.objectURL = undefined;
+  }
+}
+
+export function renderPresetChoices(
+  container,
+  createElement = (tag) => document.createElement(tag),
+) {
+  let currentGroup;
+  let group;
+  for (const option of PRESET_OPTIONS) {
+    if (option.group !== currentGroup) {
+      currentGroup = option.group;
+      group = createElement("div");
+      group.className = "theme-preset-group";
+      const title = createElement("span");
+      title.className = "theme-preset-group-title";
+      title.textContent = THEME_GROUP_LABELS[option.group];
+      group.append(title);
+      container.append(group);
+    }
+    const label = createElement("label");
+    label.className = "theme-preset-choice";
+    const input = createElement("input");
+    input.type = "radio";
+    input.name = "theme-preset";
+    input.value = option.id;
+    const swatch = createElement("span");
+    swatch.className = "theme-preset-swatch";
+    swatch.setAttribute("aria-hidden", "true");
+    for (const color of option.preview) {
+      const sample = createElement("span");
+      sample.style.backgroundColor = color;
+      swatch.append(sample);
+    }
+    const name = createElement("span");
+    name.textContent = option.label;
+    label.append(input, swatch, name);
+    group.append(label);
+  }
+}
+
+export class ThemePanel {
+  constructor({ controller, dom }) {
+    this.controller = controller;
+    this.dom = dom;
+    this.inputs = new Map();
+    renderPresetChoices(this.dom.themePresets);
+    this.#createColorRows();
+    this.#bind();
+  }
+
+  render() {
+    const palette = this.controller.apply();
+    const selected = this.dom.themePresets.querySelector(
+      `input[value="${this.controller.theme.preset}"]`,
+    );
+    if (selected) {
+      selected.checked = true;
+    }
+    for (const [token, controls] of this.inputs) {
+      controls.color.value = palette[token];
+      controls.hex.value = palette[token];
+      controls.reset.disabled = !(token in this.controller.theme.overrides);
+    }
+    const warnings = this.controller.contrastWarnings();
+    this.dom.themeValidation.dataset.status = warnings.length === 0 ? "ok" : "warning";
+    this.dom.themeValidation.textContent =
+      warnings.length === 0
+        ? "コントラスト基準を満たしています"
+        : warnings
+            .map(
+              ({ foreground, background, minimum, ratio }) =>
+                `${THEME_LABELS[foreground]} / ${THEME_LABELS[background]}: ${ratio.toFixed(2)}（基準 ${minimum}）`,
+            )
+            .join(" · ");
+  }
+
+  open() {
+    this.dom.themePanel.hidden = false;
+    this.dom.themeToggle.setAttribute("aria-expanded", "true");
+    this.dom.themeClose.focus();
+  }
+
+  close() {
+    this.dom.themePanel.hidden = true;
+    this.dom.themeToggle.setAttribute("aria-expanded", "false");
+    this.dom.themeToggle.focus();
+  }
+
+  #createColorRows() {
+    for (const token of EDITABLE_TOKENS) {
+      const row = document.createElement("div");
+      const label = document.createElement("label");
+      const color = document.createElement("input");
+      const hex = document.createElement("input");
+      const reset = document.createElement("button");
+      const inputId = `theme-${token}`;
+      row.className = "theme-color-row";
+      label.htmlFor = inputId;
+      label.textContent = THEME_LABELS[token];
+      color.id = inputId;
+      color.type = "color";
+      color.setAttribute("aria-label", `${THEME_LABELS[token]}のカラーピッカー`);
+      hex.type = "text";
+      hex.inputMode = "text";
+      hex.maxLength = 7;
+      hex.setAttribute("aria-label", `${THEME_LABELS[token]}の16進カラー`);
+      reset.type = "button";
+      reset.textContent = "戻す";
+      reset.addEventListener("click", () => {
+        this.controller.resetOverride(token);
+        this.render();
+      });
+      const update = (value) => {
+        try {
+          this.controller.setOverride(token, value);
+          this.render();
+        } catch {
+          this.dom.themeValidation.dataset.status = "warning";
+          this.dom.themeValidation.textContent = "色は #rrggbb 形式で入力してください";
+        }
+      };
+      color.addEventListener("input", () => update(color.value));
+      hex.addEventListener("input", () => update(hex.value));
+      row.append(label, color, hex, reset);
+      this.dom.themeColors.append(row);
+      this.inputs.set(token, { color, hex, reset });
+    }
+  }
+
+  #bind() {
+    this.dom.themeToggle.addEventListener("click", () => this.open());
+    this.dom.themeClose.addEventListener("click", () => this.close());
+    this.dom.themePanel.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopPropagation();
+        this.close();
+      }
+    });
+    this.dom.themePresets.addEventListener("change", (event) => {
+      if (event.target instanceof HTMLInputElement && PRESETS.includes(event.target.value)) {
+        this.controller.selectPreset(event.target.value);
+        this.render();
+      }
+    });
+    this.dom.themeReset.addEventListener("click", () => {
+      this.controller.resetOverrides();
+      this.render();
+    });
+  }
+}
+
 function boot() {
   const dom = {
     enable: document.querySelector("#enable"),
+    connectionRow: document.querySelector("#connection-row"),
     state: document.querySelector("#state"),
     connection: document.querySelector("#connection"),
-    ptt: document.querySelector("#ptt"),
-    pttKey: document.querySelector("#ptt-key"),
-    cancel: document.querySelector("#cancel"),
-    cancelKey: document.querySelector("#cancel-key"),
+    micState: document.querySelector("#mic-state"),
+    listenStart: document.querySelector("#listen-start"),
+    startKey: document.querySelector("#start-key"),
+    listenStop: document.querySelector("#listen-stop"),
+    stopKey: document.querySelector("#stop-key"),
+    voice: document.querySelector("#voice"),
     error: document.querySelector("#error"),
+    errorText: document.querySelector("#error-text"),
+    errorClose: document.querySelector("#error-close"),
     transcript: document.querySelector("#transcript"),
     clear: document.querySelector("#clear"),
+    activity: document.querySelector("#activity"),
+    activityLatest: document.querySelector("#activity-latest"),
+    progressLabel: document.querySelector("#progress-label"),
+    progressElapsed: document.querySelector("#progress-elapsed"),
+    progressUpdated: document.querySelector("#progress-updated"),
+    themeToggle: document.querySelector("#theme-toggle"),
+    themePanel: document.querySelector("#theme-panel"),
+    themeClose: document.querySelector("#theme-close"),
+    themePresets: document.querySelector("#theme-presets"),
+    themeColors: document.querySelector("#theme-colors"),
+    themeValidation: document.querySelector("#theme-validation"),
+    themeReset: document.querySelector("#theme-reset"),
+    pairingOpen: document.querySelector("#pairing-open"),
+    pairingPanel: document.querySelector("#pairing-panel"),
+    pairingClose: document.querySelector("#pairing-close"),
+    pairingImage: document.querySelector("#pairing-image"),
   };
   const transcript = new TranscriptView(dom.transcript);
-  const capability = window.location.hash.slice(1);
-  if (capability) {
-    window.history.replaceState(null, "", window.location.pathname);
-  }
+  const activityBuffer = new ActivityBuffer();
+  const progress = new ProgressTracker();
+  const operatorStatus = new OperatorStatus({
+    activityBuffer,
+    activityView: new ActivityView({
+      container: dom.activity,
+      latestButton: dom.activityLatest,
+    }),
+    error: dom.error,
+    errorText: dom.errorText,
+    progress,
+    progressView: new ProgressView({
+      label: dom.progressLabel,
+      elapsed: dom.progressElapsed,
+      updated: dom.progressUpdated,
+    }),
+  });
+  const themeController = new ThemeController({
+    root: document.documentElement,
+    storage: window.localStorage,
+    onWarning: (code) => operatorStatus.showError(code),
+  });
+  themeController.load();
+  const themePanel = new ThemePanel({ controller: themeController, dom });
+  themePanel.render();
+  watchSystemTheme(themeController, window.matchMedia("(prefers-color-scheme: dark)"), () =>
+    themePanel.render(),
+  );
+  operatorStatus.renderProgress();
+  const capability = loadCapability({
+    location: window.location,
+    history: window.history,
+    storage: window.sessionStorage,
+  });
+  const pairingPanel = new PairingPanel({
+    capability,
+    dom: {
+      open: dom.pairingOpen,
+      panel: dom.pairingPanel,
+      close: dom.pairingClose,
+      image: dom.pairingImage,
+    },
+    fetch: window.fetch.bind(window),
+    location: window.location,
+    createObjectURL: (blob) => window.URL.createObjectURL(blob),
+    revokeObjectURL: (url) => window.URL.revokeObjectURL(url),
+    onError: (code) => operatorStatus.showError(code),
+  });
+  void pairingPanel.probe();
 
   let socket;
   let peer;
@@ -289,22 +901,25 @@ function boot() {
   let context;
   let controller;
   let openPromise;
+  let progressTimer;
+  let conversationHandshake;
+  let stopPeerWatch;
+  let socketCloseError;
   const hotkeyMapper = new BrowserHotkeyMapper({
     globalHotkeysEnabled: true,
-    pttKey: "",
-    cancelKey: "",
+    startKey: "",
+    stopKey: "",
   });
-
-  const showError = (code) => {
-    dom.error.hidden = false;
-    dom.error.textContent = `ERROR / ${code}`;
-  };
 
   const send = (message) => {
     if (socket?.readyState === WebSocket.OPEN) {
       socket.send(JSON.stringify(message));
     }
   };
+  const voiceModels = new VoiceModelController({
+    select: dom.voice,
+    send,
+  });
 
   const connectSocket = () => {
     if (openPromise) {
@@ -312,51 +927,137 @@ function boot() {
     }
     const url = new URL("/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    socket = new WebSocket(url, [WEBSOCKET_PROTOCOL, `${CAPABILITY_PREFIX}${capability}`]);
-    socket.binaryType = "arraybuffer";
-    socket.addEventListener("close", () => {
-      dom.connection.textContent = "SOCKET OFFLINE";
+    const nextSocket = new WebSocket(url, [
+      WEBSOCKET_PROTOCOL,
+      `${CAPABILITY_PREFIX}${capability}`,
+    ]);
+    socket = nextSocket;
+    nextSocket.binaryType = "arraybuffer";
+    let wasOnline = false;
+    nextSocket.addEventListener("close", () => {
+      if (socket !== nextSocket) {
+        return;
+      }
+      const disconnectError = socketCloseError;
+      const disconnectCode = disconnectError?.code;
+      socketCloseError = undefined;
+      dom.connection.textContent = "WS OFFLINE";
+      dom.connection.dataset.status = "error";
+      dom.micState.textContent = "MIC OFF";
+      dom.micState.dataset.status = "muted";
+      clearInterval(progressTimer);
+      progressTimer = undefined;
       openPromise = null;
+      socket = undefined;
+      stopPeerWatch?.();
+      stopPeerWatch = undefined;
+      conversationHandshake?.cancel(disconnectCode ?? "websocket_disconnected", {
+        displayed: true,
+      });
+      conversationHandshake = undefined;
+      const disconnectedMedia = {
+        context,
+        controller,
+        controls: [dom.listenStart, dom.listenStop, dom.voice],
+        peer,
+        stream,
+      };
+      context = undefined;
+      controller = undefined;
+      peer = undefined;
+      stream = undefined;
+      void closeDisconnectedMedia(disconnectedMedia);
+      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      operatorStatus.disconnect();
+      const closeErrorCode = connectionCloseErrorCode(disconnectError, wasOnline);
+      if (closeErrorCode) {
+        operatorStatus.showError(closeErrorCode);
+      }
     });
-    socket.addEventListener("message", async (event) => {
+    nextSocket.addEventListener("message", async (event) => {
       if (typeof event.data !== "string") {
         controller?.consumeAudio(event.data);
         return;
       }
-      const message = JSON.parse(event.data);
+      let message;
+      try {
+        message = JSON.parse(event.data);
+      } catch {
+        operatorStatus.showError("invalid_message");
+        return;
+      }
+      if (conversationHandshake && (await conversationHandshake.consume(message))) {
+        return;
+      }
       if (message.type === "state") {
         dom.state.textContent = message.state.toUpperCase();
-        controller.idleExpired = message.state === "idle_expired";
-        const pttKey = message.hotkeys.pushToTalk.toLowerCase();
-        const cancelKey = message.hotkeys.cancel.toLowerCase();
+        dom.state.dataset.status = message.state === "ready" ? "ok" : "info";
+        if (controller) {
+          controller.idleExpired = message.state === "idle_expired";
+        }
+        if (message.state === "idle_expired") {
+          controller?.expire();
+          dom.micState.textContent = "MIC OFF";
+          dom.micState.dataset.status = "muted";
+          dom.listenStart.classList.remove("is-active");
+          dom.listenStart.setAttribute("aria-pressed", "false");
+          operatorStatus.expire();
+        } else if (message.state === "ready" && !progress.snapshot().active) {
+          progress.ready();
+          operatorStatus.renderProgress();
+        }
+        const startKey = message.hotkeys.startListening.toLowerCase();
+        const stopKey = message.hotkeys.stopListening.toLowerCase();
         hotkeyMapper.configure({
           globalHotkeysEnabled: message.hotkeys.enabled,
-          pttKey,
-          cancelKey,
+          startKey,
+          stopKey,
         });
-        dom.pttKey.textContent = pttKey.toUpperCase();
-        dom.cancelKey.textContent = cancelKey.toUpperCase();
-      } else if (message.type === "sdp_answer") {
-        await peer.setRemoteDescription({ type: "answer", sdp: message.sdp });
+        dom.startKey.textContent = startKey.toUpperCase();
+        dom.stopKey.textContent = stopKey.toUpperCase();
+        voiceModels.configure(message.voice);
       } else if (message.type === "control") {
-        await controller.applyControl(message.control);
+        await apply(message.control);
       } else if (message.type === "audio") {
-        controller.acceptAudio(message);
+        controller?.acceptAudio(message);
       } else if (message.type === "audio_invalidate") {
-        controller.invalidateAudio(message.generation);
+        controller?.invalidateAudio(message.generation);
       } else if (message.type === "transcript") {
         transcript.append(message.role, message.delta, message.done);
-      } else if (message.type === "error") {
-        showError(message.code);
+      } else if (message.type === "voice") {
+        voiceModels.confirm(message.selected);
+        operatorStatus.addLocal({
+          kind: "settings",
+          phase: "completed",
+          label: `音声モデル: ${message.selected || "既定"}`,
+        });
+      } else if (
+        message.type === "activity" ||
+        message.type === "reasoning_summary" ||
+        message.type === "error"
+      ) {
+        operatorStatus.consume(message);
       }
     });
-    openPromise = waitForSocketOpen(socket)
+    openPromise = waitForSocketOpen(nextSocket)
       .then(() => {
-        dom.connection.textContent = "SOCKET ONLINE";
+        wasOnline = true;
+        dom.connection.textContent = "WS ONLINE";
+        dom.connection.dataset.status = "ok";
+        operatorStatus.addLocal({
+          kind: "connection",
+          phase: "completed",
+          label: "オペレーター接続",
+        });
+        clearInterval(progressTimer);
+        progressTimer = window.setInterval(() => operatorStatus.renderProgress(), 1_000);
       })
       .catch((error) => {
         openPromise = null;
-        socket.close();
+        if (socket === nextSocket) {
+          socket = undefined;
+        }
+        nextSocket.close();
         throw error;
       });
     return openPromise;
@@ -364,26 +1065,64 @@ function boot() {
 
   const connectConversation = async () => {
     await connectSocket();
+    stopPeerWatch?.();
     peer?.close();
-    peer = new RTCPeerConnection();
-    peer.addTrack(stream.getAudioTracks()[0], stream);
-    peer.createDataChannel("oai-events");
-    const offer = await peer.createOffer();
-    await peer.setLocalDescription(offer);
-    await waitForIce(peer);
-    send({ type: "start", sdp: peer.localDescription.sdp });
+    const nextPeer = new RTCPeerConnection();
+    peer = nextPeer;
+    stopPeerWatch = watchPeerFailure(nextPeer, (code) => {
+      if (peer !== nextPeer) {
+        return;
+      }
+      closeSocketForFailure(socket, namedError(code), (failure) => {
+        socketCloseError = failure;
+      });
+    });
+    nextPeer.addTrack(stream.getAudioTracks()[0], stream);
+    nextPeer.createDataChannel("oai-events");
+    const offer = await nextPeer.createOffer();
+    await nextPeer.setLocalDescription(offer);
+    await waitForIce(nextPeer);
+    const handshake = new ConversationHandshake((sdp) =>
+      nextPeer.setRemoteDescription({ type: "answer", sdp }),
+    );
+    conversationHandshake = handshake;
+    send({ type: "start", sdp: nextPeer.localDescription.sdp });
+    try {
+      await handshake.promise;
+    } finally {
+      if (conversationHandshake === handshake) {
+        conversationHandshake = undefined;
+      }
+    }
   };
 
   dom.enable.addEventListener("click", async () => {
     dom.enable.disabled = true;
+    let stage = "audio";
     try {
+      const activation = beginAudioActivation();
+      context = activation.context;
+      await activation.ready;
+      stage = "microphone";
       stream = await navigator.mediaDevices.getUserMedia({ audio: true });
       stream.getAudioTracks()[0].enabled = false;
-      context = new AudioContext();
-      await context.resume();
-      const playback = new AudioPlaybackQueue(context, (active) => {
-        send({ type: "playback", active });
-      });
+      stage = "conversation";
+      let playbackActive = false;
+      const playback = new AudioPlaybackQueue(
+        context,
+        (active) => {
+          send({ type: "playback", active });
+          if (playbackActive !== active) {
+            playbackActive = active;
+            operatorStatus.addLocal({
+              kind: "playback",
+              phase: active ? "started" : "completed",
+              label: "音声再生",
+            });
+          }
+        },
+        (code) => operatorStatus.showError(code),
+      );
       controller = new MocoController({
         stream,
         playback,
@@ -391,12 +1130,17 @@ function boot() {
         reconnect: connectConversation,
       });
       await connectConversation();
-      dom.ptt.disabled = false;
-      dom.cancel.disabled = false;
-      dom.enable.textContent = "音声卓は有効です";
+      dom.listenStart.disabled = false;
+      dom.listenStop.disabled = false;
+      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "connected");
     } catch (error) {
+      stopPeerWatch?.();
+      stopPeerWatch = undefined;
       peer?.close();
-      socket?.close();
+      ({ openPromise, progressTimer } = resetConnectionAttempt(progressTimer));
+      const failedSocket = socket;
+      socket = undefined;
+      failedSocket?.close();
       for (const track of stream?.getTracks() ?? []) {
         track.stop();
       }
@@ -406,8 +1150,10 @@ function boot() {
       stream = undefined;
       context = undefined;
       controller = undefined;
-      showError(error.name || "enable_failed");
-      dom.enable.disabled = false;
+      if (!error.displayed) {
+        operatorStatus.showError(connectionSetupErrorCode(stage, error));
+      }
+      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
     }
   });
 
@@ -415,12 +1161,35 @@ function boot() {
     if (!controller) {
       return;
     }
-    dom.ptt.classList.toggle("is-active", control === "ptt_down");
-    await controller.applyControl(control);
+    const listening = control === "listen_start";
+    let applied;
+    try {
+      applied = await controller.applyControl(control);
+    } catch (error) {
+      const closing = closeSocketForFailure(socket, error, (failure) => {
+        socketCloseError = failure;
+      });
+      if (!closing && !error.displayed) {
+        operatorStatus.showError(error.name || "conversation_start_failed");
+      }
+      return;
+    }
+    if (!applied) {
+      return;
+    }
+    dom.listenStart.classList.toggle("is-active", listening);
+    dom.listenStart.setAttribute("aria-pressed", String(listening));
+    dom.micState.textContent = listening ? "MIC ON" : "MIC OFF";
+    dom.micState.dataset.status = listening ? "ok" : "muted";
+    operatorStatus.addLocal({
+      kind: "microphone",
+      phase: listening ? "started" : "completed",
+      label: listening ? "マイク入力" : "マイク入力を停止",
+    });
   };
 
   window.addEventListener("keydown", (event) => {
-    if (hotkeyMapper.handles(event.key)) {
+    if (shouldHandleHotkey(event, hotkeyMapper)) {
       event.preventDefault();
       const control = hotkeyMapper.keyDown(event.key);
       if (control !== null) {
@@ -429,7 +1198,7 @@ function boot() {
     }
   });
   window.addEventListener("keyup", (event) => {
-    if (hotkeyMapper.handles(event.key)) {
+    if (shouldHandleHotkey(event, hotkeyMapper)) {
       event.preventDefault();
       const control = hotkeyMapper.keyUp(event.key);
       if (control !== null) {
@@ -437,11 +1206,22 @@ function boot() {
       }
     }
   });
-  dom.ptt.addEventListener("pointerdown", () => void apply("ptt_down"));
-  dom.ptt.addEventListener("pointerup", () => void apply("ptt_up"));
-  dom.ptt.addEventListener("pointercancel", () => void apply("ptt_up"));
-  dom.cancel.addEventListener("click", () => void apply("cancel"));
+  dom.listenStart.addEventListener("click", () => void apply("listen_start"));
+  dom.listenStop.addEventListener("click", () => void apply("listen_stop"));
+  dom.voice.addEventListener("change", () => {
+    voiceModels.select(dom.voice.value);
+  });
   dom.clear.addEventListener("click", () => transcript.clear());
+  dom.errorClose.addEventListener("click", () => operatorStatus.dismissError());
+  dom.pairingOpen.addEventListener("click", () => void pairingPanel.open());
+  dom.pairingClose.addEventListener("click", () => pairingPanel.close());
+  dom.pairingPanel.addEventListener("keydown", (event) => {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      event.stopPropagation();
+      pairingPanel.close();
+    }
+  });
 }
 
 if (typeof window !== "undefined" && typeof document !== "undefined") {

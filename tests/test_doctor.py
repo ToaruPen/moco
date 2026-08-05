@@ -117,11 +117,15 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
     assert {check.code for check in checks} == {
         "python",
         "config",
+        "operator_public_url",
+        "cloudflared_binary",
+        "cloudflared_service",
         "codex_binary",
         "codex_account",
         "codex_features",
         "codex_voices",
         "irodori_health",
+        "irodori_route",
         "irodori_synthesis",
         "hotkeys",
     }
@@ -131,6 +135,117 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
     assert str(settings.irodori.base_url) not in rendered
     assert rpc.closed
     assert synthesizer.closed
+
+
+async def test_doctor_reports_public_operator_boundary(tmp_path: Path) -> None:
+    settings = MocoSettings.model_validate(
+        {
+            "server": {"public_url": "https://voice.example.com"},
+            "codex": {
+                "binary": str(tmp_path / "missing"),
+                "working_directory": str(tmp_path),
+            },
+        },
+    )
+    checks = await run_doctor(
+        settings,
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            FakeSynthesizer(),
+        ),
+        hotkey_probe=lambda: True,
+        cloudflared_probe=lambda: (True, True),
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["operator_public_url"] == DoctorCheck(
+        "operator_public_url",
+        "ok",
+        "configured",
+    )
+    assert by_code["cloudflared_binary"] == DoctorCheck(
+        "cloudflared_binary",
+        "ok",
+        "available",
+    )
+    assert by_code["cloudflared_service"] == DoctorCheck(
+        "cloudflared_service",
+        "ok",
+        "running",
+    )
+    assert "voice.example.com" not in "\n".join(check.detail for check in checks)
+
+
+@pytest.mark.parametrize(
+    ("probe", "binary_check", "service_check"),
+    [
+        (
+            (False, False),
+            DoctorCheck("cloudflared_binary", "error", "unavailable"),
+            DoctorCheck("cloudflared_service", "blocked", "binary_unavailable"),
+        ),
+        (
+            (True, False),
+            DoctorCheck("cloudflared_binary", "ok", "available"),
+            DoctorCheck("cloudflared_service", "error", "not_running"),
+        ),
+    ],
+)
+async def test_doctor_distinguishes_cloudflared_failures(
+    tmp_path: Path,
+    probe: tuple[bool, bool],
+    binary_check: DoctorCheck,
+    service_check: DoctorCheck,
+) -> None:
+    settings = MocoSettings.model_validate(
+        {
+            "server": {"public_url": "https://voice.example.com"},
+            "codex": {
+                "binary": str(tmp_path / "missing"),
+                "working_directory": str(tmp_path),
+            },
+        },
+    )
+    checks = await run_doctor(
+        settings,
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            FakeSynthesizer(),
+        ),
+        hotkey_probe=lambda: True,
+        cloudflared_probe=lambda: probe,
+    )
+
+    assert binary_check in checks
+    assert service_check in checks
+
+
+async def test_doctor_reports_explicit_irodori_address_override(
+    tmp_path: Path,
+) -> None:
+    settings = MocoSettings.model_validate(
+        {
+            "codex": {
+                "binary": str(tmp_path / "missing"),
+                "working_directory": str(tmp_path),
+            },
+            "irodori": {
+                "base_url": "https://windows-node.example.ts.net",
+                "connect_ip": "100.112.161.83",
+            },
+        },
+    )
+
+    checks = await run_doctor(
+        settings,
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            FakeSynthesizer(),
+        ),
+        hotkey_probe=lambda: True,
+    )
+
+    assert DoctorCheck("irodori_route", "ok", "address_override_active") in checks
 
 
 async def test_doctor_blocks_codex_checks_when_binary_is_missing(

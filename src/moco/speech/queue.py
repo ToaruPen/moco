@@ -15,6 +15,7 @@ from moco.speech.text import TranscriptSegmenter
 
 type TranscriptRole = Literal["assistant", "user"]
 type Delivery = Callable[[bytes], object | Awaitable[object]]
+type ErrorReporter = Callable[[str], object | Awaitable[object]]
 logger = logging.getLogger(__name__)
 
 
@@ -35,9 +36,11 @@ class SpeechQueue:
         *,
         deliver: Delivery,
         max_chars: int,
+        on_error: ErrorReporter | None = None,
     ) -> None:
         self._synthesizer = synthesizer
         self._deliver = deliver
+        self._on_error = on_error
         self._segmenter = TranscriptSegmenter(max_chars=max_chars)
         self._items: deque[_SpeechItem] = deque()
         self._condition = asyncio.Condition()
@@ -98,13 +101,12 @@ class SpeechQueue:
             self._assistant_has_streamed = False
         await self._enqueue(segments)
 
-    async def cancel(self) -> None:
+    async def invalidate(self) -> None:
         safe_event(
             logger,
-            "speech_cancelled",
+            "speech_invalidated",
             component="speech",
-            control="cancel",
-            state="cancelling",
+            state="invalidating",
         )
         async with self._condition:
             self._generation += 1
@@ -126,7 +128,7 @@ class SpeechQueue:
     async def close(self) -> None:
         if self._closed:
             return
-        await self.cancel()
+        await self.invalidate()
         async with self._condition:
             self._closed = True
             self._condition.notify_all()
@@ -182,6 +184,20 @@ class SpeechQueue:
                 event_code=error.code,
                 result="error",
             )
+            await self._report_error(error.code)
+            return
+        except Exception:  # noqa: BLE001
+            code = "synthesis_failed"
+            self._error_codes.append(code)
+            safe_event(
+                logger,
+                "synthesis_failed",
+                component="speech",
+                boundary="irodori_http",
+                event_code=code,
+                result="error",
+            )
+            await self._report_error(code)
             return
 
         if item.generation != self._generation:
@@ -200,5 +216,23 @@ class SpeechQueue:
                 component="speech",
                 boundary="browser_audio",
                 event_code="audio_delivery_failed",
+                result="error",
+            )
+            await self._report_error("audio_delivery_failed")
+
+    async def _report_error(self, code: str) -> None:
+        if self._on_error is None:
+            return
+        try:
+            result = self._on_error(code)
+            if inspect.isawaitable(result):
+                await cast("Awaitable[object]", result)
+        except Exception:  # noqa: BLE001
+            safe_event(
+                logger,
+                "speech_error_notification_failed",
+                component="speech",
+                boundary="browser_websocket",
+                event_code="speech_error_notification_failed",
                 result="error",
             )

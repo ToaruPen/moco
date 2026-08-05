@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from contextlib import suppress
 
 from moco.speech.irodori import IrodoriError
 from moco.speech.queue import SpeechQueue
@@ -27,6 +28,10 @@ class DeliveryFailureError(RuntimeError):
     """Synthetic playback delivery failure."""
 
 
+class UnexpectedSynthesisError(OSError):
+    """Synthetic unexpected synthesizer failure."""
+
+
 async def test_worker_synthesizes_and_delivers_fifo() -> None:
     synthesizer = FakeSynthesizer()
     delivered: list[bytes] = []
@@ -41,7 +46,7 @@ async def test_worker_synthesizes_and_delivers_fifo() -> None:
     await queue.close()
 
 
-async def test_cancel_discards_active_generation_before_delivery() -> None:
+async def test_invalidate_discards_active_generation_before_delivery() -> None:
     synthesizer = FakeSynthesizer()
     synthesizer.gate = asyncio.Event()
     delivered: list[bytes] = []
@@ -50,7 +55,7 @@ async def test_cancel_discards_active_generation_before_delivery() -> None:
     await queue.on_transcript(role="assistant", delta="古い返事。", done=True)
     await asyncio.sleep(0)
 
-    await queue.cancel()
+    await queue.invalidate()
     synthesizer.gate.set()
     await queue.join()
 
@@ -58,12 +63,12 @@ async def test_cancel_discards_active_generation_before_delivery() -> None:
     await queue.close()
 
 
-async def test_cancel_suppresses_assistant_until_next_user_turn() -> None:
+async def test_invalidate_suppresses_assistant_until_next_user_turn() -> None:
     synthesizer = FakeSynthesizer()
     queue = SpeechQueue(synthesizer, deliver=lambda _wav: None, max_chars=80)
 
     await queue.on_transcript(role="assistant", delta="古い返事。", done=True)
-    await queue.cancel()
+    await queue.invalidate()
     await queue.on_transcript(role="assistant", delta="まだ古い返事。", done=True)
     assert queue.pending_count == 0
 
@@ -89,7 +94,57 @@ async def test_contract_error_does_not_kill_consumer() -> None:
     await queue.close()
 
 
-async def test_cancel_waits_for_and_stops_in_progress_delivery() -> None:
+async def test_contract_error_is_reported_to_the_owner() -> None:
+    synthesizer = FakeSynthesizer()
+    synthesizer.fail_once = True
+    reported: list[str] = []
+    queue = SpeechQueue(
+        synthesizer,
+        deliver=lambda _wav: None,
+        max_chars=80,
+        on_error=reported.append,
+    )
+    queue.start()
+
+    await queue.on_transcript(role="assistant", delta="失敗。", done=True)
+    await queue.join()
+
+    assert reported == ["invalid_response"]
+    await queue.close()
+
+
+async def test_unexpected_synthesis_error_is_reported_without_stopping_worker() -> None:
+    class UnexpectedFailureSynthesizer(FakeSynthesizer):
+        async def synthesize(self, text: str) -> bytes:
+            self.calls.append(text)
+            if len(self.calls) == 1:
+                raise UnexpectedSynthesisError
+            return f"wav:{text}".encode()
+
+    synthesizer = UnexpectedFailureSynthesizer()
+    delivered: list[bytes] = []
+    reported: list[str] = []
+    queue = SpeechQueue(
+        synthesizer,
+        deliver=delivered.append,
+        max_chars=80,
+        on_error=reported.append,
+    )
+    queue.start()
+    await queue.on_transcript(role="assistant", delta="失敗。成功。", done=True)
+
+    try:
+        await asyncio.wait_for(queue.join(), timeout=0.2)
+    finally:
+        with suppress(Exception):
+            await queue.close()
+
+    assert queue.error_codes == ("synthesis_failed",)
+    assert reported == ["synthesis_failed"]
+    assert delivered == ["wav:成功。".encode()]
+
+
+async def test_invalidate_waits_for_and_stops_in_progress_delivery() -> None:
     synthesizer = FakeSynthesizer()
     delivery_started = asyncio.Event()
     release_delivery = asyncio.Event()
@@ -105,7 +160,7 @@ async def test_cancel_waits_for_and_stops_in_progress_delivery() -> None:
     await queue.on_transcript(role="assistant", delta="古い返事。", done=True)
     await delivery_started.wait()
 
-    await queue.cancel()
+    await queue.invalidate()
     release_delivery.set()
     await queue.join()
 

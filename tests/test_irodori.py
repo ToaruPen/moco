@@ -13,6 +13,7 @@ from moco.speech.irodori import (
     IrodoriClient,
     IrodoriError,
     IrodoriSynthesizer,
+    _AddressOverrideTransport,
     _is_complete_wav,
     _LimitedResponseStream,
     _LimitedResponseTransport,
@@ -29,6 +30,7 @@ class FakeIrodoriClient:
         self.wav = wav if wav is not None else valid_wav()
         self.requests: list[SynthesisRequest] = []
         self.error: Exception | None = None
+        self.close_error: Exception | None = None
         self.closed = False
 
     async def health(self) -> HealthResponse:
@@ -48,6 +50,8 @@ class FakeIrodoriClient:
 
     async def aclose(self) -> None:
         self.closed = True
+        if self.close_error is not None:
+            raise self.close_error
 
 
 async def test_uses_portable_speaker_and_configured_parameters() -> None:
@@ -72,6 +76,21 @@ async def test_uses_portable_speaker_and_configured_parameters() -> None:
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
+
+
+async def test_selected_speaker_applies_to_subsequent_synthesis() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(irodori=IrodoriSettings(speaker="default")),
+    )
+
+    synthesizer.select_speaker("alternate")
+    await synthesizer.synthesize("別の声。")
+    synthesizer.select_speaker(None)
+    await synthesizer.synthesize("ナレーター。")
+
+    assert [request.speaker for request in client.requests] == ["alternate", None]
 
 
 async def test_maps_client_errors_to_stable_codes() -> None:
@@ -139,6 +158,37 @@ async def test_transport_rejects_declared_response_over_limit() -> None:
     await transport.aclose()
 
 
+async def test_address_override_preserves_host_sni_and_tls_identity() -> None:
+    seen: dict[str, object] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.update(
+            host=request.url.host,
+            host_header=request.headers["host"],
+            sni_hostname=request.extensions["sni_hostname"],
+        )
+        return httpx.Response(200, json={"model_loaded": True})
+
+    transport = _AddressOverrideTransport(
+        httpx.MockTransport(handler),
+        connect_ip="100.112.161.83",
+    )
+    request = httpx.Request(
+        "GET",
+        "https://voice-host.example.ts.net/health",
+    )
+
+    response = await transport.handle_async_request(request)
+
+    assert response.status_code == 200
+    assert seen == {
+        "host": "100.112.161.83",
+        "host_header": "voice-host.example.ts.net",
+        "sni_hostname": "voice-host.example.ts.net",
+    }
+    await transport.aclose()
+
+
 async def test_close_delegates_to_client() -> None:
     client = FakeIrodoriClient()
     synthesizer = IrodoriSynthesizer(
@@ -149,6 +199,70 @@ async def test_close_delegates_to_client() -> None:
     await synthesizer.close()
 
     assert client.closed
+
+
+async def test_health_and_synthesis_use_separate_clients() -> None:
+    health_client = FakeIrodoriClient()
+    synthesis_client = FakeIrodoriClient()
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", health_client),
+        settings=MocoSettings(),
+        synthesis_client=cast("IrodoriClient", synthesis_client),
+    )
+
+    await synthesizer.health()
+    await synthesizer.synthesize("test")
+    await synthesizer.close()
+
+    assert health_client.requests == []
+    assert len(synthesis_client.requests) == 1
+    assert health_client.closed
+    assert synthesis_client.closed
+
+
+async def test_synthesis_client_closes_when_health_client_close_fails() -> None:
+    health_client = FakeIrodoriClient()
+    health_client.close_error = RuntimeError("health close failed")
+    synthesis_client = FakeIrodoriClient()
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", health_client),
+        settings=MocoSettings(),
+        synthesis_client=cast("IrodoriClient", synthesis_client),
+    )
+
+    with pytest.raises(RuntimeError, match="health close failed"):
+        await synthesizer.close()
+
+    assert health_client.closed
+    assert synthesis_client.closed
+
+
+async def test_from_settings_disables_only_synthesis_timeout(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    timeouts: list[float | None] = []
+
+    class RecordingClient(FakeIrodoriClient):
+        def __init__(
+            self,
+            *,
+            base_url: str | None = None,
+            timeout: float | httpx.Timeout | None = 30.0,
+            transport: httpx.AsyncBaseTransport | None = None,
+        ) -> None:
+            super().__init__()
+            del base_url, transport
+            assert timeout is None or isinstance(timeout, float)
+            timeouts.append(timeout)
+
+    monkeypatch.setattr("moco.speech.irodori.AsyncIrodoriClient", RecordingClient)
+
+    synthesizer = IrodoriSynthesizer.from_settings(
+        MocoSettings(irodori=IrodoriSettings(timeout_seconds=7.5)),
+    )
+    await synthesizer.close()
+
+    assert timeouts == [7.5, None]
 
 
 async def test_health_validation_failure_is_safely_mapped() -> None:

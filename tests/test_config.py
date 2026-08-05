@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from moco.config import ConfigError, default_config_path, load_config
+from moco.config import (
+    ConfigError,
+    IrodoriSettings,
+    ServerSettings,
+    default_config_path,
+    load_config,
+)
 
 
 def test_load_config_applies_defaults(tmp_path: Path) -> None:
@@ -15,8 +21,8 @@ def test_load_config_applies_defaults(tmp_path: Path) -> None:
 
     assert settings.server.host == "127.0.0.1"
     assert settings.runtime.idle_timeout_seconds == 300
-    assert settings.hotkeys.push_to_talk == "f1"
-    assert settings.hotkeys.cancel == "f2"
+    assert settings.hotkeys.start_listening == "f1"
+    assert settings.hotkeys.stop_listening == "f2"
     assert settings.speech.segment_max_chars == 80
 
 
@@ -49,6 +55,31 @@ def test_operator_server_must_bind_loopback(tmp_path: Path) -> None:
         load_config(path)
 
 
+def test_public_operator_url_is_normalized() -> None:
+    settings = ServerSettings(public_url=" HTTPS://Voice.Example.COM ")
+
+    assert settings.public_url == "https://voice.example.com"
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "http://voice.example.com",
+        "https://127.0.0.1",
+        "https://*.example.com",
+        "https://voice.example.com:8443",
+        "https://voice.example.com/path",
+        "https://voice.example.com?mode=mobile",
+        "https://voice.example.com/#fragment",
+        "https://user@voice.example.com",
+        "https://localhost",
+    ],
+)
+def test_public_operator_url_rejects_unsafe_shapes(public_url: str) -> None:
+    with pytest.raises(ValueError, match="public URL"):
+        ServerSettings(public_url=public_url)
+
+
 @pytest.mark.parametrize(
     "yaml_text",
     [
@@ -69,7 +100,10 @@ def test_positive_values_are_required(tmp_path: Path, yaml_text: str) -> None:
 
 def test_hotkeys_must_be_distinct(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
-    path.write_text("hotkeys:\n  push_to_talk: F1\n  cancel: f1\n", encoding="utf-8")
+    path.write_text(
+        "hotkeys:\n  start_listening: F1\n  stop_listening: f1\n",
+        encoding="utf-8",
+    )
 
     with pytest.raises(ConfigError, match="distinct"):
         load_config(path)
@@ -97,6 +131,50 @@ def test_irodori_url_must_not_contain_credentials(tmp_path: Path) -> None:
 
     assert "credentials" in str(caught.value)
     assert sensitive_value not in str(caught.value)
+
+
+def test_irodori_speaker_options_are_normalized_and_deduplicated() -> None:
+    settings = IrodoriSettings(
+        speaker=" main ",
+        speakers=("main", " alt ", "alt"),
+    )
+
+    assert settings.speaker == "main"
+    assert settings.available_speakers == ("main", "alt")
+
+
+def test_irodori_connect_ip_must_be_an_ip_address(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(
+        "irodori:\n  connect_ip: not-a-hostname\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="connect_ip"):
+        load_config(path)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://windows-node.example.ts.net",
+        "https://100.64.0.2",
+        "https://windows-node.example.ts.net:8443",
+        "https://localhost",
+    ],
+)
+def test_irodori_connect_ip_requires_portless_https_fqdn(
+    tmp_path: Path,
+    base_url: str,
+) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(
+        f"irodori:\n  base_url: {base_url}\n  connect_ip: 100.64.0.1\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ConfigError, match="connect_ip"):
+        load_config(path)
 
 
 @pytest.mark.parametrize(

@@ -12,16 +12,14 @@ class LifecycleState(StrEnum):
     DISABLED = "disabled"
     READY = "ready"
     CONNECTING = "connecting"
-    RECORDING = "recording"
-    WORKING = "working"
+    LISTENING = "listening"
     SPEAKING = "speaking"
-    CANCELLING = "cancelling"
     IDLE_EXPIRED = "idle_expired"
     ERROR = "error"
 
 
 class BusyKind(StrEnum):
-    RECORDING = "recording"
+    LISTENING = "listening"
     DELEGATED = "delegated"
     SYNTHESIS = "synthesis"
     PLAYBACK = "playback"
@@ -77,18 +75,16 @@ class LifecycleController:
         self._busy[kind] = active
         self.touch()
 
-    def ptt_down(self) -> bool:
+    def listen_start(self) -> bool:
         starts_fresh = self._state is LifecycleState.IDLE_EXPIRED
-        if starts_fresh:
-            self._state = LifecycleState.READY
-        self._busy[BusyKind.RECORDING] = True
-        self._state = LifecycleState.RECORDING
+        self._busy[BusyKind.LISTENING] = True
+        self._state = LifecycleState.LISTENING
         self.touch()
         return starts_fresh
 
-    def ptt_up(self) -> None:
-        self._busy[BusyKind.RECORDING] = False
-        self._state = LifecycleState.WORKING
+    def listen_stop(self) -> None:
+        self._busy[BusyKind.LISTENING] = False
+        self._state = LifecycleState.READY
         self.touch()
 
     async def poll(self) -> bool:

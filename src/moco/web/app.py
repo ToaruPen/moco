@@ -4,21 +4,24 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, assert_never, cast
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import ValidationError
 
 from moco.codex.rpc import CodexRpcClient
 from moco.codex.session import (
+    ActivityEvent,
     CodexRealtimeSession,
     RealtimeErrorEvent,
     RealtimeEvent,
+    ReasoningSummaryEvent,
     TranscriptEvent,
 )
 from moco.config import MocoSettings
@@ -31,10 +34,12 @@ from moco.web.messages import (
     ClientControl,
     ControlMessage,
     PlaybackMessage,
+    SelectVoiceMessage,
     StartMessage,
     StopMessage,
     parse_client_message,
 )
+from moco.web.pairing import render_pairing_svg
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
@@ -48,6 +53,19 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _WEBSOCKET_PROTOCOL = "moco"
 _CAPABILITY_PROTOCOL_PREFIX = f"{_WEBSOCKET_PROTOCOL}.capability."
 _MAX_INVALID_MESSAGES = 3
+_ACTIVITY_LABELS = {
+    "turn": ("turn", "応答処理"),
+    "reasoning": ("reasoning", "推論要約"),
+    "command_execution": ("work", "コマンド実行"),
+    "file_change": ("work", "ファイル変更"),
+    "external_tool": ("work", "外部ツール"),
+    "subagent": ("work", "サブエージェント"),
+    "web_search": ("work", "Web 検索"),
+    "image_view": ("work", "画像確認"),
+    "image_generation": ("work", "画像生成"),
+    "context_compaction": ("work", "コンテキスト整理"),
+    "codex_work": ("work", "Codex 処理"),
+}
 logger = logging.getLogger(__name__)
 
 
@@ -59,13 +77,13 @@ class RealtimeSession(Protocol):
 
     def notifications(self) -> AsyncIterator[RealtimeEvent]: ...
 
-    async def cancel_current(self) -> None: ...
-
     async def close(self) -> None: ...
 
 
 class WebSynthesizer(Protocol):
     async def health(self) -> HealthResponse: ...
+
+    def select_speaker(self, speaker: str | None) -> None: ...
 
     async def synthesize(self, text: str) -> bytes: ...
 
@@ -129,6 +147,8 @@ class _BrowserConnection:
         self._transcripts: dict[str, str] = {}
         self._synthesis_busy = False
         self._delegated_busy = False
+        self._selected_speaker = settings.irodori.speaker
+        self._user_utterance_active = False
         self._lifecycle = LifecycleController(
             idle_timeout_seconds=settings.runtime.idle_timeout_seconds,
             on_expire=self._expire_conversation,
@@ -195,6 +215,9 @@ class _BrowserConnection:
             if message.active:
                 self._lifecycle.set_state(LifecycleState.SPEAKING)
             return True
+        if isinstance(message, SelectVoiceMessage):
+            await self._select_voice(message.speaker)
+            return True
         if isinstance(message, StopMessage):
             return False
         assert_never(message)
@@ -208,15 +231,14 @@ class _BrowserConnection:
         session: RealtimeSession | None = None
         try:
             synthesizer = self._synthesizer_factory()
+            synthesizer.select_speaker(self._selected_speaker)
             session = self._session_factory()
             health = await synthesizer.health()
             if not health.model_loaded:
-                await _close_start_resources(session, synthesizer)
-                await self._send_error("irodori_not_ready")
+                await self._fail_start(session, synthesizer, "irodori_not_ready")
                 return
             answer = await session.start(message.sdp)
         except (OSError, RuntimeError) as error:
-            await _close_start_resources(session, synthesizer)
             _log_boundary_failure("conversation_start", error)
             safe_event(
                 logger,
@@ -225,17 +247,16 @@ class _BrowserConnection:
                 event_code="conversation_start_failed",
                 result="error",
             )
-            await self._send_error("conversation_start_failed")
+            await self._fail_start(session, synthesizer, "conversation_start_failed")
             return
 
-        ready_synthesizer = synthesizer
-        ready_session = session
-        self._synthesizer = ready_synthesizer
-        self._session = ready_session
+        self._synthesizer = synthesizer
+        self._session = session
         self._speech = SpeechQueue(
-            ready_synthesizer,
+            synthesizer,
             deliver=self._deliver_audio,
             max_chars=self._settings.speech.segment_max_chars,
+            on_error=self._send_error,
         )
         self._speech.start()
         self._lifecycle.enable()
@@ -253,6 +274,18 @@ class _BrowserConnection:
             result="ok",
         )
 
+    async def _fail_start(
+        self,
+        session: RealtimeSession | None,
+        synthesizer: WebSynthesizer | None,
+        error_code: str,
+    ) -> None:
+        await _close_start_resources(session, synthesizer)
+        await self._send_error(error_code)
+        self._lifecycle.disable()
+        self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+        await self._send_state(LifecycleState.IDLE_EXPIRED)
+
     async def _apply_control(self, control: ClientControl) -> None:
         safe_event(
             logger,
@@ -260,34 +293,32 @@ class _BrowserConnection:
             component="web",
             control=control.value,
         )
-        if control is ClientControl.PTT_DOWN:
+        if control is ClientControl.LISTEN_START:
             if self._session is None:
                 await self._send_error("conversation_not_started")
                 return
-            self._generation += 1
-            speech = self._speech
-            if speech is not None:
-                await speech.cancel()
-            await self._session.cancel_current()
-            self._lifecycle.ptt_down()
-            await self._send_json({"type": "audio_invalidate", "generation": self._generation})
-            await self._send_state(LifecycleState.RECORDING)
+            self._lifecycle.listen_start()
+            await self._send_state(LifecycleState.LISTENING)
             return
-        if control is ClientControl.PTT_UP:
-            self._lifecycle.ptt_up()
-            await self._send_state(LifecycleState.WORKING)
-            return
-        if control is ClientControl.CANCEL:
-            self._generation += 1
-            if self._speech is not None:
-                await self._speech.cancel()
-            if self._session is not None:
-                await self._session.cancel_current()
-            self._lifecycle.set_state(LifecycleState.CANCELLING)
-            await self._send_json({"type": "audio_invalidate", "generation": self._generation})
-            await self._send_state(LifecycleState.CANCELLING)
+        if control is ClientControl.LISTEN_STOP:
+            if self._session is None:
+                self._lifecycle.disable()
+                self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+                await self._send_state(LifecycleState.IDLE_EXPIRED)
+                return
+            self._lifecycle.listen_stop()
+            await self._send_state(LifecycleState.READY)
             return
         assert_never(control)
+
+    async def _select_voice(self, speaker: str | None) -> None:
+        if speaker is not None and speaker not in self._settings.irodori.available_speakers:
+            await self._send_error("voice_not_available")
+            return
+        self._selected_speaker = speaker
+        if self._synthesizer is not None:
+            self._synthesizer.select_speaker(speaker)
+        await self._send_json({"type": "voice", "selected": speaker})
 
     async def _consume_notifications(self) -> None:
         session = self._session
@@ -296,9 +327,14 @@ class _BrowserConnection:
         try:
             async for event in session.notifications():
                 if isinstance(event, RealtimeErrorEvent):
-                    await self._send_error("codex_realtime_error")
-                    await self._close_conversation_resources()
+                    await self._terminate_conversation("codex_realtime_error")
                     return
+                if isinstance(event, ActivityEvent):
+                    await self._send_activity(event)
+                    continue
+                if isinstance(event, ReasoningSummaryEvent):
+                    await self._send_reasoning_summary(event)
+                    continue
                 if isinstance(event, TranscriptEvent):
                     await self._handle_transcript(event)
         except asyncio.CancelledError:
@@ -306,9 +342,43 @@ class _BrowserConnection:
         except (OSError, RuntimeError) as error:
             _log_boundary_failure("realtime_events", error)
             with suppress(RuntimeError):
-                await self._send_error("invalid_realtime_event")
+                await self._terminate_conversation("invalid_realtime_event")
+
+    async def _terminate_conversation(self, error_code: str) -> None:
+        await self._send_error(error_code)
+        await self._close_conversation_resources()
+        self._lifecycle.disable()
+        self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+        await self._send_state(LifecycleState.IDLE_EXPIRED)
+
+    async def _send_activity(self, event: ActivityEvent) -> None:
+        kind, label = _ACTIVITY_LABELS[event.kind]
+        await self._send_json(
+            {
+                "type": "activity",
+                "kind": kind,
+                "phase": event.phase,
+                "label": label,
+                "occurredAtMs": (
+                    event.occurred_at_ms if event.occurred_at_ms is not None else _now_ms()
+                ),
+            },
+        )
+
+    async def _send_reasoning_summary(self, event: ReasoningSummaryEvent) -> None:
+        await self._send_json(
+            {
+                "type": "reasoning_summary",
+                "itemId": event.item_id,
+                "delta": _display_text(event.delta)[:500],
+                "occurredAtMs": _now_ms(),
+            },
+        )
 
     async def _handle_transcript(self, event: TranscriptEvent) -> None:
+        if event.role == "user" and not self._user_utterance_active:
+            self._user_utterance_active = True
+            await self._invalidate_speech()
         delta, done = self._transcript_delta(event)
         await self._send_json(
             {
@@ -321,7 +391,17 @@ class _BrowserConnection:
         speech = self._speech
         if speech is not None:
             await speech.on_transcript(role=event.role, delta=delta, done=done)
+        if event.role == "user" and done:
+            self._user_utterance_active = False
         self._lifecycle.touch()
+
+    async def _invalidate_speech(self) -> None:
+        self._generation += 1
+        if self._speech is not None:
+            await self._speech.invalidate()
+        await self._send_json(
+            {"type": "audio_invalidate", "generation": self._generation},
+        )
 
     def _transcript_delta(self, event: TranscriptEvent) -> tuple[str, bool]:
         accumulated = self._transcripts.get(event.role, "")
@@ -357,6 +437,15 @@ class _BrowserConnection:
             if speech_busy != self._synthesis_busy:
                 self._synthesis_busy = speech_busy
                 self._lifecycle.set_busy(BusyKind.SYNTHESIS, active=speech_busy)
+                await self._send_json(
+                    {
+                        "type": "activity",
+                        "kind": "voice",
+                        "phase": "started" if speech_busy else "completed",
+                        "label": "音声生成",
+                        "occurredAtMs": _now_ms(),
+                    },
+                )
             delegated_busy = self._session is not None and self._session.active_turn_id is not None
             if delegated_busy != self._delegated_busy:
                 self._delegated_busy = delegated_busy
@@ -391,6 +480,7 @@ class _BrowserConnection:
             self._session = None
             self._synthesizer = None
             self._transcripts.clear()
+            self._user_utterance_active = False
             if speech is not None:
                 await speech.close()
             if session is not None:
@@ -405,8 +495,12 @@ class _BrowserConnection:
                 "state": state.value,
                 "hotkeys": {
                     "enabled": self._global_hotkeys_active,
-                    "pushToTalk": self._settings.hotkeys.push_to_talk,
-                    "cancel": self._settings.hotkeys.cancel,
+                    "startListening": self._settings.hotkeys.start_listening,
+                    "stopListening": self._settings.hotkeys.stop_listening,
+                },
+                "voice": {
+                    "selected": self._selected_speaker,
+                    "options": list(self._settings.irodori.available_speakers),
                 },
             },
         )
@@ -446,9 +540,32 @@ def create_app(
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.head("/pairing.svg", include_in_schema=False)
+    async def pairing_status(request: Request) -> Response:
+        if resolved.server.public_url is None or not _pairing_request_allowed(
+            request,
+            app.state.capability_token,
+        ):
+            raise HTTPException(status_code=404)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    @app.get("/pairing.svg", include_in_schema=False)
+    async def pairing_svg(request: Request) -> Response:
+        public_url = resolved.server.public_url
+        if public_url is None or not _pairing_request_allowed(
+            request,
+            app.state.capability_token,
+        ):
+            raise HTTPException(status_code=404)
+        return Response(
+            render_pairing_svg(public_url, app.state.capability_token),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
     @app.websocket("/ws")
     async def operator_socket(websocket: WebSocket) -> None:
-        if not _origin_allowed(websocket) or not _capability_allowed(
+        if not _origin_allowed(websocket, resolved.server.public_url) or not _capability_allowed(
             websocket,
             app.state.capability_token,
         ):
@@ -484,22 +601,33 @@ def _codex_session_factory(settings: MocoSettings) -> SessionFactory:
     return build
 
 
-def _origin_allowed(websocket: WebSocket) -> bool:
+def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
     origin = websocket.headers.get("origin")
     host = websocket.headers.get("host")
     if origin is None or host is None:
         return False
     origin_parts = urlsplit(origin)
     host_parts = urlsplit(f"//{host}")
-    return (
-        origin_parts.scheme in {"http", "https"}
-        and origin_parts.path in {"", "/"}
-        and not origin_parts.query
-        and not origin_parts.fragment
+    if (
+        origin_parts.path not in {"", "/"}
+        or origin_parts.query
+        or origin_parts.fragment
+        or origin_parts.username is not None
+        or origin_parts.password is not None
+    ):
+        return False
+    local = (
+        origin_parts.scheme == "http"
         and origin_parts.hostname in _LOOPBACK_HOSTS
         and host_parts.hostname in _LOOPBACK_HOSTS
         and origin_parts.netloc.casefold() == host.casefold()
     )
+    public = (
+        public_url is not None
+        and origin.casefold().rstrip("/") == public_url
+        and host.casefold() == urlsplit(public_url).netloc.casefold()
+    )
+    return local or public
 
 
 def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
@@ -520,12 +648,35 @@ def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
     )
 
 
+def _pairing_request_allowed(request: Request, expected_token: str) -> bool:
+    host = urlsplit(f"//{request.headers.get('host', '')}").hostname
+    candidate = request.headers.get("x-moco-capability")
+    fetch_site = request.headers.get("sec-fetch-site")
+    return (
+        host in _LOOPBACK_HOSTS
+        and candidate is not None
+        and secrets.compare_digest(candidate, expected_token)
+        and fetch_site in {None, "same-origin"}
+    )
+
+
 def _log_boundary_failure(boundary: str, error: BaseException) -> None:
     logger.warning(
         "Boundary failure (boundary=%s, error_type=%s)",
         boundary,
         type(error).__name__,
     )
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _display_text(text: str) -> str:
+    printable = "".join(
+        character if character.isprintable() else " " for character in strip_control_emojis(text)
+    )
+    return " ".join(printable.split())
 
 
 async def _close_start_resources(

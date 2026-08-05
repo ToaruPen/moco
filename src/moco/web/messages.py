@@ -3,13 +3,12 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator
 
 
 class ClientControl(StrEnum):
-    PTT_DOWN = "ptt_down"
-    PTT_UP = "ptt_up"
-    CANCEL = "cancel"
+    LISTEN_START = "listen_start"
+    LISTEN_STOP = "listen_stop"
 
 
 class _ClientMessage(BaseModel):
@@ -31,17 +30,32 @@ class PlaybackMessage(_ClientMessage):
     active: StrictBool
 
 
+class SelectVoiceMessage(_ClientMessage):
+    type: Literal["select_voice"] = "select_voice"
+    speaker: str | None
+
+    @field_validator("speaker")
+    @classmethod
+    def _normalize_speaker(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        speaker = value.strip()
+        if not speaker:
+            msg = "speaker must not be blank"
+            raise ValueError(msg)
+        return speaker
+
+
 class StopMessage(_ClientMessage):
     type: Literal["stop"] = "stop"
 
 
 ClientMessage = Annotated[
-    StartMessage | ControlMessage | PlaybackMessage | StopMessage,
+    StartMessage | ControlMessage | PlaybackMessage | SelectVoiceMessage | StopMessage,
     Field(discriminator="type"),
 ]
 _CLIENT_MESSAGE_ADAPTER: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)
 
 
 def parse_client_message(payload: object) -> ClientMessage:
-    message: ClientMessage = _CLIENT_MESSAGE_ADAPTER.validate_python(payload)
-    return message
+    return _CLIENT_MESSAGE_ADAPTER.validate_python(payload)

@@ -28,6 +28,7 @@ from moco.service.launchd import (
     uninstall_service,
 )
 from moco.web.app import create_app
+from moco.web.pairing import mobile_operator_url
 
 app = typer.Typer(no_args_is_help=True, help="moco local voice agent")
 config_app = typer.Typer(no_args_is_help=True, help="Manage strict YAML configuration.")
@@ -185,8 +186,8 @@ async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
     operator_app = create_app(settings, capability_token=capability_value)
     loop = asyncio.get_running_loop()
     mapper = HotkeyMapper(
-        ptt_key=settings.hotkeys.push_to_talk,
-        cancel_key=settings.hotkeys.cancel,
+        start_key=settings.hotkeys.start_listening,
+        stop_key=settings.hotkeys.stop_listening,
         emit=lambda control: asyncio.create_task(
             operator_app.state.control_hub.publish(control),
         ),
@@ -219,8 +220,10 @@ async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
         if not server.started:
             await task
             return
-        url = f"http://{settings.server.host}:{settings.server.port}/#{capability_value}"
-        _atomic_write(state_path, json.dumps({"url": url}).encode())
+        _atomic_write(
+            state_path,
+            json.dumps(_runtime_state_payload(settings, capability_value)).encode(),
+        )
         typer.echo(
             f"moco is ready on {settings.server.host}:{settings.server.port}; run `moco open`"
         )
@@ -249,6 +252,15 @@ def _is_safe_operator_url(url: str) -> bool:
         and bool(parsed.fragment)
         and not parsed.query
     )
+
+
+def _runtime_state_payload(settings: MocoSettings, capability: str) -> dict[str, str]:
+    payload = {
+        "url": f"http://{settings.server.host}:{settings.server.port}/#{capability}",
+    }
+    if settings.server.public_url is not None:
+        payload["mobile_url"] = mobile_operator_url(settings.server.public_url, capability)
+    return payload
 
 
 def _read_state_url(state_path: Path) -> str:

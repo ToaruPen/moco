@@ -86,6 +86,26 @@ class _LimitedResponseTransport(httpx.AsyncBaseTransport):
         await self._transport.aclose()
 
 
+class _AddressOverrideTransport(httpx.AsyncBaseTransport):
+    def __init__(self, transport: httpx.AsyncBaseTransport, *, connect_ip: str) -> None:
+        self._transport = transport
+        self._connect_ip = connect_ip
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        hostname = request.url.host
+        rewritten = httpx.Request(
+            method=request.method,
+            url=request.url.copy_with(host=self._connect_ip),
+            headers=request.headers,
+            stream=request.stream,
+            extensions={**request.extensions, "sni_hostname": hostname},
+        )
+        return await self._transport.handle_async_request(rewritten)
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
 class IrodoriError(RuntimeError):
     def __init__(self, message: str, *, code: str) -> None:
         super().__init__(message)
@@ -93,33 +113,53 @@ class IrodoriError(RuntimeError):
 
 
 class IrodoriSynthesizer:
-    def __init__(self, client: IrodoriClient, *, settings: MocoSettings) -> None:
-        self._client = client
+    def __init__(
+        self,
+        client: IrodoriClient,
+        *,
+        settings: MocoSettings,
+        synthesis_client: IrodoriClient | None = None,
+    ) -> None:
+        self._health_client = client
+        self._synthesis_client = synthesis_client or client
         self._settings = settings
+        self._speaker = settings.irodori.speaker
 
     @classmethod
     def from_settings(cls, settings: MocoSettings) -> Self:
         max_wav_bytes = settings.irodori.max_wav_bytes
         max_response_bytes = ((max_wav_bytes + 2) // 3) * 4 + _JSON_ENVELOPE_BYTES
+        base_url = str(settings.irodori.base_url)
         return cls(
             AsyncIrodoriClient(
-                base_url=str(settings.irodori.base_url),
+                base_url=base_url,
                 timeout=settings.irodori.timeout_seconds,
-                transport=_LimitedResponseTransport(
-                    httpx.AsyncHTTPTransport(),
+                transport=_build_transport(
+                    settings,
                     max_bytes=max_response_bytes,
                 ),
             ),
             settings=settings,
+            synthesis_client=AsyncIrodoriClient(
+                base_url=base_url,
+                timeout=None,
+                transport=_build_transport(
+                    settings,
+                    max_bytes=max_response_bytes,
+                ),
+            ),
         )
 
     async def health(self) -> HealthResponse:
         try:
-            return await self._client.health()
+            return await self._health_client.health()
         except ClientError as error:
             raise _map_client_error(error) from error
         except (KeyError, TypeError, ValueError) as error:
             raise _invalid_response_error() from error
+
+    def select_speaker(self, speaker: str | None) -> None:
+        self._speaker = speaker
 
     async def synthesize(
         self,
@@ -134,14 +174,14 @@ class IrodoriSynthesizer:
         config = self._settings.irodori
         request = SynthesisRequest(
             text=text,
-            speaker=speaker if speaker is not None else config.speaker,
+            speaker=speaker if speaker is not None else self._speaker,
             num_steps=num_steps or config.num_steps,
             duration_scale=duration_scale or config.duration_scale,
             cfg_scale_text=cfg_scale_text or config.cfg_scale_text,
             cfg_scale_speaker=cfg_scale_speaker or config.cfg_scale_speaker,
         )
         try:
-            result = await self._client.synthesize(request)
+            result = await self._synthesis_client.synthesize(request)
         except ClientError as error:
             raise _map_client_error(error) from error
         except (KeyError, TypeError, ValueError) as error:
@@ -156,7 +196,25 @@ class IrodoriSynthesizer:
         return wav
 
     async def close(self) -> None:
-        await self._client.aclose()
+        try:
+            await self._health_client.aclose()
+        finally:
+            if self._synthesis_client is not self._health_client:
+                await self._synthesis_client.aclose()
+
+
+def _build_transport(
+    settings: MocoSettings,
+    *,
+    max_bytes: int,
+) -> httpx.AsyncBaseTransport:
+    transport: httpx.AsyncBaseTransport = httpx.AsyncHTTPTransport()
+    if settings.irodori.connect_ip is not None:
+        transport = _AddressOverrideTransport(
+            transport,
+            connect_ip=str(settings.irodori.connect_ip),
+        )
+    return _LimitedResponseTransport(transport, max_bytes=max_bytes)
 
 
 def _map_client_error(error: ClientError) -> IrodoriError:
