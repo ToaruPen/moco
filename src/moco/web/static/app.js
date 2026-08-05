@@ -19,6 +19,16 @@ const ERROR_COPY = Object.freeze({
   invalid_message: "受信した操作を解釈できませんでした",
   already_started: "Realtime 会話はすでに開始しています",
   irodori_not_ready: "Irodori の音声モデルを利用できません",
+  irodori_unavailable: "Irodori に接続できません",
+  capability_mismatch: "Irodori の機能契約に互換性がありません",
+  configured_voice_unavailable: "設定した音声モデルを利用できません",
+  voice_catalog_empty: "利用可能な音声モデルがありません",
+  voice_selection_required: "音声モデルを選択してください",
+  model_loading: "音声モデルを読み込み中です",
+  model_not_loaded: "音声モデルが読み込まれていません",
+  voice_bank_invalid: "音声モデル一覧を利用できません",
+  runtime_generation_mismatch: "音声ランタイムが更新されたため再接続が必要です",
+  voice_not_found: "選択した音声モデルが見つかりません",
   conversation_start_failed: "Realtime 会話を開始できませんでした",
   conversation_not_started: "Realtime 会話が開始していません",
   voice_not_available: "選択した音声モデルを利用できません",
@@ -44,8 +54,18 @@ const ERROR_COPY = Object.freeze({
 
 const CONVERSATION_START_ERRORS = new Set([
   "already_started",
+  "capability_mismatch",
+  "configured_voice_unavailable",
   "conversation_start_failed",
+  "irodori_unavailable",
   "irodori_not_ready",
+  "model_loading",
+  "model_not_loaded",
+  "runtime_generation_mismatch",
+  "voice_bank_invalid",
+  "voice_catalog_empty",
+  "voice_not_found",
+  "voice_selection_required",
 ]);
 
 const THEME_LABELS = Object.freeze({
@@ -455,7 +475,8 @@ export class ConversationHandshake {
       return true;
     }
     if (message.type === "error" && CONVERSATION_START_ERRORS.has(message.code)) {
-      this.#fail(message.code, true);
+      this.#fail(message.code);
+      return true;
     }
     return false;
   }

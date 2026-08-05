@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from irodori_tts_infra.contracts import CapabilitiesResponse
 from pydantic import ValidationError
 
 from moco.codex.rpc import CodexRpcClient
@@ -27,7 +28,7 @@ from moco.codex.session import (
 from moco.config import MocoSettings
 from moco.runtime.lifecycle import BusyKind, LifecycleController, LifecycleState
 from moco.runtime.telemetry import safe_event
-from moco.speech.irodori import IrodoriSynthesizer
+from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 from moco.speech.queue import SpeechQueue
 from moco.speech.text import strip_control_emojis
 from moco.web.messages import (
@@ -44,8 +45,6 @@ from moco.web.pairing import render_pairing_svg
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
 
-    from irodori_tts_infra.contracts import HealthResponse
-
     from moco.runtime.hotkeys import Control
 
 STATIC_DIR = Path(__file__).with_name("static")
@@ -53,6 +52,16 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _WEBSOCKET_PROTOCOL = "moco"
 _CAPABILITY_PROTOCOL_PREFIX = f"{_WEBSOCKET_PROTOCOL}.capability."
 _MAX_INVALID_MESSAGES = 3
+_CAPABILITY_POLL_INTERVAL_SECONDS = 1.0
+_CAPABILITY_MISMATCH = "capability_mismatch"
+_IRODORI_UNAVAILABLE = "irodori_unavailable"
+_TERMINAL_READINESS = frozenset({"ready", "model_not_loaded", "voice_bank_invalid"})
+_IRODORI_READINESS_CODES = frozenset(
+    {"model_loading", "model_not_loaded", "voice_bank_invalid"},
+)
+_PROVISIONAL_SELECTION_ERRORS = frozenset(
+    {"voice_catalog_empty", "configured_voice_unavailable", "voice_selection_required"},
+)
 _ACTIVITY_LABELS = {
     "turn": ("turn", "応答処理"),
     "reasoning": ("reasoning", "推論要約"),
@@ -69,6 +78,12 @@ _ACTIVITY_LABELS = {
 logger = logging.getLogger(__name__)
 
 
+class _CapabilityError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
 class RealtimeSession(Protocol):
     @property
     def active_turn_id(self) -> str | None: ...
@@ -81,9 +96,9 @@ class RealtimeSession(Protocol):
 
 
 class WebSynthesizer(Protocol):
-    async def health(self) -> HealthResponse: ...
+    async def capabilities(self) -> CapabilitiesResponse: ...
 
-    def select_speaker(self, speaker: str | None) -> None: ...
+    def select_voice(self, voice_id: str) -> None: ...
 
     async def synthesize(self, text: str) -> bytes: ...
 
@@ -138,8 +153,10 @@ class _BrowserConnection:
         self._speech: SpeechQueue | None = None
         self._notifications_task: asyncio.Task[None] | None = None
         self._idle_task: asyncio.Task[None] | None = None
+        self._capability_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._resource_lock = asyncio.Lock()
+        self._capability_lock = asyncio.Lock()
         self._closed = False
         self._invalid_messages = 0
         self._generation = 0
@@ -147,7 +164,15 @@ class _BrowserConnection:
         self._transcripts: dict[str, str] = {}
         self._synthesis_busy = False
         self._delegated_busy = False
-        self._selected_speaker = settings.irodori.speaker
+        self._voice_options: tuple[dict[str, object], ...] = ()
+        self._voice_ready = False
+        self._voice_readiness = "loading"
+        self._emoji_supported = False
+        self._voice_generation: str | None = None
+        self._selected_voice_id: str | None = None
+        self._voice_selection_error: str | None = None
+        self._voice_selected_explicitly = False
+        self._browser_state = LifecycleState.READY
         self._user_utterance_active = False
         self._lifecycle = LifecycleController(
             idle_timeout_seconds=settings.runtime.idle_timeout_seconds,
@@ -162,6 +187,10 @@ class _BrowserConnection:
             state="ready",
         )
         await self._send_state(LifecycleState.READY)
+        self._capability_task = asyncio.create_task(
+            self._capability_loop(),
+            name="moco-irodori-capabilities",
+        )
         self._idle_task = asyncio.create_task(self._idle_loop(), name="moco-idle-loop")
         try:
             while True:
@@ -180,6 +209,12 @@ class _BrowserConnection:
         if self._closed:
             return
         self._closed = True
+        capability_task = self._capability_task
+        self._capability_task = None
+        if capability_task is not None and capability_task is not asyncio.current_task():
+            capability_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await capability_task
         idle_task = self._idle_task
         self._idle_task = None
         if idle_task is not None and idle_task is not asyncio.current_task():
@@ -216,11 +251,133 @@ class _BrowserConnection:
                 self._lifecycle.set_state(LifecycleState.SPEAKING)
             return True
         if isinstance(message, SelectVoiceMessage):
-            await self._select_voice(message.speaker)
+            await self._select_voice(message.voice_id)
             return True
         if isinstance(message, StopMessage):
             return False
         assert_never(message)
+
+    async def _capability_loop(self) -> None:
+        synthesizer: WebSynthesizer | None = None
+        try:
+            try:
+                synthesizer = self._synthesizer_factory()
+            except (OSError, RuntimeError):
+                await self._set_capability_failure("unavailable")
+                return
+            await self._poll_capabilities(synthesizer)
+        except asyncio.CancelledError:
+            raise
+        except (RuntimeError, WebSocketDisconnect):
+            return
+        finally:
+            if synthesizer is not None:
+                try:
+                    await synthesizer.close()
+                except Exception as error:  # noqa: BLE001
+                    _log_boundary_failure("irodori_capability_cleanup", error)
+
+    async def _poll_capabilities(self, synthesizer: WebSynthesizer) -> None:
+        while True:
+            try:
+                capabilities = await self._fetch_capabilities(synthesizer)
+            except _CapabilityError as error:
+                await self._set_capability_failure(_readiness_for_capability_error(error.code))
+                return
+            conflict = await self._cache_capabilities(capabilities)
+            await self._send_state(self._browser_state)
+            if conflict is not None or capabilities.readiness in _TERMINAL_READINESS:
+                return
+            await asyncio.sleep(_CAPABILITY_POLL_INTERVAL_SECONDS)
+
+    async def _fetch_capabilities(
+        self,
+        synthesizer: WebSynthesizer,
+    ) -> CapabilitiesResponse:
+        try:
+            response = await synthesizer.capabilities()
+            capabilities = CapabilitiesResponse.model_validate(
+                response.model_dump(mode="python"),
+                strict=True,
+            )
+            _validate_capabilities(capabilities)
+        except IrodoriError as error:
+            if error.code == "invalid_response":
+                raise _CapabilityError(_CAPABILITY_MISMATCH) from error
+            if error.code in _IRODORI_READINESS_CODES:
+                raise _CapabilityError(error.code) from error
+            raise _CapabilityError(_IRODORI_UNAVAILABLE) from error
+        except (AttributeError, KeyError, TypeError, ValueError, ValidationError) as error:
+            raise _CapabilityError(_CAPABILITY_MISMATCH) from error
+        except OSError as error:
+            raise _CapabilityError(_IRODORI_UNAVAILABLE) from error
+        safe_event(
+            logger,
+            "irodori_capabilities_received",
+            contract_version=capabilities.contract_version,
+            ready=capabilities.ready,
+            readiness=capabilities.readiness,
+            voice_count=len(capabilities.voices),
+        )
+        return capabilities
+
+    async def _cache_capabilities(self, capabilities: CapabilitiesResponse) -> str | None:
+        options = tuple(
+            {"id": voice.id, "label": voice.label, "default": voice.default}
+            for voice in capabilities.voices
+        )
+        voice_ids = {voice.id for voice in capabilities.voices}
+        async with self._capability_lock:
+            self._emoji_supported = capabilities.conditioning.emoji.supported
+            cached_generation = self._voice_generation
+            if cached_generation is not None and cached_generation != capabilities.generation:
+                self._voice_options = options
+                self._voice_ready = False
+                self._voice_readiness = "capability_mismatch"
+                self._selected_voice_id = None
+                self._voice_selection_error = "runtime_generation_mismatch"
+                safe_event(
+                    logger,
+                    "irodori_generation_mismatch",
+                    event_code="runtime_generation_mismatch",
+                )
+                return "runtime_generation_mismatch"
+            should_resolve_selection = cached_generation is None or (
+                self._selected_voice_id is None
+                and self._voice_selection_error in _PROVISIONAL_SELECTION_ERRORS
+                and not self._voice_selected_explicitly
+            )
+            if should_resolve_selection:
+                selected, selection_error = _resolve_voice_selection(
+                    capabilities,
+                    self._settings.irodori.speaker,
+                )
+                self._selected_voice_id = selected
+                self._voice_selection_error = selection_error
+            elif self._selected_voice_id is not None and self._selected_voice_id not in voice_ids:
+                self._selected_voice_id = None
+                self._voice_selection_error = "voice_not_found"
+                self._voice_options = options
+                self._voice_ready = capabilities.ready
+                self._voice_readiness = capabilities.readiness
+                return "voice_not_found"
+            self._voice_generation = capabilities.generation
+            self._voice_options = options
+            self._voice_ready = capabilities.ready
+            self._voice_readiness = capabilities.readiness
+        return None
+
+    async def _set_capability_failure(self, readiness: str) -> None:
+        async with self._capability_lock:
+            self._voice_ready = False
+            self._voice_readiness = readiness
+            if readiness == "capability_mismatch":
+                self._voice_selection_error = "capability_mismatch"
+            elif readiness in _IRODORI_READINESS_CODES:
+                self._voice_selection_error = readiness
+            else:
+                self._voice_selection_error = "irodori_unavailable"
+        await self._send_state(self._browser_state)
 
     async def _start(self, message: StartMessage) -> None:
         if self._session is not None:
@@ -231,12 +388,11 @@ class _BrowserConnection:
         session: RealtimeSession | None = None
         try:
             synthesizer = self._synthesizer_factory()
-            synthesizer.select_speaker(self._selected_speaker)
-            session = self._session_factory()
-            health = await synthesizer.health()
-            if not health.model_loaded:
-                await self._fail_start(session, synthesizer, "irodori_not_ready")
+            preparation_error = await self._prepare_start_synthesizer(synthesizer)
+            if preparation_error is not None:
+                await self._fail_start(None, synthesizer, preparation_error)
                 return
+            session = self._session_factory()
             answer = await session.start(message.sdp)
         except (OSError, RuntimeError) as error:
             _log_boundary_failure("conversation_start", error)
@@ -256,7 +412,7 @@ class _BrowserConnection:
             synthesizer,
             deliver=self._deliver_audio,
             max_chars=self._settings.speech.segment_max_chars,
-            on_error=self._send_error,
+            on_error=self._handle_speech_error,
         )
         self._speech.start()
         self._lifecycle.enable()
@@ -273,6 +429,27 @@ class _BrowserConnection:
             state="ready",
             result="ok",
         )
+
+    async def _prepare_start_synthesizer(self, synthesizer: WebSynthesizer) -> str | None:
+        try:
+            capabilities = await self._fetch_capabilities(synthesizer)
+        except _CapabilityError as error:
+            return error.code
+        preparation_error = await self._cache_capabilities(capabilities)
+        if preparation_error is None:
+            preparation_error = _start_voice_error(
+                capabilities,
+                selection_error=self._voice_selection_error,
+                selected_voice_id=self._selected_voice_id,
+            )
+        if preparation_error is not None:
+            return preparation_error
+        selected_voice_id = cast("str", self._selected_voice_id)
+        try:
+            synthesizer.select_voice(selected_voice_id)
+        except IrodoriError as error:
+            return error.code
+        return None
 
     async def _fail_start(
         self,
@@ -311,14 +488,28 @@ class _BrowserConnection:
             return
         assert_never(control)
 
-    async def _select_voice(self, speaker: str | None) -> None:
-        if speaker is not None and speaker not in self._settings.irodori.available_speakers:
+    async def _select_voice(self, voice_id: str) -> None:
+        async with self._capability_lock:
+            available = any(option["id"] == voice_id for option in self._voice_options)
+            if not available:
+                selection_failed = True
+            elif self._synthesizer is not None:
+                try:
+                    self._synthesizer.select_voice(voice_id)
+                except IrodoriError:
+                    selection_failed = True
+                else:
+                    selection_failed = False
+            else:
+                selection_failed = False
+            if not selection_failed:
+                self._selected_voice_id = voice_id
+                self._voice_selection_error = None
+                self._voice_selected_explicitly = True
+        if selection_failed:
             await self._send_error("voice_not_available")
             return
-        self._selected_speaker = speaker
-        if self._synthesizer is not None:
-            self._synthesizer.select_speaker(speaker)
-        await self._send_json({"type": "voice", "selected": speaker})
+        await self._send_json({"type": "voice", "selected": voice_id})
 
     async def _consume_notifications(self) -> None:
         session = self._session
@@ -350,6 +541,15 @@ class _BrowserConnection:
         self._lifecycle.disable()
         self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
         await self._send_state(LifecycleState.IDLE_EXPIRED)
+
+    async def _handle_speech_error(self, code: str) -> None:
+        if code == "runtime_generation_mismatch":
+            safe_event(
+                logger,
+                "irodori_generation_mismatch",
+                event_code=code,
+            )
+        await self._send_error(code)
 
     async def _send_activity(self, event: ActivityEvent) -> None:
         kind, label = _ACTIVITY_LABELS[event.kind]
@@ -489,6 +689,7 @@ class _BrowserConnection:
                 await synthesizer.close()
 
     async def _send_state(self, state: LifecycleState) -> None:
+        self._browser_state = state
         await self._send_json(
             {
                 "type": "state",
@@ -499,8 +700,15 @@ class _BrowserConnection:
                     "stopListening": self._settings.hotkeys.stop_listening,
                 },
                 "voice": {
-                    "selected": self._selected_speaker,
-                    "options": list(self._settings.irodori.available_speakers),
+                    "selected": self._selected_voice_id,
+                    "options": list(self._voice_options),
+                    "ready": self._voice_ready,
+                    "readiness": self._voice_readiness,
+                },
+                "conditioning": {
+                    "captionMode": "off",
+                    "deliveryCaptionSupported": False,
+                    "emojiSupported": self._emoji_supported,
                 },
             },
         )
@@ -677,6 +885,72 @@ def _display_text(text: str) -> str:
         character if character.isprintable() else " " for character in strip_control_emojis(text)
     )
     return " ".join(printable.split())
+
+
+def _validate_capabilities(capabilities: CapabilitiesResponse) -> None:
+    if capabilities.ready != (capabilities.readiness == "ready"):
+        msg = "Irodori capability readiness is inconsistent"
+        raise ValueError(msg)
+    voice_ids = [voice.id for voice in capabilities.voices]
+    if len(voice_ids) != len(set(voice_ids)):
+        msg = "Irodori capability voice IDs are not unique"
+        raise ValueError(msg)
+    if sum(voice.default for voice in capabilities.voices) > 1:
+        msg = "Irodori capability has multiple default voices"
+        raise ValueError(msg)
+    aliases: set[str] = set()
+    for voice in capabilities.voices:
+        for alias in voice.aliases:
+            if alias in aliases:
+                msg = "Irodori capability aliases are ambiguous"
+                raise ValueError(msg)
+            aliases.add(alias)
+
+
+def _resolve_voice_selection(
+    capabilities: CapabilitiesResponse,
+    configured: str | None,
+) -> tuple[str | None, str | None]:
+    if not capabilities.voices:
+        return None, "voice_catalog_empty"
+    if configured is not None:
+        canonical = next(
+            (voice.id for voice in capabilities.voices if voice.id == configured),
+            None,
+        )
+        if canonical is not None:
+            return canonical, None
+        aliases = [voice.id for voice in capabilities.voices if configured in voice.aliases]
+        if len(aliases) == 1:
+            return aliases[0], None
+        return None, "configured_voice_unavailable"
+    defaults = [voice.id for voice in capabilities.voices if voice.default]
+    if len(defaults) == 1:
+        return defaults[0], None
+    return None, "voice_selection_required"
+
+
+def _readiness_for_capability_error(code: str) -> str:
+    if code == _CAPABILITY_MISMATCH:
+        return _CAPABILITY_MISMATCH
+    if code in _IRODORI_READINESS_CODES:
+        return code
+    return "unavailable"
+
+
+def _start_voice_error(
+    capabilities: CapabilitiesResponse,
+    *,
+    selection_error: str | None,
+    selected_voice_id: str | None,
+) -> str | None:
+    if not capabilities.ready:
+        return capabilities.readiness
+    if selection_error is not None:
+        return selection_error
+    if selected_voice_id is None:
+        return "voice_selection_required"
+    return None
 
 
 async def _close_start_resources(

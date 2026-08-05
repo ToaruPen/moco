@@ -688,7 +688,7 @@ describe("browser connection timeouts", () => {
     );
   });
 
-  it("waits for the SDP answer and rejects a terminal start error", async () => {
+  it("waits for the SDP answer and rejects every stable terminal start error", async () => {
     const descriptions = [];
     const success = new ConversationHandshake(async (sdp) => descriptions.push(sdp));
     const waitingForSuccess = success.promise;
@@ -697,16 +697,25 @@ describe("browser connection timeouts", () => {
     await waitingForSuccess;
     assert.deepEqual(descriptions, ["answer-sdp"]);
 
-    const failure = new ConversationHandshake(async () => {});
-    const waitingForFailure = assert.rejects(
-      failure.promise,
-      (error) => error.name === "conversation_start_failed",
-    );
-    assert.equal(
-      await failure.consume({ type: "error", code: "conversation_start_failed" }),
-      false,
-    );
-    await waitingForFailure;
+    for (const code of [
+      "conversation_start_failed",
+      "configured_voice_unavailable",
+      "voice_catalog_empty",
+      "voice_selection_required",
+      "model_loading",
+      "model_not_loaded",
+      "voice_bank_invalid",
+      "capability_mismatch",
+      "irodori_unavailable",
+      "runtime_generation_mismatch",
+      "voice_not_found",
+    ]) {
+      const failure = new ConversationHandshake(async () => {});
+      const waitingForFailure = assert.rejects(failure.promise, (error) => error.name === code);
+      assert.equal(await failure.consume({ type: "error", code }), true);
+      assert.equal(failure.settled, true);
+      await waitingForFailure;
+    }
   });
 
   it("reports a peer connection that enters failed state", () => {
