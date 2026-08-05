@@ -11,29 +11,29 @@ from pynput import keyboard
 from moco.runtime.hotkeys import Control, GlobalHotkeyListener, HotkeyMapper
 
 
-def test_key_repeat_emits_one_ptt_pair() -> None:
+def test_key_repeat_emits_one_listen_start() -> None:
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="f1", cancel_key="f2", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="f1", stop_key="f2", emit=emitted.append)
 
     mapper.key_down("f1")
     mapper.key_down("f1")
     mapper.key_up("f1")
 
-    assert emitted == [Control.PTT_DOWN, Control.PTT_UP]
+    assert emitted == [Control.LISTEN_START]
 
 
 def test_key_up_without_matching_down_is_ignored() -> None:
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="f1", cancel_key="f2", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="f1", stop_key="f2", emit=emitted.append)
 
     mapper.key_up("f1")
 
     assert emitted == []
 
 
-def test_cancel_emits_once_per_physical_press() -> None:
+def test_listen_stop_emits_once_per_physical_press() -> None:
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="f1", cancel_key="f2", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="f1", stop_key="f2", emit=emitted.append)
 
     mapper.key_down("f2")
     mapper.key_down("f2")
@@ -41,12 +41,12 @@ def test_cancel_emits_once_per_physical_press() -> None:
     mapper.key_down("f2")
     mapper.key_up("f2")
 
-    assert emitted == [Control.CANCEL, Control.CANCEL]
+    assert emitted == [Control.LISTEN_STOP, Control.LISTEN_STOP]
 
 
 def test_unconfigured_keys_are_ignored() -> None:
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="f1", cancel_key="f2", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="f1", stop_key="f2", emit=emitted.append)
 
     mapper.key_down("f3")
     mapper.key_up("f3")
@@ -56,13 +56,13 @@ def test_unconfigured_keys_are_ignored() -> None:
 
 def test_bindings_are_not_coupled_to_function_key_defaults() -> None:
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="space", cancel_key="escape", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="space", stop_key="escape", emit=emitted.append)
 
     mapper.key_down("space")
     mapper.key_up("space")
     mapper.key_down("escape")
 
-    assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]
+    assert emitted == [Control.LISTEN_START, Control.LISTEN_STOP]
 
 
 class ImmediateLoop:
@@ -102,7 +102,7 @@ def test_global_listener_maps_named_and_character_keys(
     FakeListener.instances.clear()
     monkeypatch.setattr(keyboard, "Listener", FakeListener)
     emitted: list[Control] = []
-    mapper = HotkeyMapper(ptt_key="f1", cancel_key="x", emit=emitted.append)
+    mapper = HotkeyMapper(start_key="f1", stop_key="x", emit=emitted.append)
     listener = GlobalHotkeyListener(
         loop=cast("asyncio.AbstractEventLoop", ImmediateLoop()),
         mapper=mapper,
@@ -125,7 +125,7 @@ def test_global_listener_maps_named_and_character_keys(
     assert listener.running
     assert len(FakeListener.instances) == 1
     assert backend.waited
-    assert emitted == [Control.PTT_DOWN, Control.PTT_UP, Control.CANCEL]
+    assert emitted == [Control.LISTEN_START, Control.LISTEN_STOP]
 
     listener.stop()
     listener.stop()
@@ -145,8 +145,8 @@ def test_global_listener_reports_denied_platform_trust(
     listener = GlobalHotkeyListener(
         loop=cast("asyncio.AbstractEventLoop", ImmediateLoop()),
         mapper=HotkeyMapper(
-            ptt_key="v",
-            cancel_key="escape",
+            start_key="v",
+            stop_key="escape",
             emit=lambda _control: None,
         ),
     )

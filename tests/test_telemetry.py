@@ -27,6 +27,44 @@ def test_allows_only_bounded_operational_attributes() -> None:
     assert sanitize_attributes(attributes, strict=True) == attributes
 
 
+def test_allows_only_bounded_irodori_capability_metadata() -> None:
+    attributes = {
+        "contract_version": 1,
+        "ready": True,
+        "readiness": "model_loading",
+        "voice_count": 3,
+    }
+
+    assert sanitize_attributes(attributes, strict=True) == attributes
+    for forbidden in ["generation", "voice_id", "voice_label", "aliases", "caption"]:
+        with pytest.raises(TelemetryAttributeError, match=forbidden):
+            sanitize_attributes({forbidden: "fixture-sensitive"}, strict=True)
+
+
+@pytest.mark.parametrize("readiness", ["loading", "capability_mismatch", "unavailable"])
+def test_allows_bounded_web_capability_readiness(readiness: str) -> None:
+    assert sanitize_attributes({"readiness": readiness}, strict=True) == {
+        "readiness": readiness,
+    }
+
+
+@pytest.mark.parametrize(
+    "attributes",
+    [
+        {"contract_version": True},
+        {"ready": 1},
+        {"readiness": "unknown"},
+        {"voice_count": -1},
+        {"voice_count": 1.5},
+    ],
+)
+def test_rejects_invalid_capability_metadata_types_or_values(
+    attributes: dict[str, object],
+) -> None:
+    with pytest.raises(TelemetryAttributeError):
+        sanitize_attributes(attributes, strict=True)
+
+
 @pytest.mark.parametrize(
     "key",
     [

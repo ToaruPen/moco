@@ -28,15 +28,30 @@ _ALLOWED_ATTRIBUTES = frozenset(
     {
         "boundary",
         "component",
+        "contract_version",
         "control",
         "duration_ms",
         "event_code",
+        "ready",
+        "readiness",
         "result",
         "state",
         "trace_id",
+        "voice_count",
     },
 )
 _SAFE_TEXT = re.compile(r"^[A-Za-z0-9_.:/-]{1,64}$")
+_SAFE_READINESS = frozenset(
+    {
+        "ready",
+        "loading",
+        "model_loading",
+        "model_not_loaded",
+        "voice_bank_invalid",
+        "capability_mismatch",
+        "unavailable",
+    },
+)
 
 
 class TelemetryAttributeError(ValueError):
@@ -122,6 +137,8 @@ def configure_telemetry(settings: TelemetrySettings) -> TelemetryRuntime:
 
 
 def _is_safe_value(key: str, value: object) -> bool:
+    if key in {"contract_version", "ready", "readiness", "voice_count"}:
+        return _is_safe_capability_value(key, value)
     if isinstance(value, bool):
         return True
     if isinstance(value, int | float):
@@ -133,3 +150,11 @@ def _is_safe_value(key: str, value: object) -> bool:
             character in "0123456789abcdef" for character in value
         )
     return True
+
+
+def _is_safe_capability_value(key: str, value: object) -> bool:
+    if key in {"contract_version", "voice_count"}:
+        return type(value) is int and value >= 0
+    if key == "ready":
+        return type(value) is bool
+    return key == "readiness" and isinstance(value, str) and value in _SAFE_READINESS

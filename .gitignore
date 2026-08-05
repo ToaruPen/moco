@@ -12,5 +12,7 @@ dist/
 htmlcov/
 moco-state/
 node_modules/
+playwright-report/
+test-results/
 *.egg-info/
 coverage.xml

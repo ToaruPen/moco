@@ -4,42 +4,46 @@ import asyncio
 import json
 import logging
 import secrets
+import time
 from contextlib import suppress
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, assert_never, cast
 from urllib.parse import urlsplit
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
+from irodori_tts_infra.contracts import CapabilitiesResponse
 from pydantic import ValidationError
 
 from moco.codex.rpc import CodexRpcClient
 from moco.codex.session import (
+    ActivityEvent,
     CodexRealtimeSession,
     RealtimeErrorEvent,
     RealtimeEvent,
+    ReasoningSummaryEvent,
     TranscriptEvent,
 )
 from moco.config import MocoSettings
 from moco.runtime.lifecycle import BusyKind, LifecycleController, LifecycleState
 from moco.runtime.telemetry import safe_event
-from moco.speech.irodori import IrodoriSynthesizer
+from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 from moco.speech.queue import SpeechQueue
 from moco.speech.text import strip_control_emojis
 from moco.web.messages import (
     ClientControl,
     ControlMessage,
     PlaybackMessage,
+    SelectVoiceMessage,
     StartMessage,
     StopMessage,
     parse_client_message,
 )
+from moco.web.pairing import render_pairing_svg
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
-
-    from irodori_tts_infra.contracts import HealthResponse
 
     from moco.runtime.hotkeys import Control
 
@@ -48,7 +52,36 @@ _LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
 _WEBSOCKET_PROTOCOL = "moco"
 _CAPABILITY_PROTOCOL_PREFIX = f"{_WEBSOCKET_PROTOCOL}.capability."
 _MAX_INVALID_MESSAGES = 3
+_CAPABILITY_POLL_INTERVAL_SECONDS = 1.0
+_CAPABILITY_MISMATCH = "capability_mismatch"
+_IRODORI_UNAVAILABLE = "irodori_unavailable"
+_TERMINAL_READINESS = frozenset({"ready", "model_not_loaded", "voice_bank_invalid"})
+_IRODORI_READINESS_CODES = frozenset(
+    {"model_loading", "model_not_loaded", "voice_bank_invalid"},
+)
+_PROVISIONAL_SELECTION_ERRORS = frozenset(
+    {"voice_catalog_empty", "configured_voice_unavailable", "voice_selection_required"},
+)
+_ACTIVITY_LABELS = {
+    "turn": ("turn", "応答処理"),
+    "reasoning": ("reasoning", "推論要約"),
+    "command_execution": ("work", "コマンド実行"),
+    "file_change": ("work", "ファイル変更"),
+    "external_tool": ("work", "外部ツール"),
+    "subagent": ("work", "サブエージェント"),
+    "web_search": ("work", "Web 検索"),
+    "image_view": ("work", "画像確認"),
+    "image_generation": ("work", "画像生成"),
+    "context_compaction": ("work", "コンテキスト整理"),
+    "codex_work": ("work", "Codex 処理"),
+}
 logger = logging.getLogger(__name__)
+
+
+class _CapabilityError(RuntimeError):
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
 
 
 class RealtimeSession(Protocol):
@@ -59,13 +92,13 @@ class RealtimeSession(Protocol):
 
     def notifications(self) -> AsyncIterator[RealtimeEvent]: ...
 
-    async def cancel_current(self) -> None: ...
-
     async def close(self) -> None: ...
 
 
 class WebSynthesizer(Protocol):
-    async def health(self) -> HealthResponse: ...
+    async def capabilities(self) -> CapabilitiesResponse: ...
+
+    def select_voice(self, voice_id: str) -> None: ...
 
     async def synthesize(self, text: str) -> bytes: ...
 
@@ -120,8 +153,10 @@ class _BrowserConnection:
         self._speech: SpeechQueue | None = None
         self._notifications_task: asyncio.Task[None] | None = None
         self._idle_task: asyncio.Task[None] | None = None
+        self._capability_task: asyncio.Task[None] | None = None
         self._send_lock = asyncio.Lock()
         self._resource_lock = asyncio.Lock()
+        self._capability_lock = asyncio.Lock()
         self._closed = False
         self._invalid_messages = 0
         self._generation = 0
@@ -129,6 +164,16 @@ class _BrowserConnection:
         self._transcripts: dict[str, str] = {}
         self._synthesis_busy = False
         self._delegated_busy = False
+        self._voice_options: tuple[dict[str, object], ...] = ()
+        self._voice_ready = False
+        self._voice_readiness = "loading"
+        self._emoji_supported = False
+        self._voice_generation: str | None = None
+        self._selected_voice_id: str | None = None
+        self._voice_selection_error: str | None = None
+        self._voice_selected_explicitly = False
+        self._browser_state = LifecycleState.READY
+        self._user_utterance_active = False
         self._lifecycle = LifecycleController(
             idle_timeout_seconds=settings.runtime.idle_timeout_seconds,
             on_expire=self._expire_conversation,
@@ -142,6 +187,10 @@ class _BrowserConnection:
             state="ready",
         )
         await self._send_state(LifecycleState.READY)
+        self._capability_task = asyncio.create_task(
+            self._capability_loop(),
+            name="moco-irodori-capabilities",
+        )
         self._idle_task = asyncio.create_task(self._idle_loop(), name="moco-idle-loop")
         try:
             while True:
@@ -160,6 +209,12 @@ class _BrowserConnection:
         if self._closed:
             return
         self._closed = True
+        capability_task = self._capability_task
+        self._capability_task = None
+        if capability_task is not None and capability_task is not asyncio.current_task():
+            capability_task.cancel()
+            with suppress(asyncio.CancelledError):
+                await capability_task
         idle_task = self._idle_task
         self._idle_task = None
         if idle_task is not None and idle_task is not asyncio.current_task():
@@ -195,9 +250,133 @@ class _BrowserConnection:
             if message.active:
                 self._lifecycle.set_state(LifecycleState.SPEAKING)
             return True
+        if isinstance(message, SelectVoiceMessage):
+            await self._select_voice(message.voice_id)
+            return True
         if isinstance(message, StopMessage):
             return False
         assert_never(message)
+
+    async def _capability_loop(self) -> None:
+        synthesizer: WebSynthesizer | None = None
+        try:
+            try:
+                synthesizer = self._synthesizer_factory()
+            except (OSError, RuntimeError):
+                await self._set_capability_failure("unavailable")
+                return
+            await self._poll_capabilities(synthesizer)
+        except asyncio.CancelledError:
+            raise
+        except (RuntimeError, WebSocketDisconnect):
+            return
+        finally:
+            if synthesizer is not None:
+                try:
+                    await synthesizer.close()
+                except Exception as error:  # noqa: BLE001
+                    _log_boundary_failure("irodori_capability_cleanup", error)
+
+    async def _poll_capabilities(self, synthesizer: WebSynthesizer) -> None:
+        while True:
+            try:
+                capabilities = await self._fetch_capabilities(synthesizer)
+            except _CapabilityError as error:
+                await self._set_capability_failure(_readiness_for_capability_error(error.code))
+                return
+            conflict = await self._cache_capabilities(capabilities)
+            await self._send_state(self._browser_state)
+            if conflict is not None or capabilities.readiness in _TERMINAL_READINESS:
+                return
+            await asyncio.sleep(_CAPABILITY_POLL_INTERVAL_SECONDS)
+
+    async def _fetch_capabilities(
+        self,
+        synthesizer: WebSynthesizer,
+    ) -> CapabilitiesResponse:
+        try:
+            response = await synthesizer.capabilities()
+            capabilities = CapabilitiesResponse.model_validate(
+                response.model_dump(mode="python"),
+                strict=True,
+            )
+        except IrodoriError as error:
+            if error.code == "invalid_response":
+                raise _CapabilityError(_CAPABILITY_MISMATCH) from error
+            if error.code in _IRODORI_READINESS_CODES:
+                raise _CapabilityError(error.code) from error
+            raise _CapabilityError(_IRODORI_UNAVAILABLE) from error
+        except (AttributeError, KeyError, TypeError, ValueError, ValidationError) as error:
+            raise _CapabilityError(_CAPABILITY_MISMATCH) from error
+        except OSError as error:
+            raise _CapabilityError(_IRODORI_UNAVAILABLE) from error
+        safe_event(
+            logger,
+            "irodori_capabilities_received",
+            contract_version=capabilities.contract_version,
+            ready=capabilities.ready,
+            readiness=capabilities.readiness,
+            voice_count=len(capabilities.voices),
+        )
+        return capabilities
+
+    async def _cache_capabilities(self, capabilities: CapabilitiesResponse) -> str | None:
+        options = tuple(
+            {"id": voice.id, "label": voice.label, "default": voice.default}
+            for voice in capabilities.voices
+        )
+        voice_ids = {voice.id for voice in capabilities.voices}
+        async with self._capability_lock:
+            self._emoji_supported = capabilities.conditioning.emoji.supported
+            cached_generation = self._voice_generation
+            if cached_generation is not None and cached_generation != capabilities.generation:
+                self._voice_options = options
+                self._voice_ready = False
+                self._voice_readiness = "capability_mismatch"
+                self._selected_voice_id = None
+                self._voice_selection_error = "runtime_generation_mismatch"
+                safe_event(
+                    logger,
+                    "irodori_generation_mismatch",
+                    event_code="runtime_generation_mismatch",
+                )
+                return "runtime_generation_mismatch"
+            should_resolve_selection = cached_generation is None or (
+                self._selected_voice_id is None
+                and self._voice_selection_error in _PROVISIONAL_SELECTION_ERRORS
+                and not self._voice_selected_explicitly
+            )
+            if should_resolve_selection:
+                selected, selection_error = _resolve_voice_selection(
+                    capabilities,
+                    self._settings.irodori.speaker,
+                )
+                self._selected_voice_id = selected
+                self._voice_selection_error = selection_error
+            elif self._selected_voice_id is not None and self._selected_voice_id not in voice_ids:
+                self._selected_voice_id = None
+                self._voice_selection_error = "voice_not_found"
+                self._voice_options = options
+                self._voice_ready = capabilities.ready
+                self._voice_readiness = capabilities.readiness
+                return "voice_not_found"
+            self._voice_generation = capabilities.generation
+            self._voice_options = options
+            self._voice_ready = capabilities.ready
+            self._voice_readiness = capabilities.readiness
+        return None
+
+    async def _set_capability_failure(self, readiness: str) -> None:
+        async with self._capability_lock:
+            self._voice_ready = False
+            self._voice_readiness = readiness
+            if readiness == "capability_mismatch":
+                self._voice_selection_error = "capability_mismatch"
+            elif readiness in _IRODORI_READINESS_CODES:
+                self._voice_selection_error = readiness
+            else:
+                self._voice_selection_error = "irodori_unavailable"
+        await self._send_state(self._browser_state)
 
     async def _start(self, message: StartMessage) -> None:
         if self._session is not None:
@@ -208,15 +387,13 @@ class _BrowserConnection:
         session: RealtimeSession | None = None
         try:
             synthesizer = self._synthesizer_factory()
-            session = self._session_factory()
-            health = await synthesizer.health()
-            if not health.model_loaded:
-                await _close_start_resources(session, synthesizer)
-                await self._send_error("irodori_not_ready")
+            preparation_error = await self._prepare_start_synthesizer(synthesizer)
+            if preparation_error is not None:
+                await self._fail_start(None, synthesizer, preparation_error)
                 return
+            session = self._session_factory()
             answer = await session.start(message.sdp)
         except (OSError, RuntimeError) as error:
-            await _close_start_resources(session, synthesizer)
             _log_boundary_failure("conversation_start", error)
             safe_event(
                 logger,
@@ -225,17 +402,16 @@ class _BrowserConnection:
                 event_code="conversation_start_failed",
                 result="error",
             )
-            await self._send_error("conversation_start_failed")
+            await self._fail_start(session, synthesizer, "conversation_start_failed")
             return
 
-        ready_synthesizer = synthesizer
-        ready_session = session
-        self._synthesizer = ready_synthesizer
-        self._session = ready_session
+        self._synthesizer = synthesizer
+        self._session = session
         self._speech = SpeechQueue(
-            ready_synthesizer,
+            synthesizer,
             deliver=self._deliver_audio,
             max_chars=self._settings.speech.segment_max_chars,
+            on_error=self._handle_speech_error,
         )
         self._speech.start()
         self._lifecycle.enable()
@@ -253,6 +429,39 @@ class _BrowserConnection:
             result="ok",
         )
 
+    async def _prepare_start_synthesizer(self, synthesizer: WebSynthesizer) -> str | None:
+        try:
+            capabilities = await self._fetch_capabilities(synthesizer)
+        except _CapabilityError as error:
+            return error.code
+        preparation_error = await self._cache_capabilities(capabilities)
+        if preparation_error is None:
+            preparation_error = _start_voice_error(
+                capabilities,
+                selection_error=self._voice_selection_error,
+                selected_voice_id=self._selected_voice_id,
+            )
+        if preparation_error is not None:
+            return preparation_error
+        selected_voice_id = cast("str", self._selected_voice_id)
+        try:
+            synthesizer.select_voice(selected_voice_id)
+        except IrodoriError as error:
+            return error.code
+        return None
+
+    async def _fail_start(
+        self,
+        session: RealtimeSession | None,
+        synthesizer: WebSynthesizer | None,
+        error_code: str,
+    ) -> None:
+        await _close_start_resources(session, synthesizer)
+        await self._send_error(error_code)
+        self._lifecycle.disable()
+        self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+        await self._send_state(LifecycleState.IDLE_EXPIRED)
+
     async def _apply_control(self, control: ClientControl) -> None:
         safe_event(
             logger,
@@ -260,34 +469,46 @@ class _BrowserConnection:
             component="web",
             control=control.value,
         )
-        if control is ClientControl.PTT_DOWN:
+        if control is ClientControl.LISTEN_START:
             if self._session is None:
                 await self._send_error("conversation_not_started")
                 return
-            self._generation += 1
-            speech = self._speech
-            if speech is not None:
-                await speech.cancel()
-            await self._session.cancel_current()
-            self._lifecycle.ptt_down()
-            await self._send_json({"type": "audio_invalidate", "generation": self._generation})
-            await self._send_state(LifecycleState.RECORDING)
+            self._lifecycle.listen_start()
+            await self._send_state(LifecycleState.LISTENING)
             return
-        if control is ClientControl.PTT_UP:
-            self._lifecycle.ptt_up()
-            await self._send_state(LifecycleState.WORKING)
-            return
-        if control is ClientControl.CANCEL:
-            self._generation += 1
-            if self._speech is not None:
-                await self._speech.cancel()
-            if self._session is not None:
-                await self._session.cancel_current()
-            self._lifecycle.set_state(LifecycleState.CANCELLING)
-            await self._send_json({"type": "audio_invalidate", "generation": self._generation})
-            await self._send_state(LifecycleState.CANCELLING)
+        if control is ClientControl.LISTEN_STOP:
+            if self._session is None:
+                self._lifecycle.disable()
+                self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+                await self._send_state(LifecycleState.IDLE_EXPIRED)
+                return
+            self._lifecycle.listen_stop()
+            await self._send_state(LifecycleState.READY)
             return
         assert_never(control)
+
+    async def _select_voice(self, voice_id: str) -> None:
+        async with self._capability_lock:
+            available = any(option["id"] == voice_id for option in self._voice_options)
+            if not available:
+                selection_failed = True
+            elif self._synthesizer is not None:
+                try:
+                    self._synthesizer.select_voice(voice_id)
+                except IrodoriError:
+                    selection_failed = True
+                else:
+                    selection_failed = False
+            else:
+                selection_failed = False
+            if not selection_failed:
+                self._selected_voice_id = voice_id
+                self._voice_selection_error = None
+                self._voice_selected_explicitly = True
+        if selection_failed:
+            await self._send_error("voice_not_available")
+            return
+        await self._send_json({"type": "voice", "selected": voice_id})
 
     async def _consume_notifications(self) -> None:
         session = self._session
@@ -296,9 +517,14 @@ class _BrowserConnection:
         try:
             async for event in session.notifications():
                 if isinstance(event, RealtimeErrorEvent):
-                    await self._send_error("codex_realtime_error")
-                    await self._close_conversation_resources()
+                    await self._terminate_conversation("codex_realtime_error")
                     return
+                if isinstance(event, ActivityEvent):
+                    await self._send_activity(event)
+                    continue
+                if isinstance(event, ReasoningSummaryEvent):
+                    await self._send_reasoning_summary(event)
+                    continue
                 if isinstance(event, TranscriptEvent):
                     await self._handle_transcript(event)
         except asyncio.CancelledError:
@@ -306,9 +532,52 @@ class _BrowserConnection:
         except (OSError, RuntimeError) as error:
             _log_boundary_failure("realtime_events", error)
             with suppress(RuntimeError):
-                await self._send_error("invalid_realtime_event")
+                await self._terminate_conversation("invalid_realtime_event")
+
+    async def _terminate_conversation(self, error_code: str) -> None:
+        await self._send_error(error_code)
+        await self._close_conversation_resources()
+        self._lifecycle.disable()
+        self._lifecycle.set_state(LifecycleState.IDLE_EXPIRED)
+        await self._send_state(LifecycleState.IDLE_EXPIRED)
+
+    async def _handle_speech_error(self, code: str) -> None:
+        if code == "runtime_generation_mismatch":
+            safe_event(
+                logger,
+                "irodori_generation_mismatch",
+                event_code=code,
+            )
+        await self._send_error(code)
+
+    async def _send_activity(self, event: ActivityEvent) -> None:
+        kind, label = _ACTIVITY_LABELS[event.kind]
+        await self._send_json(
+            {
+                "type": "activity",
+                "kind": kind,
+                "phase": event.phase,
+                "label": label,
+                "occurredAtMs": (
+                    event.occurred_at_ms if event.occurred_at_ms is not None else _now_ms()
+                ),
+            },
+        )
+
+    async def _send_reasoning_summary(self, event: ReasoningSummaryEvent) -> None:
+        await self._send_json(
+            {
+                "type": "reasoning_summary",
+                "itemId": event.item_id,
+                "delta": _display_text(event.delta)[:500],
+                "occurredAtMs": _now_ms(),
+            },
+        )
 
     async def _handle_transcript(self, event: TranscriptEvent) -> None:
+        if event.role == "user" and not self._user_utterance_active:
+            self._user_utterance_active = True
+            await self._invalidate_speech()
         delta, done = self._transcript_delta(event)
         await self._send_json(
             {
@@ -321,7 +590,17 @@ class _BrowserConnection:
         speech = self._speech
         if speech is not None:
             await speech.on_transcript(role=event.role, delta=delta, done=done)
+        if event.role == "user" and done:
+            self._user_utterance_active = False
         self._lifecycle.touch()
+
+    async def _invalidate_speech(self) -> None:
+        self._generation += 1
+        if self._speech is not None:
+            await self._speech.invalidate()
+        await self._send_json(
+            {"type": "audio_invalidate", "generation": self._generation},
+        )
 
     def _transcript_delta(self, event: TranscriptEvent) -> tuple[str, bool]:
         accumulated = self._transcripts.get(event.role, "")
@@ -357,6 +636,15 @@ class _BrowserConnection:
             if speech_busy != self._synthesis_busy:
                 self._synthesis_busy = speech_busy
                 self._lifecycle.set_busy(BusyKind.SYNTHESIS, active=speech_busy)
+                await self._send_json(
+                    {
+                        "type": "activity",
+                        "kind": "voice",
+                        "phase": "started" if speech_busy else "completed",
+                        "label": "音声生成",
+                        "occurredAtMs": _now_ms(),
+                    },
+                )
             delegated_busy = self._session is not None and self._session.active_turn_id is not None
             if delegated_busy != self._delegated_busy:
                 self._delegated_busy = delegated_busy
@@ -391,6 +679,7 @@ class _BrowserConnection:
             self._session = None
             self._synthesizer = None
             self._transcripts.clear()
+            self._user_utterance_active = False
             if speech is not None:
                 await speech.close()
             if session is not None:
@@ -399,14 +688,26 @@ class _BrowserConnection:
                 await synthesizer.close()
 
     async def _send_state(self, state: LifecycleState) -> None:
+        self._browser_state = state
         await self._send_json(
             {
                 "type": "state",
                 "state": state.value,
                 "hotkeys": {
                     "enabled": self._global_hotkeys_active,
-                    "pushToTalk": self._settings.hotkeys.push_to_talk,
-                    "cancel": self._settings.hotkeys.cancel,
+                    "startListening": self._settings.hotkeys.start_listening,
+                    "stopListening": self._settings.hotkeys.stop_listening,
+                },
+                "voice": {
+                    "selected": self._selected_voice_id,
+                    "options": list(self._voice_options),
+                    "ready": self._voice_ready,
+                    "readiness": self._voice_readiness,
+                },
+                "conditioning": {
+                    "captionMode": "off",
+                    "deliveryCaptionSupported": False,
+                    "emojiSupported": self._emoji_supported,
                 },
             },
         )
@@ -446,9 +747,32 @@ def create_app(
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
 
+    @app.head("/pairing.svg", include_in_schema=False)
+    async def pairing_status(request: Request) -> Response:
+        if resolved.server.public_url is None or not _pairing_request_allowed(
+            request,
+            app.state.capability_token,
+        ):
+            raise HTTPException(status_code=404)
+        return Response(status_code=204, headers={"Cache-Control": "no-store"})
+
+    @app.get("/pairing.svg", include_in_schema=False)
+    async def pairing_svg(request: Request) -> Response:
+        public_url = resolved.server.public_url
+        if public_url is None or not _pairing_request_allowed(
+            request,
+            app.state.capability_token,
+        ):
+            raise HTTPException(status_code=404)
+        return Response(
+            render_pairing_svg(public_url, app.state.capability_token),
+            media_type="image/svg+xml",
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
     @app.websocket("/ws")
     async def operator_socket(websocket: WebSocket) -> None:
-        if not _origin_allowed(websocket) or not _capability_allowed(
+        if not _origin_allowed(websocket, resolved.server.public_url) or not _capability_allowed(
             websocket,
             app.state.capability_token,
         ):
@@ -484,22 +808,33 @@ def _codex_session_factory(settings: MocoSettings) -> SessionFactory:
     return build
 
 
-def _origin_allowed(websocket: WebSocket) -> bool:
+def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
     origin = websocket.headers.get("origin")
     host = websocket.headers.get("host")
     if origin is None or host is None:
         return False
     origin_parts = urlsplit(origin)
     host_parts = urlsplit(f"//{host}")
-    return (
-        origin_parts.scheme in {"http", "https"}
-        and origin_parts.path in {"", "/"}
-        and not origin_parts.query
-        and not origin_parts.fragment
+    if (
+        origin_parts.path not in {"", "/"}
+        or origin_parts.query
+        or origin_parts.fragment
+        or origin_parts.username is not None
+        or origin_parts.password is not None
+    ):
+        return False
+    local = (
+        origin_parts.scheme == "http"
         and origin_parts.hostname in _LOOPBACK_HOSTS
         and host_parts.hostname in _LOOPBACK_HOSTS
         and origin_parts.netloc.casefold() == host.casefold()
     )
+    public = (
+        public_url is not None
+        and origin.casefold().rstrip("/") == public_url
+        and host.casefold() == urlsplit(public_url).netloc.casefold()
+    )
+    return local or public
 
 
 def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
@@ -520,12 +855,81 @@ def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
     )
 
 
+def _pairing_request_allowed(request: Request, expected_token: str) -> bool:
+    host = urlsplit(f"//{request.headers.get('host', '')}").hostname
+    candidate = request.headers.get("x-moco-capability")
+    fetch_site = request.headers.get("sec-fetch-site")
+    return (
+        host in _LOOPBACK_HOSTS
+        and candidate is not None
+        and secrets.compare_digest(candidate, expected_token)
+        and fetch_site in {None, "same-origin"}
+    )
+
+
 def _log_boundary_failure(boundary: str, error: BaseException) -> None:
     logger.warning(
         "Boundary failure (boundary=%s, error_type=%s)",
         boundary,
         type(error).__name__,
     )
+
+
+def _now_ms() -> int:
+    return int(time.time() * 1000)
+
+
+def _display_text(text: str) -> str:
+    printable = "".join(
+        character if character.isprintable() else " " for character in strip_control_emojis(text)
+    )
+    return " ".join(printable.split())
+
+
+def _resolve_voice_selection(
+    capabilities: CapabilitiesResponse,
+    configured: str | None,
+) -> tuple[str | None, str | None]:
+    if not capabilities.voices:
+        return None, "voice_catalog_empty"
+    if configured is not None:
+        canonical = next(
+            (voice.id for voice in capabilities.voices if voice.id == configured),
+            None,
+        )
+        if canonical is not None:
+            return canonical, None
+        aliases = [voice.id for voice in capabilities.voices if configured in voice.aliases]
+        if len(aliases) == 1:
+            return aliases[0], None
+        return None, "configured_voice_unavailable"
+    defaults = [voice.id for voice in capabilities.voices if voice.default]
+    if len(defaults) == 1:
+        return defaults[0], None
+    return None, "voice_selection_required"
+
+
+def _readiness_for_capability_error(code: str) -> str:
+    if code == _CAPABILITY_MISMATCH:
+        return _CAPABILITY_MISMATCH
+    if code in _IRODORI_READINESS_CODES:
+        return code
+    return "unavailable"
+
+
+def _start_voice_error(
+    capabilities: CapabilitiesResponse,
+    *,
+    selection_error: str | None,
+    selected_voice_id: str | None,
+) -> str | None:
+    if not capabilities.ready:
+        return capabilities.readiness
+    if selection_error is not None:
+        return selection_error
+    if selected_voice_id is None:
+        return "voice_selection_required"
+    return None
 
 
 async def _close_start_resources(

@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 import yaml
@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     HttpUrl,
+    IPvAnyAddress,
     ValidationError,
     field_validator,
     model_validator,
@@ -21,6 +22,8 @@ PositiveInt = Annotated[int, Field(gt=0)]
 PositiveFloat = Annotated[float, Field(gt=0.0)]
 Port = Annotated[int, Field(gt=0, le=65_535)]
 VadThreshold = Annotated[float, Field(gt=0.0, le=1.0)]
+_MIN_PUBLIC_DNS_LABELS = 2
+_MAX_DNS_LABEL_LENGTH = 63
 
 
 class ConfigError(ValueError):
@@ -34,6 +37,7 @@ class StrictSettings(BaseModel):
 class ServerSettings(StrictSettings):
     host: str = "127.0.0.1"
     port: Port = 8765
+    public_url: str | None = None
 
     @field_validator("host")
     @classmethod
@@ -51,13 +55,56 @@ class ServerSettings(StrictSettings):
             raise ValueError(msg)
         return host
 
+    @field_validator("public_url")
+    @classmethod
+    def _validate_public_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        candidate = value.strip()
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        try:
+            address = ipaddress.ip_address(hostname or "")
+        except ValueError:
+            address = None
+        try:
+            port = parsed.port
+        except ValueError as error:
+            msg = "operator public URL must be a portless HTTPS FQDN"
+            raise ValueError(msg) from error
+        labels = (hostname or "").rstrip(".").split(".")
+        labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
+            label.isascii()
+            and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
+            and label[0].isalnum()
+            and label[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in label)
+            for label in labels
+        )
+        if (
+            parsed.scheme.casefold() != "https"
+            or hostname is None
+            or address is not None
+            or not labels_valid
+            or parsed.username is not None
+            or parsed.password is not None
+            or port is not None
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+            or "*" in candidate
+        ):
+            msg = "operator public URL must be a portless HTTPS FQDN"
+            raise ValueError(msg)
+        return f"https://{hostname.rstrip('.').casefold()}"
+
 
 class HotkeySettings(StrictSettings):
     enabled: bool = True
-    push_to_talk: str = "f1"
-    cancel: str = "f2"
+    start_listening: str = "f1"
+    stop_listening: str = "f2"
 
-    @field_validator("push_to_talk", "cancel")
+    @field_validator("start_listening", "stop_listening")
     @classmethod
     def _normalize_key(cls, value: str) -> str:
         key = value.strip().lower()
@@ -68,8 +115,8 @@ class HotkeySettings(StrictSettings):
 
     @model_validator(mode="after")
     def _require_distinct_keys(self) -> Self:
-        if self.push_to_talk == self.cancel:
-            msg = "push-to-talk and cancel hotkeys must be distinct"
+        if self.start_listening == self.stop_listening:
+            msg = "start-listening and stop-listening hotkeys must be distinct"
             raise ValueError(msg)
         return self
 
@@ -106,7 +153,9 @@ def _validate_http_url(value: object, *, label: str) -> object:
 
 class IrodoriSettings(StrictSettings):
     base_url: HttpUrl = HttpUrl("http://127.0.0.1:8923")
+    connect_ip: IPvAnyAddress | None = None
     speaker: str | None = None
+    caption_mode: Literal["off"] = "off"
     num_steps: PositiveInt = 24
     duration_scale: PositiveFloat = 1.0
     cfg_scale_text: PositiveFloat = 3.0
@@ -125,6 +174,28 @@ class IrodoriSettings(StrictSettings):
         if value is None:
             return None
         return value.strip() or None
+
+    @model_validator(mode="after")
+    def _require_secure_address_override(self) -> Self:
+        if self.connect_ip is None:
+            return self
+        parsed = urlsplit(str(self.base_url))
+        hostname = parsed.hostname or ""
+        try:
+            ipaddress.ip_address(hostname)
+        except ValueError:
+            hostname_is_ip = False
+        else:
+            hostname_is_ip = True
+        if (
+            parsed.scheme != "https"
+            or parsed.port is not None
+            or "." not in hostname
+            or hostname_is_ip
+        ):
+            msg = "connect_ip requires a portless HTTPS base_url with a DNS FQDN"
+            raise ValueError(msg)
+        return self
 
 
 class SpeechSettings(StrictSettings):

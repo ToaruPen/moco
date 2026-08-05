@@ -1,5 +1,19 @@
 # moco First Usable Release Implementation Plan
 
+> **Superseded control contract:** The push-to-talk and explicit-cancel steps in
+> this historical plan were replaced by the continuous `LISTEN_START` /
+> `LISTEN_STOP` contract in
+> `docs/superpowers/specs/2026-07-31-voice-runtime-hardening-design.md`. Do not
+> implement the PTT examples below.
+>
+> Explicit Realtime session replacement is tracked separately in Issue #2.
+
+> **Superseded Irodori contract:** The static speaker, `/health`-gated adapter,
+> and deployment steps in this historical plan were replaced by
+> `docs/superpowers/plans/2026-08-04-irodori-capability-client-migration.md`.
+> The current contract is capability-driven, generation-conditional, and uses
+> caption mode `off`. Do not execute the old Irodori steps below.
+
 > **For agentic workers:** REQUIRED SUB-SKILL: Use
 > superpowers:subagent-driven-development (recommended) or
 > superpowers:executing-plans to implement this plan task-by-task. Steps use

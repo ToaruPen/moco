@@ -11,21 +11,20 @@ if TYPE_CHECKING:
 
 
 class Control(StrEnum):
-    PTT_DOWN = "ptt_down"
-    PTT_UP = "ptt_up"
-    CANCEL = "cancel"
+    LISTEN_START = "listen_start"
+    LISTEN_STOP = "listen_stop"
 
 
 class HotkeyMapper:
     def __init__(
         self,
         *,
-        ptt_key: str,
-        cancel_key: str,
+        start_key: str,
+        stop_key: str,
         emit: Callable[[Control], object],
     ) -> None:
-        self._ptt_key = ptt_key.lower()
-        self._cancel_key = cancel_key.lower()
+        self._start_key = start_key.lower()
+        self._stop_key = stop_key.lower()
         self._emit = emit
         self._pressed: set[str] = set()
 
@@ -33,20 +32,18 @@ class HotkeyMapper:
         canonical = key.lower()
         if canonical in self._pressed:
             return
-        if canonical == self._ptt_key:
+        if canonical == self._start_key:
             self._pressed.add(canonical)
-            self._emit(Control.PTT_DOWN)
-        elif canonical == self._cancel_key:
+            self._emit(Control.LISTEN_START)
+        elif canonical == self._stop_key:
             self._pressed.add(canonical)
-            self._emit(Control.CANCEL)
+            self._emit(Control.LISTEN_STOP)
 
     def key_up(self, key: str) -> None:
         canonical = key.lower()
         if canonical not in self._pressed:
             return
         self._pressed.remove(canonical)
-        if canonical == self._ptt_key:
-            self._emit(Control.PTT_UP)
 
 
 class GlobalHotkeyListener:

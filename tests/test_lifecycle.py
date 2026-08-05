@@ -15,7 +15,7 @@ class Clock:
 
 @pytest.mark.parametrize(
     "kind",
-    [BusyKind.RECORDING, BusyKind.DELEGATED, BusyKind.SYNTHESIS, BusyKind.PLAYBACK],
+    [BusyKind.LISTENING, BusyKind.DELEGATED, BusyKind.SYNTHESIS, BusyKind.PLAYBACK],
 )
 async def test_busy_activity_prevents_idle_expiry(kind: BusyKind) -> None:
     clock = Clock()
@@ -67,7 +67,7 @@ async def test_idle_expiry_fires_once() -> None:
     assert lifecycle.state is LifecycleState.IDLE_EXPIRED
 
 
-async def test_ptt_after_expiry_returns_to_ready_for_fresh_session() -> None:
+async def test_listen_start_after_expiry_requests_fresh_session() -> None:
     clock = Clock()
 
     async def expire() -> None:
@@ -82,14 +82,14 @@ async def test_ptt_after_expiry_returns_to_ready_for_fresh_session() -> None:
     clock.now = 5
     await lifecycle.poll()
 
-    starts_fresh = lifecycle.ptt_down()
+    starts_fresh = lifecycle.listen_start()
 
     assert starts_fresh
-    assert lifecycle.state is LifecycleState.RECORDING
+    assert lifecycle.state is LifecycleState.LISTENING
     assert lifecycle.is_busy
 
 
-def test_ptt_pair_updates_state_and_activity() -> None:
+def test_listening_start_and_stop_update_state_and_activity() -> None:
     clock = Clock()
 
     async def expire() -> None:
@@ -102,11 +102,11 @@ def test_ptt_pair_updates_state_and_activity() -> None:
     )
     lifecycle.enable()
 
-    assert not lifecycle.ptt_down()
-    assert lifecycle.state.value == "recording"
+    assert not lifecycle.listen_start()
+    assert lifecycle.state.value == "listening"
     clock.now = 2
-    lifecycle.ptt_up()
+    lifecycle.listen_stop()
 
-    assert lifecycle.state is LifecycleState.WORKING
+    assert lifecycle.state is LifecycleState.READY
     assert not lifecycle.is_busy
     assert lifecycle.last_activity == 2

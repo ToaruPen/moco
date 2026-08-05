@@ -1,13 +1,15 @@
 # moco configuration. Unknown keys are rejected.
 server:
-  # The operator server is intentionally loopback-only.
+  # moco stays loopback-only; cloudflared connects to this origin.
   host: 127.0.0.1
   port: 8765
+  # Optional stable hostname protected by Cloudflare Access. No path or port.
+  public_url: null
 
 hotkeys:
   enabled: true
-  push_to_talk: f1
-  cancel: f2
+  start_listening: f1
+  stop_listening: f2
 
 runtime:
   # Close only the conversation after five inactive minutes.
@@ -18,14 +20,20 @@ codex:
   working_directory: /Users/your-name
 
 irodori:
-  # Replace with the Windows host's Tailscale URL for normal use.
-  base_url: http://127.0.0.1:8923
-  # Portable speaker name; null uses the Irodori server default.
+  # Replace with the Windows node's portless Tailscale Serve URL.
+  base_url: https://windows-node.example.ts.net
+  # Optional direct tailnet address when the OS cannot resolve MagicDNS.
+  # HTTPS still verifies the base_url hostname through SNI.
+  connect_ip: null
+  # Preferred voice ID from the runtime catalog; null uses the catalog default.
   speaker: null
+  # Captions remain disabled during the initial v4 migration.
+  caption_mode: "off"
   num_steps: 24
   duration_scale: 1.0
   cfg_scale_text: 3.0
   cfg_scale_speaker: 5.0
+  # Readiness checks remain bounded; synthesis itself has no timeout.
   timeout_seconds: 30
   max_wav_bytes: 33554432
 
