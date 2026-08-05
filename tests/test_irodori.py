@@ -6,7 +6,14 @@ from typing import cast
 import httpx
 import pytest
 from irodori_tts_infra.client.errors import ClientError
-from irodori_tts_infra.contracts import HealthResponse, SynthesisRequest, SynthesisResult
+from irodori_tts_infra.contracts import (
+    CapabilitiesResponse,
+    HealthResponse,
+    Readiness,
+    SynthesisRequest,
+    SynthesisResult,
+    VoiceCapability,
+)
 
 from moco.config import IrodoriSettings, MocoSettings
 from moco.speech.irodori import (
@@ -25,9 +32,35 @@ def valid_wav(payload: bytes = b"") -> bytes:
     return b"RIFF" + len(body).to_bytes(4, byteorder="little") + body
 
 
+def make_capabilities(
+    count: int,
+    *,
+    ready: bool = True,
+    readiness: Readiness | None = None,
+    generation: str = "fixture-generation",
+) -> CapabilitiesResponse:
+    voices = tuple(
+        VoiceCapability(
+            id=f"fixture-id-{index}",
+            label=f"Fixture label {index}",
+            aliases=(f"fixture-alias-{index}",),
+            default=index == 0,
+        )
+        for index in range(count)
+    )
+    return CapabilitiesResponse(
+        generation=generation,
+        ready=ready,
+        readiness=readiness or ("ready" if ready else "model_loading"),
+        voices=voices,
+    )
+
+
 class FakeIrodoriClient:
-    def __init__(self, wav: bytes | None = None) -> None:
+    def __init__(self, wav: bytes | None = None, *, voice_count: int = 2) -> None:
         self.wav = wav if wav is not None else valid_wav()
+        self.capabilities_response: object = make_capabilities(voice_count)
+        self.capabilities_calls = 0
         self.requests: list[SynthesisRequest] = []
         self.error: Exception | None = None
         self.close_error: Exception | None = None
@@ -37,6 +70,12 @@ class FakeIrodoriClient:
         if self.error is not None:
             raise self.error
         return HealthResponse(model_loaded=True)
+
+    async def capabilities(self) -> CapabilitiesResponse:
+        if self.error is not None:
+            raise self.error
+        self.capabilities_calls += 1
+        return cast("CapabilitiesResponse", self.capabilities_response)
 
     async def synthesize(self, request: SynthesisRequest) -> SynthesisResult:
         if self.error is not None:
@@ -54,11 +93,38 @@ class FakeIrodoriClient:
             raise self.close_error
 
 
-async def test_uses_portable_speaker_and_configured_parameters() -> None:
+async def prepare_synthesizer(
+    client: FakeIrodoriClient,
+    *,
+    settings: MocoSettings | None = None,
+) -> IrodoriSynthesizer:
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=settings or MocoSettings(),
+    )
+    await synthesizer.capabilities()
+    synthesizer.select_voice("fixture-id-0")
+    return synthesizer
+
+
+async def test_capabilities_fetches_from_bounded_client_and_caches_response() -> None:
+    client = FakeIrodoriClient(voice_count=3)
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    capabilities = await synthesizer.capabilities()
+
+    assert capabilities == make_capabilities(3)
+    assert client.capabilities_calls == 1
+    synthesizer.select_voice("fixture-id-2")
+
+
+async def test_uses_canonical_voice_generation_and_only_supported_fields() -> None:
     client = FakeIrodoriClient()
     settings = MocoSettings(
         irodori=IrodoriSettings(
-            speaker="portable-name",
             num_steps=16,
             duration_scale=1.2,
             cfg_scale_text=2.5,
@@ -66,31 +132,135 @@ async def test_uses_portable_speaker_and_configured_parameters() -> None:
         ),
     )
     synthesizer = IrodoriSynthesizer(cast("IrodoriClient", client), settings=settings)
+    await synthesizer.capabilities()
+    synthesizer.select_voice("fixture-id-1")
 
     assert await synthesizer.synthesize("こんにちは。") == valid_wav()
 
     request = client.requests[0]
-    assert request.speaker == "portable-name"
-    assert request.ref_embed is None
+    assert request.voice_id == "fixture-id-1"
+    assert request.if_generation == "fixture-generation"
     assert request.num_steps == 16
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
+    assert request.model_fields_set == {
+        "text",
+        "voice_id",
+        "if_generation",
+        "num_steps",
+        "duration_scale",
+        "cfg_scale_text",
+        "cfg_scale_speaker",
+    }
+    assert request.style == "neutral"
+    assert request.cfg_scale_caption == 3.0
 
 
-async def test_selected_speaker_applies_to_subsequent_synthesis() -> None:
+async def test_alias_selection_is_normalized_to_canonical_voice_id() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(client)
+
+    synthesizer.select_voice("fixture-alias-1")
+    await synthesizer.synthesize("別の声。")
+
+    assert client.requests[0].voice_id == "fixture-id-1"
+
+
+async def test_select_voice_requires_loaded_capabilities() -> None:
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", FakeIrodoriClient()),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        synthesizer.select_voice("fixture-id-0")
+
+    assert caught.value.code == "capabilities_not_loaded"
+
+
+async def test_select_voice_rejects_empty_or_unknown_catalog() -> None:
+    empty_client = FakeIrodoriClient(voice_count=0)
+    empty = IrodoriSynthesizer(
+        cast("IrodoriClient", empty_client),
+        settings=MocoSettings(),
+    )
+    await empty.capabilities()
+    with pytest.raises(IrodoriError) as empty_caught:
+        empty.select_voice("fixture-id-0")
+    assert empty_caught.value.code == "voice_catalog_empty"
+
     client = FakeIrodoriClient()
     synthesizer = IrodoriSynthesizer(
         cast("IrodoriClient", client),
-        settings=MocoSettings(irodori=IrodoriSettings(speaker="default")),
+        settings=MocoSettings(),
+    )
+    await synthesizer.capabilities()
+    with pytest.raises(IrodoriError) as unknown_caught:
+        synthesizer.select_voice("not-in-catalog")
+    assert unknown_caught.value.code == "voice_not_found"
+
+
+async def test_synthesis_requires_loaded_capabilities() -> None:
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", FakeIrodoriClient()),
+        settings=MocoSettings(),
     )
 
-    synthesizer.select_speaker("alternate")
-    await synthesizer.synthesize("別の声。")
-    synthesizer.select_speaker(None)
-    await synthesizer.synthesize("ナレーター。")
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
 
-    assert [request.speaker for request in client.requests] == ["alternate", None]
+    assert caught.value.code == "capabilities_not_loaded"
+
+
+@pytest.mark.parametrize(
+    "readiness",
+    ["model_loading", "model_not_loaded", "voice_bank_invalid"],
+)
+async def test_synthesis_preserves_unready_capability_code(readiness: Readiness) -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = make_capabilities(
+        2,
+        ready=False,
+        readiness=readiness,
+    )
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+    await synthesizer.capabilities()
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
+
+    assert caught.value.code == readiness
+
+
+async def test_synthesis_requires_voice_selection() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+    await synthesizer.capabilities()
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
+
+    assert caught.value.code == "voice_selection_required"
+
+
+async def test_synthesis_rejects_selected_voice_removed_by_capability_refresh() -> None:
+    client = FakeIrodoriClient(voice_count=2)
+    synthesizer = await prepare_synthesizer(client)
+    synthesizer.select_voice("fixture-id-1")
+    client.capabilities_response = make_capabilities(1, generation="refreshed-generation")
+    await synthesizer.capabilities()
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
+
+    assert caught.value.code == "voice_not_found"
 
 
 async def test_maps_client_errors_to_stable_codes() -> None:
@@ -107,6 +277,20 @@ async def test_maps_client_errors_to_stable_codes() -> None:
     assert caught.value.code == "connection_error"
 
 
+async def test_capabilities_preserves_client_error_code() -> None:
+    client = FakeIrodoriClient()
+    client.error = ClientError("runtime unavailable", code="model_not_loaded")
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.capabilities()
+
+    assert caught.value.code == "model_not_loaded"
+
+
 @pytest.mark.parametrize(
     ("wav", "code"),
     [
@@ -118,7 +302,7 @@ async def test_rejects_invalid_or_oversized_wav(wav: bytes, code: str) -> None:
     max_bytes = len(valid_wav()) if code == "audio_too_large" else 1024
     client = FakeIrodoriClient(wav)
     settings = MocoSettings(irodori=IrodoriSettings(max_wav_bytes=max_bytes))
-    synthesizer = IrodoriSynthesizer(cast("IrodoriClient", client), settings=settings)
+    synthesizer = await prepare_synthesizer(client, settings=settings)
 
     with pytest.raises(IrodoriError) as caught:
         await synthesizer.synthesize("test")
@@ -128,17 +312,81 @@ async def test_rejects_invalid_or_oversized_wav(wav: bytes, code: str) -> None:
 
 async def test_unexpected_validation_failure_becomes_invalid_response() -> None:
     client = FakeIrodoriClient()
-    client.error = ValueError("raw response contained sensitive details")
     synthesizer = IrodoriSynthesizer(
         cast("IrodoriClient", client),
         settings=MocoSettings(),
     )
+    await synthesizer.capabilities()
+    synthesizer.select_voice("fixture-id-0")
+    client.error = ValueError("raw response contained sensitive details")
 
     with pytest.raises(IrodoriError, match="invalid response") as caught:
         await synthesizer.synthesize("test")
 
     assert caught.value.code == "invalid_response"
     assert "sensitive" not in str(caught.value)
+
+
+async def test_capabilities_validation_failure_becomes_invalid_response() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = {
+        "generation": "fixture-generation",
+        "ready": True,
+        "readiness": "ready",
+        "voices": (),
+        "unexpected": "must be rejected",
+    }
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError, match="invalid response") as caught:
+        await synthesizer.capabilities()
+
+    assert caught.value.code == "invalid_response"
+
+
+async def test_capabilities_revalidates_typed_client_response_strictly() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = CapabilitiesResponse.model_construct(
+        generation="fixture-generation",
+        ready=True,
+        readiness="ready",
+        voices=(
+            VoiceCapability(id="fixture-id-0", label="Fixture 0", aliases=("collision",)),
+            VoiceCapability(id="fixture-id-1", label="Fixture 1", aliases=("collision",)),
+        ),
+    )
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.capabilities()
+
+    assert caught.value.code == "invalid_response"
+
+
+async def test_capabilities_rejects_forged_same_type_instance() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = CapabilitiesResponse.model_construct(
+        contract_version=2,
+        generation=" ",
+        ready=True,
+        readiness="ready",
+        voices=(VoiceCapability.model_construct(id=" ", label="Fixture"),),
+    )
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.capabilities()
+
+    assert caught.value.code == "invalid_response"
 
 
 async def test_transport_rejects_declared_response_over_limit() -> None:
@@ -211,10 +459,14 @@ async def test_health_and_synthesis_use_separate_clients() -> None:
     )
 
     await synthesizer.health()
+    await synthesizer.capabilities()
+    synthesizer.select_voice("fixture-id-0")
     await synthesizer.synthesize("test")
     await synthesizer.close()
 
     assert health_client.requests == []
+    assert health_client.capabilities_calls == 1
+    assert synthesis_client.capabilities_calls == 0
     assert len(synthesis_client.requests) == 1
     assert health_client.closed
     assert synthesis_client.closed
@@ -279,38 +531,32 @@ async def test_health_validation_failure_is_safely_mapped() -> None:
     assert caught.value.code == "invalid_response"
 
 
-async def test_synthesis_client_error_and_explicit_overrides() -> None:
+@pytest.mark.parametrize(
+    "code",
+    [
+        "runtime_generation_mismatch",
+        "voice_not_found",
+        "model_loading",
+        "model_not_loaded",
+        "voice_bank_invalid",
+    ],
+)
+async def test_synthesis_client_errors_preserve_stable_code(code: str) -> None:
     failing = FakeIrodoriClient()
-    failing.error = ClientError("timeout", code="timeout")
-    synthesizer = IrodoriSynthesizer(
-        cast("IrodoriClient", failing),
-        settings=MocoSettings(),
-    )
+    synthesizer = await prepare_synthesizer(failing)
+    failing.error = ClientError("bounded client message", code=code)
+
     with pytest.raises(IrodoriError) as caught:
         await synthesizer.synthesize("test")
-    assert caught.value.code == "timeout"
 
-    client = FakeIrodoriClient()
-    synthesizer = IrodoriSynthesizer(
-        cast("IrodoriClient", client),
-        settings=MocoSettings(),
-    )
-    await synthesizer.synthesize(
-        "test",
-        speaker="override",
-        num_steps=3,
-        duration_scale=1.1,
-        cfg_scale_text=2.2,
-        cfg_scale_speaker=4.4,
-    )
-    request = client.requests[0]
-    assert (
-        request.speaker,
-        request.num_steps,
-        request.duration_scale,
-        request.cfg_scale_text,
-        request.cfg_scale_speaker,
-    ) == ("override", 3, 1.1, 2.2, 4.4)
+    assert caught.value.code == code
+
+
+def test_legacy_speaker_selection_interfaces_are_removed() -> None:
+    legacy_selector = "select_" + "speaker"
+    legacy_override = "speak" + "er"
+    assert not hasattr(IrodoriSynthesizer, legacy_selector)
+    assert legacy_override not in IrodoriSynthesizer.synthesize.__annotations__
 
 
 class ChunkStream(httpx.AsyncByteStream):

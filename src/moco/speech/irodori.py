@@ -5,7 +5,12 @@ from typing import TYPE_CHECKING, Protocol, Self
 import httpx
 from irodori_tts_infra.client.async_ import AsyncIrodoriClient
 from irodori_tts_infra.client.errors import ClientError
-from irodori_tts_infra.contracts import HealthResponse, SynthesisRequest, SynthesisResult
+from irodori_tts_infra.contracts import (
+    CapabilitiesResponse,
+    HealthResponse,
+    SynthesisRequest,
+    SynthesisResult,
+)
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
@@ -14,10 +19,16 @@ if TYPE_CHECKING:
 
 _WAV_HEADER_SIZE = 12
 _JSON_ENVELOPE_BYTES = 4096
+_CAPABILITIES_NOT_LOADED = "capabilities_not_loaded"
+_VOICE_CATALOG_EMPTY = "voice_catalog_empty"
+_VOICE_NOT_FOUND = "voice_not_found"
+_VOICE_SELECTION_REQUIRED = "voice_selection_required"
 
 
 class IrodoriClient(Protocol):
     async def health(self) -> HealthResponse: ...
+
+    async def capabilities(self) -> CapabilitiesResponse: ...
 
     async def synthesize(self, request: SynthesisRequest) -> SynthesisResult: ...
 
@@ -123,7 +134,8 @@ class IrodoriSynthesizer:
         self._health_client = client
         self._synthesis_client = synthesis_client or client
         self._settings = settings
-        self._speaker = settings.irodori.speaker
+        self._capabilities: CapabilitiesResponse | None = None
+        self._voice_id: str | None = None
 
     @classmethod
     def from_settings(cls, settings: MocoSettings) -> Self:
@@ -158,27 +170,53 @@ class IrodoriSynthesizer:
         except (KeyError, TypeError, ValueError) as error:
             raise _invalid_response_error() from error
 
-    def select_speaker(self, speaker: str | None) -> None:
-        self._speaker = speaker
+    async def capabilities(self) -> CapabilitiesResponse:
+        try:
+            response = await self._health_client.capabilities()
+            capabilities = CapabilitiesResponse.model_validate(
+                response.model_dump(mode="python"),
+                strict=True,
+            )
+        except ClientError as error:
+            raise _map_client_error(error) from error
+        except (AttributeError, KeyError, TypeError, ValueError) as error:
+            raise _invalid_response_error() from error
+        self._capabilities = capabilities
+        return capabilities
 
-    async def synthesize(
-        self,
-        text: str,
-        *,
-        speaker: str | None = None,
-        num_steps: int | None = None,
-        duration_scale: float | None = None,
-        cfg_scale_text: float | None = None,
-        cfg_scale_speaker: float | None = None,
-    ) -> bytes:
+    def select_voice(self, selector: str) -> None:
+        capabilities = self._capabilities
+        if capabilities is None:
+            raise _state_error(_CAPABILITIES_NOT_LOADED)
+        if not capabilities.voices:
+            raise _state_error(_VOICE_CATALOG_EMPTY)
+        for voice in capabilities.voices:
+            if selector == voice.id or selector in voice.aliases:
+                self._voice_id = voice.id
+                return
+        raise _state_error(_VOICE_NOT_FOUND)
+
+    async def synthesize(self, text: str) -> bytes:
+        capabilities = self._capabilities
+        if capabilities is None:
+            raise _state_error(_CAPABILITIES_NOT_LOADED)
+        if not capabilities.ready:
+            raise _state_error(capabilities.readiness)
+        voice_id = self._voice_id
+        if voice_id is None:
+            raise _state_error(_VOICE_SELECTION_REQUIRED)
+        if not any(voice.id == voice_id for voice in capabilities.voices):
+            raise _state_error(_VOICE_NOT_FOUND)
+
         config = self._settings.irodori
         request = SynthesisRequest(
             text=text,
-            speaker=speaker if speaker is not None else self._speaker,
-            num_steps=num_steps or config.num_steps,
-            duration_scale=duration_scale or config.duration_scale,
-            cfg_scale_text=cfg_scale_text or config.cfg_scale_text,
-            cfg_scale_speaker=cfg_scale_speaker or config.cfg_scale_speaker,
+            voice_id=voice_id,
+            if_generation=capabilities.generation,
+            num_steps=config.num_steps,
+            duration_scale=config.duration_scale,
+            cfg_scale_text=config.cfg_scale_text,
+            cfg_scale_speaker=config.cfg_scale_speaker,
         )
         try:
             result = await self._synthesis_client.synthesize(request)
@@ -223,6 +261,10 @@ def _map_client_error(error: ClientError) -> IrodoriError:
 
 def _invalid_response_error() -> IrodoriError:
     return IrodoriError("Irodori server returned an invalid response", code="invalid_response")
+
+
+def _state_error(code: str) -> IrodoriError:
+    return IrodoriError("Irodori is not ready to synthesize", code=code)
 
 
 def _is_complete_wav(data: bytes) -> bool:
