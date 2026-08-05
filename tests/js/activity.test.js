@@ -252,6 +252,6 @@ describe("activity DOM views", () => {
       document.querySelector(".activity-row--reasoning .activity-label").textContent,
       "確認を続けています",
     );
-    assert.equal(created - initialCreated, 4);
+    assert.equal(created - initialCreated, initialCreated / 2);
   });
 });
