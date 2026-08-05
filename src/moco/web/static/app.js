@@ -18,7 +18,6 @@ const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
 const ERROR_COPY = Object.freeze({
   invalid_message: "受信した操作を解釈できませんでした",
   already_started: "Realtime 会話はすでに開始しています",
-  irodori_not_ready: "Irodori の音声モデルを利用できません",
   irodori_unavailable: "Irodori に接続できません",
   capability_mismatch: "Irodori の機能契約に互換性がありません",
   configured_voice_unavailable: "設定した音声モデルを利用できません",
@@ -58,7 +57,6 @@ const CONVERSATION_START_ERRORS = new Set([
   "configured_voice_unavailable",
   "conversation_start_failed",
   "irodori_unavailable",
-  "irodori_not_ready",
   "model_loading",
   "model_not_loaded",
   "runtime_generation_mismatch",

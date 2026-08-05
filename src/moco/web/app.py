@@ -300,7 +300,6 @@ class _BrowserConnection:
                 response.model_dump(mode="python"),
                 strict=True,
             )
-            _validate_capabilities(capabilities)
         except IrodoriError as error:
             if error.code == "invalid_response":
                 raise _CapabilityError(_CAPABILITY_MISMATCH) from error
@@ -885,26 +884,6 @@ def _display_text(text: str) -> str:
         character if character.isprintable() else " " for character in strip_control_emojis(text)
     )
     return " ".join(printable.split())
-
-
-def _validate_capabilities(capabilities: CapabilitiesResponse) -> None:
-    if capabilities.ready != (capabilities.readiness == "ready"):
-        msg = "Irodori capability readiness is inconsistent"
-        raise ValueError(msg)
-    voice_ids = [voice.id for voice in capabilities.voices]
-    if len(voice_ids) != len(set(voice_ids)):
-        msg = "Irodori capability voice IDs are not unique"
-        raise ValueError(msg)
-    if sum(voice.default for voice in capabilities.voices) > 1:
-        msg = "Irodori capability has multiple default voices"
-        raise ValueError(msg)
-    aliases: set[str] = set()
-    for voice in capabilities.voices:
-        for alias in voice.aliases:
-            if alias in aliases:
-                msg = "Irodori capability aliases are ambiguous"
-                raise ValueError(msg)
-            aliases.add(alias)
 
 
 def _resolve_voice_selection(
