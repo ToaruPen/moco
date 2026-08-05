@@ -38,6 +38,7 @@ jobs:
         run: |
           uv sync --frozen
           npm ci
+          npx playwright install --with-deps chromium webkit
       - name: Run complete quality gate
         run: just check
 
