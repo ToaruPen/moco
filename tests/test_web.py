@@ -27,7 +27,12 @@ from moco.codex.session import (
 )
 from moco.config import IrodoriSettings, MocoSettings, RuntimeSettings, ServerSettings
 from moco.runtime.hotkeys import Control
-from moco.speech.irodori import IrodoriError
+from moco.speech.irodori import (
+    _MAX_CAPABILITY_VOICES,
+    IrodoriClient,
+    IrodoriError,
+    IrodoriSynthesizer,
+)
 from moco.web import app as web_app
 from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import StartMessage
@@ -141,6 +146,18 @@ class FakeSynthesizer:
         self.selected_voices.append(voice_id)
 
     async def close(self) -> None:
+        self.closed = True
+
+
+class CapabilityBoundaryClient:
+    def __init__(self, capabilities: CapabilitiesResponse) -> None:
+        self.capabilities_response = capabilities
+        self.closed = False
+
+    async def capabilities(self) -> CapabilitiesResponse:
+        return self.capabilities_response
+
+    async def aclose(self) -> None:
         self.closed = True
 
 
@@ -357,6 +374,40 @@ def test_connection_projects_only_safe_runtime_voice_capabilities(
     assert f"voice_count={len(capabilities.voices)}" in capability_log
     assert capabilities.generation not in capability_log
     assert all(voice.id not in capability_log for voice in capabilities.voices)
+
+
+def test_oversized_runtime_catalog_is_rejected_before_browser_projection() -> None:
+    capabilities = make_capabilities(_MAX_CAPABILITY_VOICES + 1)
+    boundary_client = CapabilityBoundaryClient(capabilities)
+
+    def synthesizer_factory() -> WebSynthesizer:
+        synthesizer = IrodoriSynthesizer(
+            cast("IrodoriClient", boundary_client),
+            settings=MocoSettings(),
+        )
+        return cast("WebSynthesizer", synthesizer)
+
+    app = create_app(
+        synthesizer_factory=synthesizer_factory,
+        capability_token=CAPABILITY,
+    )
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        initial = socket.receive_json()
+        rejected = socket.receive_json()
+
+    assert initial["voice"]["readiness"] == "loading"
+    assert rejected["voice"] == {
+        "selected": None,
+        "options": [],
+        "ready": False,
+        "readiness": "capability_mismatch",
+    }
+    assert capabilities.voices[0].id not in repr(rejected)
+    assert capabilities.voices[-1].id not in repr(rejected)
+    assert boundary_client.closed
 
 
 @pytest.mark.parametrize(
@@ -870,6 +921,50 @@ def test_mid_conversation_generation_mismatch_is_reported_without_voice_fallback
     )
     assert "event_code=runtime_generation_mismatch" in mismatch_log
     assert capabilities.generation not in mismatch_log
+
+
+def test_mid_conversation_unknown_synthesis_error_is_bounded(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_code = "private_backend_detail"
+    private_message = "private backend host and token"
+    capabilities = make_capabilities(2)
+    caplog.set_level(logging.INFO)
+    session = FakeSession()
+    discovery = FakeSynthesizer(capabilities)
+    active = FakeSynthesizer(
+        capabilities,
+        synthesis_error=IrodoriError(private_message, code=private_code),
+    )
+    synthesizers = [discovery, active]
+    app = create_app(
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizers.pop(0)),
+        capability_token=CAPABILITY,
+    )
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        receive_ready_catalog(socket)
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        socket.receive_json()
+        socket.receive_json()
+        socket.receive_json()
+        portal = client.portal
+        assert portal is not None
+        portal.call(
+            session.emit,
+            TranscriptEvent("done", "thr_test", "assistant", "確認しました。"),
+        )
+        assert socket.receive_json()["type"] == "transcript"
+        while (message := socket.receive_json())["type"] != "error":
+            pass
+
+    assert message == {"type": "error", "code": "synthesis_failed"}
+    assert private_code not in caplog.text
+    assert private_message not in caplog.text
 
 
 @pytest.mark.asyncio

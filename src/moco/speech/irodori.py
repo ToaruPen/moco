@@ -19,10 +19,20 @@ if TYPE_CHECKING:
 
 _WAV_HEADER_SIZE = 12
 _JSON_ENVELOPE_BYTES = 4096
+_MAX_CAPABILITY_RESPONSE_BYTES = 256 * 1024
+_MAX_CAPABILITY_VOICES = 256
+_MAX_CAPABILITY_TEXT_CHARS = 256
+_MAX_CAPABILITY_ALIASES_PER_VOICE = 32
 _CAPABILITIES_NOT_LOADED = "capabilities_not_loaded"
 _VOICE_CATALOG_EMPTY = "voice_catalog_empty"
 _VOICE_NOT_FOUND = "voice_not_found"
 _VOICE_SELECTION_REQUIRED = "voice_selection_required"
+_READINESS_ERROR_CODES = frozenset(
+    {"model_loading", "model_not_loaded", "voice_bank_invalid"},
+)
+_SYNTHESIS_ERROR_CODES = _READINESS_ERROR_CODES | frozenset(
+    {"runtime_generation_mismatch", "voice_not_found"},
+)
 
 
 class IrodoriClient(Protocol):
@@ -148,7 +158,7 @@ class IrodoriSynthesizer:
                 timeout=settings.irodori.timeout_seconds,
                 transport=_build_transport(
                     settings,
-                    max_bytes=max_response_bytes,
+                    max_bytes=_MAX_CAPABILITY_RESPONSE_BYTES,
                 ),
             ),
             settings=settings,
@@ -164,11 +174,14 @@ class IrodoriSynthesizer:
 
     async def health(self) -> HealthResponse:
         try:
-            return await self._health_client.health()
+            response = await self._health_client.health()
         except ClientError as error:
-            raise _map_client_error(error) from error
-        except (KeyError, TypeError, ValueError) as error:
-            raise _invalid_response_error() from error
+            mapped_error = _availability_error(error)
+        except (KeyError, TypeError, ValueError):
+            mapped_error = _invalid_response_error()
+        else:
+            return response
+        raise mapped_error
 
     async def capabilities(self) -> CapabilitiesResponse:
         try:
@@ -177,12 +190,15 @@ class IrodoriSynthesizer:
                 response.model_dump(mode="python"),
                 strict=True,
             )
+            _validate_capability_bounds(capabilities)
         except ClientError as error:
-            raise _map_client_error(error) from error
-        except (AttributeError, KeyError, TypeError, ValueError) as error:
-            raise _invalid_response_error() from error
-        self._capabilities = capabilities
-        return capabilities
+            mapped_error = _availability_error(error)
+        except (AttributeError, KeyError, TypeError, ValueError):
+            mapped_error = _invalid_response_error()
+        else:
+            self._capabilities = capabilities
+            return capabilities
+        raise mapped_error
 
     def select_voice(self, selector: str) -> None:
         capabilities = self._capabilities
@@ -221,17 +237,19 @@ class IrodoriSynthesizer:
         try:
             result = await self._synthesis_client.synthesize(request)
         except ClientError as error:
-            raise _map_client_error(error) from error
-        except (KeyError, TypeError, ValueError) as error:
-            raise _invalid_response_error() from error
-        wav = result.wav_bytes
-        if len(wav) > config.max_wav_bytes:
-            msg = "Irodori WAV exceeded the configured size limit"
-            raise IrodoriError(msg, code="audio_too_large")
-        if not _is_complete_wav(wav):
-            msg = "Irodori server did not return a valid WAV file"
-            raise IrodoriError(msg, code="invalid_audio")
-        return wav
+            mapped_error = _synthesis_error(error)
+        except (KeyError, TypeError, ValueError):
+            mapped_error = _invalid_response_error()
+        else:
+            wav = result.wav_bytes
+            if len(wav) > config.max_wav_bytes:
+                msg = "Irodori WAV exceeded the configured size limit"
+                raise IrodoriError(msg, code="audio_too_large")
+            if not _is_complete_wav(wav):
+                msg = "Irodori server did not return a valid WAV file"
+                raise IrodoriError(msg, code="invalid_audio")
+            return wav
+        raise mapped_error
 
     async def close(self) -> None:
         try:
@@ -255,8 +273,14 @@ def _build_transport(
     return _LimitedResponseTransport(transport, max_bytes=max_bytes)
 
 
-def _map_client_error(error: ClientError) -> IrodoriError:
-    return IrodoriError(error.message, code=error.code)
+def _availability_error(error: ClientError) -> IrodoriError:
+    code = error.code if error.code in _READINESS_ERROR_CODES else "irodori_unavailable"
+    return IrodoriError("Irodori capability endpoint is unavailable", code=code)
+
+
+def _synthesis_error(error: ClientError) -> IrodoriError:
+    code = error.code if error.code in _SYNTHESIS_ERROR_CODES else "synthesis_failed"
+    return IrodoriError("Irodori synthesis request failed", code=code)
 
 
 def _invalid_response_error() -> IrodoriError:
@@ -265,6 +289,28 @@ def _invalid_response_error() -> IrodoriError:
 
 def _state_error(code: str) -> IrodoriError:
     return IrodoriError("Irodori is not ready to synthesize", code=code)
+
+
+def _validate_capability_bounds(capabilities: CapabilitiesResponse) -> None:
+    if len(capabilities.generation) > _MAX_CAPABILITY_TEXT_CHARS:
+        msg = "Irodori capability generation exceeded the size limit"
+        raise ValueError(msg)
+    if len(capabilities.voices) > _MAX_CAPABILITY_VOICES:
+        msg = "Irodori capability voice catalog exceeded the size limit"
+        raise ValueError(msg)
+    for voice in capabilities.voices:
+        if len(voice.id) > _MAX_CAPABILITY_TEXT_CHARS:
+            msg = "Irodori capability voice ID exceeded the size limit"
+            raise ValueError(msg)
+        if len(voice.label) > _MAX_CAPABILITY_TEXT_CHARS:
+            msg = "Irodori capability voice label exceeded the size limit"
+            raise ValueError(msg)
+        if len(voice.aliases) > _MAX_CAPABILITY_ALIASES_PER_VOICE:
+            msg = "Irodori capability voice aliases exceeded the count limit"
+            raise ValueError(msg)
+        if any(len(alias) > _MAX_CAPABILITY_TEXT_CHARS for alias in voice.aliases):
+            msg = "Irodori capability voice alias exceeded the size limit"
+            raise ValueError(msg)
 
 
 def _is_complete_wav(data: bytes) -> bool:

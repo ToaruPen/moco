@@ -17,6 +17,21 @@ type TranscriptRole = Literal["assistant", "user"]
 type Delivery = Callable[[bytes], object | Awaitable[object]]
 type ErrorReporter = Callable[[str], object | Awaitable[object]]
 logger = logging.getLogger(__name__)
+_PUBLIC_IRODORI_ERROR_CODES = frozenset(
+    {
+        "runtime_generation_mismatch",
+        "voice_not_found",
+        "voice_catalog_empty",
+        "voice_selection_required",
+        "model_loading",
+        "model_not_loaded",
+        "voice_bank_invalid",
+        "invalid_response",
+        "audio_too_large",
+        "invalid_audio",
+        "synthesis_failed",
+    },
+)
 
 
 class Synthesizer(Protocol):
@@ -175,16 +190,17 @@ class SpeechQueue:
         except asyncio.CancelledError:
             raise
         except IrodoriError as error:
-            self._error_codes.append(error.code)
+            code = error.code if error.code in _PUBLIC_IRODORI_ERROR_CODES else "synthesis_failed"
+            self._error_codes.append(code)
             safe_event(
                 logger,
                 "synthesis_failed",
                 component="speech",
                 boundary="irodori_http",
-                event_code=error.code,
+                event_code=code,
                 result="error",
             )
-            await self._report_error(error.code)
+            await self._report_error(code)
             return
         except Exception:  # noqa: BLE001
             code = "synthesis_failed"

@@ -17,6 +17,11 @@ from irodori_tts_infra.contracts import (
 
 from moco.config import IrodoriSettings, MocoSettings
 from moco.speech.irodori import (
+    _JSON_ENVELOPE_BYTES,
+    _MAX_CAPABILITY_ALIASES_PER_VOICE,
+    _MAX_CAPABILITY_RESPONSE_BYTES,
+    _MAX_CAPABILITY_TEXT_CHARS,
+    _MAX_CAPABILITY_VOICES,
     IrodoriClient,
     IrodoriError,
     IrodoriSynthesizer,
@@ -53,6 +58,28 @@ def make_capabilities(
         ready=ready,
         readiness=readiness or ("ready" if ready else "model_loading"),
         voices=voices,
+    )
+
+
+def make_capabilities_with_voice(
+    *,
+    generation: str = "fixture-generation",
+    voice_id: str = "fixture-id",
+    label: str = "Fixture label",
+    aliases: tuple[str, ...] = ("fixture-alias",),
+) -> CapabilitiesResponse:
+    return CapabilitiesResponse(
+        generation=generation,
+        ready=True,
+        readiness="ready",
+        voices=(
+            VoiceCapability(
+                id=voice_id,
+                label=label,
+                aliases=aliases,
+                default=True,
+            ),
+        ),
     )
 
 
@@ -263,18 +290,28 @@ async def test_synthesis_rejects_selected_voice_removed_by_capability_refresh() 
     assert caught.value.code == "voice_not_found"
 
 
-async def test_maps_client_errors_to_stable_codes() -> None:
+@pytest.mark.parametrize("operation", ["health", "capabilities"])
+@pytest.mark.parametrize("code", ["connection_error", "private_backend_detail", "x" * 4096])
+async def test_health_and_capabilities_bound_unknown_client_errors(
+    operation: str,
+    code: str,
+) -> None:
     client = FakeIrodoriClient()
-    client.error = ClientError("offline", code="connection_error")
+    private_message = "private backend host and token"
+    client.error = ClientError(private_message, code=code)
     synthesizer = IrodoriSynthesizer(
         cast("IrodoriClient", client),
         settings=MocoSettings(),
     )
 
-    with pytest.raises(IrodoriError, match="offline") as caught:
-        await synthesizer.health()
+    with pytest.raises(IrodoriError) as caught:
+        await getattr(synthesizer, operation)()
 
-    assert caught.value.code == "connection_error"
+    assert caught.value.code == "irodori_unavailable"
+    assert code not in str(caught.value)
+    assert private_message not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 async def test_capabilities_preserves_client_error_code() -> None:
@@ -289,6 +326,32 @@ async def test_capabilities_preserves_client_error_code() -> None:
         await synthesizer.capabilities()
 
     assert caught.value.code == "model_not_loaded"
+    assert "runtime unavailable" not in str(caught.value)
+
+
+@pytest.mark.parametrize("operation", ["health", "capabilities"])
+@pytest.mark.parametrize(
+    "code",
+    ["model_loading", "model_not_loaded", "voice_bank_invalid"],
+)
+async def test_health_and_capabilities_preserve_documented_readiness(
+    operation: str,
+    code: str,
+) -> None:
+    client = FakeIrodoriClient()
+    client.error = ClientError("private readiness message", code=code)
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await getattr(synthesizer, operation)()
+
+    assert caught.value.code == code
+    assert "private readiness message" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 @pytest.mark.parametrize(
@@ -387,6 +450,90 @@ async def test_capabilities_rejects_forged_same_type_instance() -> None:
         await synthesizer.capabilities()
 
     assert caught.value.code == "invalid_response"
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        make_capabilities_with_voice(generation="g" * _MAX_CAPABILITY_TEXT_CHARS),
+        make_capabilities(_MAX_CAPABILITY_VOICES),
+        make_capabilities_with_voice(voice_id="i" * _MAX_CAPABILITY_TEXT_CHARS),
+        make_capabilities_with_voice(label="l" * _MAX_CAPABILITY_TEXT_CHARS),
+        make_capabilities_with_voice(aliases=("a" * _MAX_CAPABILITY_TEXT_CHARS,)),
+        make_capabilities_with_voice(
+            aliases=tuple(f"alias-{index}" for index in range(_MAX_CAPABILITY_ALIASES_PER_VOICE)),
+        ),
+    ],
+    ids=[
+        "generation",
+        "voices",
+        "voice-id",
+        "voice-label",
+        "alias-text",
+        "aliases-per-voice",
+    ],
+)
+async def test_capability_structural_limits_accept_boundary_values(
+    capabilities: CapabilitiesResponse,
+) -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = capabilities
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    assert await synthesizer.capabilities() == capabilities
+
+
+@pytest.mark.parametrize(
+    "capabilities",
+    [
+        make_capabilities_with_voice(
+            generation="g" * (_MAX_CAPABILITY_TEXT_CHARS + 1),
+        ),
+        make_capabilities(_MAX_CAPABILITY_VOICES + 1),
+        make_capabilities_with_voice(
+            voice_id="i" * (_MAX_CAPABILITY_TEXT_CHARS + 1),
+        ),
+        make_capabilities_with_voice(
+            label="l" * (_MAX_CAPABILITY_TEXT_CHARS + 1),
+        ),
+        make_capabilities_with_voice(
+            aliases=("a" * (_MAX_CAPABILITY_TEXT_CHARS + 1),),
+        ),
+        make_capabilities_with_voice(
+            aliases=tuple(
+                f"alias-{index}" for index in range(_MAX_CAPABILITY_ALIASES_PER_VOICE + 1)
+            ),
+        ),
+    ],
+    ids=[
+        "generation",
+        "voices",
+        "voice-id",
+        "voice-label",
+        "alias-text",
+        "aliases-per-voice",
+    ],
+)
+async def test_capability_structural_limits_reject_over_limit_before_cache(
+    capabilities: CapabilitiesResponse,
+) -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = capabilities
+    synthesizer = IrodoriSynthesizer(
+        cast("IrodoriClient", client),
+        settings=MocoSettings(),
+    )
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.capabilities()
+
+    assert caught.value.code == "invalid_response"
+    with pytest.raises(IrodoriError) as uncached:
+        synthesizer.select_voice(capabilities.voices[0].id)
+    assert uncached.value.code == "capabilities_not_loaded"
 
 
 async def test_transport_rejects_declared_response_over_limit() -> None:
@@ -489,10 +636,13 @@ async def test_synthesis_client_closes_when_health_client_close_fails() -> None:
     assert synthesis_client.closed
 
 
-async def test_from_settings_disables_only_synthesis_timeout(
+@pytest.mark.parametrize("max_wav_bytes", [1_024, 134_217_728])
+async def test_from_settings_separates_capability_and_synthesis_resource_bounds(
     monkeypatch: pytest.MonkeyPatch,
+    max_wav_bytes: int,
 ) -> None:
     timeouts: list[float | None] = []
+    response_limits: list[int] = []
 
     class RecordingClient(FakeIrodoriClient):
         def __init__(
@@ -503,18 +653,29 @@ async def test_from_settings_disables_only_synthesis_timeout(
             transport: httpx.AsyncBaseTransport | None = None,
         ) -> None:
             super().__init__()
-            del base_url, transport
+            del base_url
             assert timeout is None or isinstance(timeout, float)
+            assert isinstance(transport, _LimitedResponseTransport)
             timeouts.append(timeout)
+            response_limits.append(transport._max_bytes)  # noqa: SLF001
 
     monkeypatch.setattr("moco.speech.irodori.AsyncIrodoriClient", RecordingClient)
 
     synthesizer = IrodoriSynthesizer.from_settings(
-        MocoSettings(irodori=IrodoriSettings(timeout_seconds=7.5)),
+        MocoSettings(
+            irodori=IrodoriSettings(
+                timeout_seconds=7.5,
+                max_wav_bytes=max_wav_bytes,
+            ),
+        ),
     )
     await synthesizer.close()
 
     assert timeouts == [7.5, None]
+    assert response_limits == [
+        _MAX_CAPABILITY_RESPONSE_BYTES,
+        ((max_wav_bytes + 2) // 3) * 4 + _JSON_ENVELOPE_BYTES,
+    ]
 
 
 async def test_health_validation_failure_is_safely_mapped() -> None:
@@ -544,12 +705,32 @@ async def test_health_validation_failure_is_safely_mapped() -> None:
 async def test_synthesis_client_errors_preserve_stable_code(code: str) -> None:
     failing = FakeIrodoriClient()
     synthesizer = await prepare_synthesizer(failing)
-    failing.error = ClientError("bounded client message", code=code)
+    failing.error = ClientError("private synthesis message", code=code)
 
     with pytest.raises(IrodoriError) as caught:
         await synthesizer.synthesize("test")
 
     assert caught.value.code == code
+    assert "private synthesis message" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+
+@pytest.mark.parametrize("code", ["private_backend_detail", "x" * 4096])
+async def test_synthesis_bounds_unknown_client_error(code: str) -> None:
+    failing = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(failing)
+    private_message = "private synthesis host and token"
+    failing.error = ClientError(private_message, code=code)
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("test")
+
+    assert caught.value.code == "synthesis_failed"
+    assert code not in str(caught.value)
+    assert private_message not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
 
 
 def test_legacy_speaker_selection_interfaces_are_removed() -> None:

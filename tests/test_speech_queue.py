@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from contextlib import suppress
+
+import pytest
 
 from moco.speech.irodori import IrodoriError
 from moco.speech.queue import SpeechQueue
@@ -110,6 +113,72 @@ async def test_contract_error_is_reported_to_the_owner() -> None:
     await queue.join()
 
     assert reported == ["invalid_response"]
+    await queue.close()
+
+
+@pytest.mark.parametrize(
+    "code",
+    [
+        "runtime_generation_mismatch",
+        "voice_not_found",
+        "model_loading",
+        "model_not_loaded",
+        "voice_bank_invalid",
+    ],
+)
+async def test_known_irodori_error_is_preserved_for_the_owner(code: str) -> None:
+    private_message = "private adapter message"
+
+    class FailingSynthesizer(FakeSynthesizer):
+        async def synthesize(self, text: str) -> bytes:
+            self.calls.append(text)
+            raise IrodoriError(private_message, code=code)
+
+    reported: list[str] = []
+    queue = SpeechQueue(
+        FailingSynthesizer(),
+        deliver=lambda _wav: None,
+        max_chars=80,
+        on_error=reported.append,
+    )
+    queue.start()
+
+    await queue.on_transcript(role="assistant", delta="失敗。", done=True)
+    await queue.join()
+
+    assert queue.error_codes == (code,)
+    assert reported == [code]
+    await queue.close()
+
+
+async def test_forged_irodori_error_is_bounded_before_reporting(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_code = "private_backend_detail"
+    private_message = "private backend host and token"
+
+    class ForgedSynthesizer(FakeSynthesizer):
+        async def synthesize(self, text: str) -> bytes:
+            self.calls.append(text)
+            raise IrodoriError(private_message, code=private_code)
+
+    caplog.set_level(logging.INFO, logger="moco.speech.queue")
+    reported: list[str] = []
+    queue = SpeechQueue(
+        ForgedSynthesizer(),
+        deliver=lambda _wav: None,
+        max_chars=80,
+        on_error=reported.append,
+    )
+    queue.start()
+
+    await queue.on_transcript(role="assistant", delta="失敗。", done=True)
+    await queue.join()
+
+    assert queue.error_codes == ("synthesis_failed",)
+    assert reported == ["synthesis_failed"]
+    assert private_code not in caplog.text
+    assert private_message not in caplog.text
     await queue.close()
 
 
