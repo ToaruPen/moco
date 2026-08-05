@@ -3,7 +3,7 @@ from __future__ import annotations
 import ipaddress
 import os
 from pathlib import Path
-from typing import Annotated, Self
+from typing import Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 import yaml
@@ -155,7 +155,7 @@ class IrodoriSettings(StrictSettings):
     base_url: HttpUrl = HttpUrl("http://127.0.0.1:8923")
     connect_ip: IPvAnyAddress | None = None
     speaker: str | None = None
-    speakers: tuple[str, ...] = ()
+    caption_mode: Literal["off"] = "off"
     num_steps: PositiveInt = 24
     duration_scale: PositiveFloat = 1.0
     cfg_scale_text: PositiveFloat = 3.0
@@ -174,26 +174,6 @@ class IrodoriSettings(StrictSettings):
         if value is None:
             return None
         return value.strip() or None
-
-    @field_validator("speakers")
-    @classmethod
-    def _normalize_speakers(cls, value: tuple[str, ...]) -> tuple[str, ...]:
-        normalized: list[str] = []
-        for speaker in value:
-            name = speaker.strip()
-            if not name:
-                msg = "speaker options must not be blank"
-                raise ValueError(msg)
-            if name not in normalized:
-                normalized.append(name)
-        return tuple(normalized)
-
-    @property
-    def available_speakers(self) -> tuple[str, ...]:
-        speakers = list(self.speakers)
-        if self.speaker is not None:
-            speakers.insert(0, self.speaker)
-        return tuple(dict.fromkeys(speakers))
 
     @model_validator(mode="after")
     def _require_secure_address_override(self) -> Self:

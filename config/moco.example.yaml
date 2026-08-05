@@ -25,10 +25,10 @@ irodori:
   # Optional direct tailnet address when the OS cannot resolve MagicDNS.
   # HTTPS still verifies the base_url hostname through SNI.
   connect_ip: null
-  # Portable speaker name; null uses the Irodori server default.
+  # Preferred voice ID from the runtime catalog; null uses the catalog default.
   speaker: null
-  # Speaker models shown in the browser selector.
-  speakers: []
+  # Captions remain disabled during the initial v4 migration.
+  caption_mode: "off"
   num_steps: 24
   duration_scale: 1.0
   cfg_scale_text: 3.0

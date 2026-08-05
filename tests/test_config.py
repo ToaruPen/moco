@@ -39,6 +39,14 @@ def test_load_config_applies_yaml_values(tmp_path: Path) -> None:
     assert str(settings.irodori.base_url) == "http://100.64.0.1:8923/"
 
 
+def test_example_config_loads() -> None:
+    path = Path(__file__).parents[1] / "config" / "moco.example.yaml"
+
+    settings = load_config(path)
+
+    assert settings.irodori.caption_mode == "off"
+
+
 def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
     path.write_text("runtime:\n  mystery: true\n", encoding="utf-8")
@@ -133,14 +141,46 @@ def test_irodori_url_must_not_contain_credentials(tmp_path: Path) -> None:
     assert sensitive_value not in str(caught.value)
 
 
-def test_irodori_speaker_options_are_normalized_and_deduplicated() -> None:
-    settings = IrodoriSettings(
-        speaker=" main ",
-        speakers=("main", " alt ", "alt"),
+@pytest.mark.parametrize(
+    ("configured", "expected"),
+    [(" preferred-id ", "preferred-id"), ("   ", None), (None, None)],
+)
+def test_irodori_speaker_is_normalized(
+    configured: str | None,
+    expected: str | None,
+) -> None:
+    settings = IrodoriSettings(speaker=configured)
+
+    assert settings.speaker == expected
+
+
+def test_irodori_caption_mode_defaults_to_off() -> None:
+    assert IrodoriSettings().caption_mode == "off"
+
+
+def test_irodori_caption_mode_rejects_non_off(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("irodori:\n  caption_mode: auto\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"irodori\.caption_mode"):
+        load_config(path)
+
+
+def test_irodori_static_speakers_key_is_rejected(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(
+        "irodori:\n  speakers:\n    - fixture-id\n",
+        encoding="utf-8",
     )
 
-    assert settings.speaker == "main"
-    assert settings.available_speakers == ("main", "alt")
+    with pytest.raises(ConfigError, match=r"irodori\.speakers"):
+        load_config(path)
+
+
+def test_irodori_static_speaker_property_is_removed() -> None:
+    legacy_property = "available_" + "speakers"
+
+    assert not hasattr(IrodoriSettings(), legacy_property)
 
 
 def test_irodori_connect_ip_must_be_an_ip_address(tmp_path: Path) -> None:
