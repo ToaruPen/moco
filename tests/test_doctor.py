@@ -5,10 +5,10 @@ from pathlib import Path
 from typing import cast
 
 import pytest
-from irodori_tts_infra.contracts import HealthResponse
+from irodori_tts_infra.contracts import CapabilitiesResponse, Readiness, VoiceCapability
 
 from moco.codex.rpc import JsonValue
-from moco.config import CodexSettings, MocoSettings
+from moco.config import CodexSettings, IrodoriSettings, MocoSettings
 from moco.doctor import (
     DoctorCheck,
     DoctorRpcClient,
@@ -16,6 +16,31 @@ from moco.doctor import (
     _default_hotkey_probe,
     run_doctor,
 )
+from moco.speech.irodori import IrodoriError
+
+
+def make_capabilities(
+    count: int,
+    *,
+    default_index: int | None = 0,
+    generation: str = "fixture-generation-0",
+    ready: bool = True,
+    readiness: Readiness | None = None,
+) -> CapabilitiesResponse:
+    return CapabilitiesResponse(
+        generation=generation,
+        ready=ready,
+        readiness=readiness or ("ready" if ready else "model_loading"),
+        voices=tuple(
+            VoiceCapability(
+                id=f"fixture-id-{index}",
+                label=f"Fixture label {index}",
+                aliases=(f"fixture-alias-{index}",),
+                default=index == default_index,
+            )
+            for index in range(count)
+        ),
+    )
 
 
 class FakeRpc:
@@ -68,17 +93,43 @@ class FakeRpc:
 
 
 class FakeSynthesizer:
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        capabilities: object | None = None,
+        *,
+        capability_error: Exception | None = None,
+        selection_error: IrodoriError | None = None,
+        synthesis_error: IrodoriError | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
         self.closed = False
+        self.capabilities_response = capabilities or make_capabilities(3)
+        self.capability_error = capability_error
+        self.selection_error = selection_error
+        self.synthesis_error = synthesis_error
+        self.close_error = close_error
+        self.selected_voice_ids: list[str] = []
+        self.synthesized_texts: list[str] = []
 
-    async def health(self) -> HealthResponse:
-        return HealthResponse(model_loaded=True)
+    async def capabilities(self) -> CapabilitiesResponse:
+        if self.capability_error is not None:
+            raise self.capability_error
+        return cast("CapabilitiesResponse", self.capabilities_response)
+
+    def select_voice(self, voice_id: str) -> None:
+        if self.selection_error is not None:
+            raise self.selection_error
+        self.selected_voice_ids.append(voice_id)
 
     async def synthesize(self, text: str) -> bytes:
-        del text
+        self.synthesized_texts.append(text)
+        if self.synthesis_error is not None:
+            raise self.synthesis_error
         return b"RIFF\x04\x00\x00\x00WAVE"
 
     async def close(self) -> None:
+        if self.close_error is not None:
+            raise self.close_error
         self.closed = True
 
 
@@ -100,7 +151,8 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
         codex=CodexSettings(binary=binary, working_directory=tmp_path),
     )
     rpc = FakeRpc()
-    synthesizer = FakeSynthesizer()
+    capabilities = make_capabilities(3)
+    synthesizer = FakeSynthesizer(capabilities)
 
     checks = await run_doctor(
         settings,
@@ -124,7 +176,7 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
         "codex_account",
         "codex_features",
         "codex_voices",
-        "irodori_health",
+        "irodori_capabilities",
         "irodori_route",
         "irodori_synthesis",
         "hotkeys",
@@ -133,6 +185,13 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
     assert "private@example.com" not in rendered
     assert "private-token" not in rendered
     assert str(settings.irodori.base_url) not in rendered
+    assert capabilities.generation not in rendered
+    assert "voice_count" not in rendered
+    assert all(voice.id not in rendered for voice in capabilities.voices)
+    assert all(voice.label not in rendered for voice in capabilities.voices)
+    assert all(alias not in rendered for voice in capabilities.voices for alias in voice.aliases)
+    assert synthesizer.selected_voice_ids == [capabilities.voices[0].id]
+    assert synthesizer.synthesized_texts == ["接続確認"]
     assert rpc.closed
     assert synthesizer.closed
 
@@ -413,69 +472,125 @@ async def test_doctor_maps_partial_codex_failures(
     )
 
 
-class FailingSynthesizer(FakeSynthesizer):
-    def __init__(
-        self,
-        *,
-        model_loaded: bool = True,
-        health_fails: bool = False,
-        synthesis_fails: bool = False,
-        close_fails: bool = False,
-    ) -> None:
-        super().__init__()
-        self.model_loaded = model_loaded
-        self.health_fails = health_fails
-        self.synthesis_fails = synthesis_fails
-        self.close_fails = close_fails
-
-    async def health(self) -> HealthResponse:
-        if self.health_fails:
-            raise PrivateFailureError
-        return HealthResponse(model_loaded=self.model_loaded)
-
-    async def synthesize(self, text: str) -> bytes:
-        if self.synthesis_fails:
-            raise PrivateFailureError
-        return await super().synthesize(text)
-
-    async def close(self) -> None:
-        if self.close_fails:
-            raise PrivateFailureError
-        await super().close()
-
-
 @pytest.mark.parametrize(
-    ("synthesizer", "synthesize", "expected"),
+    ("capabilities", "settings", "expected_detail"),
     [
         (
-            FailingSynthesizer(model_loaded=False),
-            None,
-            {"irodori_health": ("error", "model_unavailable")},
+            make_capabilities(0),
+            MocoSettings(),
+            "catalog_empty",
         ),
         (
-            FailingSynthesizer(health_fails=True),
-            "test",
-            {
-                "irodori_health": ("error", "probe_failed"),
-                "irodori_synthesis": ("error", "probe_failed"),
-            },
+            make_capabilities(2),
+            MocoSettings(irodori=IrodoriSettings(speaker="private-missing-voice")),
+            "configured_voice_unavailable",
         ),
         (
-            FailingSynthesizer(synthesis_fails=True),
-            "test",
-            {
-                "irodori_health": ("ok", "model_loaded"),
-                "irodori_synthesis": ("error", "probe_failed"),
-            },
+            make_capabilities(2, default_index=None),
+            MocoSettings(),
+            "voice_selection_required",
+        ),
+        (
+            make_capabilities(2, ready=False, readiness="model_loading"),
+            MocoSettings(),
+            "model_loading",
+        ),
+        (
+            make_capabilities(2, ready=False, readiness="model_not_loaded"),
+            MocoSettings(),
+            "model_not_loaded",
+        ),
+        (
+            make_capabilities(2, ready=False, readiness="voice_bank_invalid"),
+            MocoSettings(),
+            "voice_bank_invalid",
+        ),
+        (
+            make_capabilities(2).model_copy(update={"contract_version": 2}),
+            MocoSettings(),
+            "capability_mismatch",
         ),
     ],
 )
-async def test_doctor_maps_irodori_failures(
+async def test_doctor_fails_closed_for_unusable_irodori_capabilities(
     tmp_path: Path,
-    synthesizer: FailingSynthesizer,
-    synthesize: str | None,
-    expected: dict[str, tuple[str, str]],
+    capabilities: object,
+    settings: MocoSettings,
+    expected_detail: str,
 ) -> None:
+    synthesizer = FakeSynthesizer(capabilities)
+    checks = await run_doctor(
+        settings.model_copy(
+            update={
+                "codex": CodexSettings(
+                    binary=tmp_path / "missing",
+                    working_directory=tmp_path,
+                ),
+            },
+        ),
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            synthesizer,
+        ),
+        hotkey_probe=lambda: True,
+        synthesize="test",
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["irodori_capabilities"] == DoctorCheck(
+        "irodori_capabilities",
+        "error",
+        expected_detail,
+    )
+    assert by_code["irodori_synthesis"] == DoctorCheck(
+        "irodori_synthesis",
+        "error",
+        expected_detail,
+    )
+    assert synthesizer.selected_voice_ids == []
+    assert synthesizer.synthesized_texts == []
+    assert synthesizer.closed
+
+
+@pytest.mark.parametrize("selector_kind", ["canonical", "alias", "default"])
+async def test_doctor_selects_a_canonical_voice_only_after_ready_validation(
+    tmp_path: Path,
+    selector_kind: str,
+) -> None:
+    capabilities = make_capabilities(3, default_index=2)
+    selected = capabilities.voices[2 if selector_kind == "default" else 1]
+    selector = {
+        "canonical": selected.id,
+        "alias": selected.aliases[0],
+        "default": None,
+    }[selector_kind]
+    synthesizer = FakeSynthesizer(capabilities)
+
+    checks = await run_doctor(
+        MocoSettings(
+            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+            irodori=IrodoriSettings(speaker=selector),
+        ),
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            synthesizer,
+        ),
+        hotkey_probe=lambda: True,
+        synthesize="test",
+    )
+
+    assert DoctorCheck("irodori_capabilities", "ok", "ready") in checks
+    assert synthesizer.selected_voice_ids == [selected.id]
+    assert synthesizer.synthesized_texts == ["test"]
+    assert synthesizer.closed
+
+
+async def test_doctor_maps_network_failure_without_rendering_private_detail(
+    tmp_path: Path,
+) -> None:
+    private_message = "https://private-host.example.test/private-token"
+    synthesizer = FakeSynthesizer(capability_error=OSError(private_message))
+
     checks = await run_doctor(
         MocoSettings(
             codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
@@ -485,11 +600,103 @@ async def test_doctor_maps_irodori_failures(
             synthesizer,
         ),
         hotkey_probe=lambda: True,
-        synthesize=synthesize,
+        synthesize="test",
+    )
+    by_code = {check.code: check for check in checks}
+    rendered = repr(checks)
+
+    assert by_code["irodori_capabilities"].detail == "irodori_unavailable"
+    assert by_code["irodori_synthesis"].detail == "irodori_unavailable"
+    assert private_message not in rendered
+    assert synthesizer.closed
+
+
+@pytest.mark.parametrize(
+    ("failure_stage", "error_code"),
+    [
+        ("selection", "voice_not_found"),
+        ("synthesis", "runtime_generation_mismatch"),
+        ("synthesis", "model_loading"),
+        ("synthesis", "model_not_loaded"),
+        ("synthesis", "voice_bank_invalid"),
+        ("synthesis", "audio_too_large"),
+        ("synthesis", "invalid_audio"),
+    ],
+)
+async def test_doctor_preserves_known_synthesis_detail_without_fallback(
+    tmp_path: Path,
+    failure_stage: str,
+    error_code: str,
+) -> None:
+    capabilities = make_capabilities(2)
+    error = IrodoriError("private boundary message", code=error_code)
+    synthesizer = FakeSynthesizer(
+        capabilities,
+        selection_error=error if failure_stage == "selection" else None,
+        synthesis_error=error if failure_stage == "synthesis" else None,
+    )
+
+    checks = await run_doctor(
+        MocoSettings(
+            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+        ),
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            synthesizer,
+        ),
+        hotkey_probe=lambda: True,
+        synthesize="test",
     )
     by_code = {check.code: check for check in checks}
 
-    assert {code: (by_code[code].status, by_code[code].detail) for code in expected} == expected
+    assert by_code["irodori_capabilities"] == DoctorCheck(
+        "irodori_capabilities",
+        "ok",
+        "ready",
+    )
+    assert by_code["irodori_synthesis"] == DoctorCheck(
+        "irodori_synthesis",
+        "error",
+        error_code,
+    )
+    assert synthesizer.selected_voice_ids == (
+        [] if failure_stage == "selection" else [capabilities.voices[0].id]
+    )
+    assert synthesizer.synthesized_texts == ([] if failure_stage == "selection" else ["test"])
+    assert "private boundary message" not in repr(checks)
+    assert synthesizer.closed
+
+
+async def test_doctor_bounds_unknown_synthesis_error_code(
+    tmp_path: Path,
+) -> None:
+    private_code = "private-token-in-code"
+    synthesizer = FakeSynthesizer(
+        synthesis_error=IrodoriError("private message", code=private_code),
+    )
+
+    checks = await run_doctor(
+        MocoSettings(
+            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+        ),
+        synthesizer_factory=lambda _settings: cast(
+            "DoctorSynthesizer",
+            synthesizer,
+        ),
+        hotkey_probe=lambda: True,
+        synthesize="test",
+    )
+    by_code = {check.code: check for check in checks}
+    rendered = repr(checks)
+
+    assert by_code["irodori_synthesis"] == DoctorCheck(
+        "irodori_synthesis",
+        "error",
+        "probe_failed",
+    )
+    assert private_code not in rendered
+    assert "private message" not in rendered
+    assert synthesizer.closed
 
 
 async def test_doctor_contains_probe_and_cleanup_failures(
@@ -499,7 +706,7 @@ async def test_doctor_contains_probe_and_cleanup_failures(
     binary = tmp_path / "codex"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
     binary.chmod(0o700)
-    synthesizer = FailingSynthesizer(close_fails=True)
+    synthesizer = FakeSynthesizer(close_error=PrivateFailureError())
 
     checks = await run_doctor(
         MocoSettings(
