@@ -6,7 +6,8 @@ from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
-from moco.errors import CodexRpcError, CodexRpcTimeoutError
+from moco.config import default_prompt_path
+from moco.errors import CodexPromptError, CodexRpcError, CodexRpcTimeoutError
 from moco.runtime.telemetry import safe_event
 
 if TYPE_CHECKING:
@@ -20,6 +21,7 @@ DEFAULT_REALTIME_PROMPT = (
     "Use clear punctuation. Use Irodori-supported emoji only when expression requires it. "
     "Do not respond with structured JSON or Markdown."
 )
+_MAX_REALTIME_PROMPT_BYTES = 65_536
 type TranscriptKind = Literal["delta", "done"]
 type TranscriptRole = Literal["assistant", "user"]
 type ActivityKind = Literal[
@@ -112,18 +114,13 @@ class CodexRealtimeSession:
         *,
         settings: MocoSettings,
         sdp_timeout: float = 10.0,
-        prompt: str = DEFAULT_REALTIME_PROMPT,
     ) -> None:
         if sdp_timeout <= 0:
             msg = "sdp_timeout must be positive"
             raise ValueError(msg)
-        if not prompt.strip():
-            msg = "realtime prompt must not be blank"
-            raise ValueError(msg)
         self._rpc = rpc
         self._settings = settings
         self._sdp_timeout = sdp_timeout
-        self._prompt = prompt
         self._thread_id: str | None = None
         self._active_turn_id: str | None = None
         self._notification_task: asyncio.Task[None] | None = None
@@ -171,6 +168,7 @@ class CodexRealtimeSession:
         if self._closed:
             msg = "Codex realtime session is closed"
             raise CodexRpcError(msg)
+        prompt = _load_realtime_prompt(self._settings)
         self._started = True
 
         try:
@@ -196,7 +194,7 @@ class CodexRealtimeSession:
                     "threadId": self._thread_id,
                     "outputModality": "audio",
                     "includeStartupContext": False,
-                    "prompt": self._prompt,
+                    "prompt": prompt,
                     "transport": {"type": "webrtc", "sdp": offer_sdp},
                     "version": "v3",
                 },
@@ -440,6 +438,34 @@ class CodexRealtimeSession:
             return
         self._events_ended = True
         self._events.put_nowait(_EVENTS_END)
+
+
+def _load_realtime_prompt(settings: MocoSettings) -> str:
+    configured = settings.codex.prompt_file
+    path = configured or default_prompt_path()
+    try:
+        with path.open("rb") as stream:
+            payload = stream.read(_MAX_REALTIME_PROMPT_BYTES + 1)
+    except FileNotFoundError as error:
+        if configured is None:
+            return DEFAULT_REALTIME_PROMPT
+        msg = "configured realtime prompt file was not found"
+        raise CodexPromptError(msg) from error
+    except (OSError, ValueError) as error:
+        msg = "realtime prompt file could not be read"
+        raise CodexPromptError(msg) from error
+    if len(payload) > _MAX_REALTIME_PROMPT_BYTES:
+        msg = "realtime prompt file exceeds 64 KiB"
+        raise CodexPromptError(msg)
+    try:
+        prompt = payload.decode("utf-8-sig").strip()
+    except UnicodeDecodeError as error:
+        msg = "realtime prompt file must be UTF-8"
+        raise CodexPromptError(msg) from error
+    if not prompt:
+        msg = "realtime prompt file must not be blank"
+        raise CodexPromptError(msg)
+    return prompt
 
 
 def _thread_id_from_result(result: JsonValue) -> str:
