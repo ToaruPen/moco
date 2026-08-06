@@ -6,9 +6,12 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
 from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, use_span
 
 from moco.config import TelemetrySettings
+from moco.runtime import telemetry as telemetry_module
 from moco.runtime.telemetry import (
     TelemetryAttributeError,
     boundary_label,
@@ -20,6 +23,18 @@ from moco.runtime.telemetry import (
 
 class TelemetryShutdownError(RuntimeError):
     """Synthetic telemetry provider shutdown failure."""
+
+
+class TelemetryConfigurationError(RuntimeError):
+    """Synthetic telemetry provider configuration failure."""
+
+
+def _batch_worker_is_alive(processor: BatchSpanProcessor) -> bool:
+    return processor._batch_processor._worker_thread.is_alive()  # noqa: SLF001
+
+
+def _shutdown_batch_processor(processor: BatchSpanProcessor) -> None:
+    processor.shutdown()  # type: ignore[no-untyped-call]
 
 
 def test_allows_only_bounded_operational_attributes() -> None:
@@ -75,6 +90,12 @@ def test_rejects_unbounded_or_wrongly_typed_audio_metadata(
 ) -> None:
     with pytest.raises(TelemetryAttributeError, match=key):
         sanitize_attributes({key: value}, strict=True)
+
+
+@pytest.mark.parametrize("key", ["component", "state", "event_code", "duration_ms"])
+def test_rejects_boolean_values_for_non_boolean_attributes(key: str) -> None:
+    with pytest.raises(TelemetryAttributeError, match=key):
+        sanitize_attributes({key: True}, strict=True)
 
 
 @pytest.mark.parametrize("phase", ["started", "completed", "failed"])
@@ -268,6 +289,87 @@ def test_exporters_are_selected_only_from_settings() -> None:
     none.close()
     console.close()
     otlp.close()
+
+
+def test_configuration_failure_shuts_down_unregistered_batch_processor(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    moco_logger = logging.getLogger("moco")
+    original_handlers = tuple(moco_logger.handlers)
+    original_level = moco_logger.level
+    original_propagate = moco_logger.propagate
+    processors: list[BatchSpanProcessor] = []
+
+    real_batch_span_processor = BatchSpanProcessor
+
+    def record_batch_span_processor(exporter: SpanExporter) -> BatchSpanProcessor:
+        processor = real_batch_span_processor(exporter)
+        processors.append(processor)
+        return processor
+
+    def fail_add_span_processor(*_args: object) -> None:
+        raise TelemetryConfigurationError
+
+    monkeypatch.setattr(telemetry_module, "BatchSpanProcessor", record_batch_span_processor)
+    monkeypatch.setattr(
+        "moco.runtime.telemetry.TracerProvider.add_span_processor",
+        fail_add_span_processor,
+    )
+
+    try:
+        with pytest.raises(TelemetryConfigurationError):
+            configure_telemetry(TelemetrySettings(console=True))
+
+        assert len(processors) == 1
+        assert not _batch_worker_is_alive(processors[0])
+        assert tuple(moco_logger.handlers) == original_handlers
+        assert moco_logger.level == original_level
+        assert moco_logger.propagate is original_propagate
+    finally:
+        for processor in processors:
+            _shutdown_batch_processor(processor)
+
+
+def test_configuration_failure_shuts_down_provider_without_masking_original_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    configuration_error = TelemetryConfigurationError("fixture configuration failure")
+    processors: list[BatchSpanProcessor] = []
+    real_batch_span_processor = BatchSpanProcessor
+    real_provider_shutdown = TracerProvider.shutdown
+
+    def record_batch_span_processor(exporter: SpanExporter) -> BatchSpanProcessor:
+        processor = real_batch_span_processor(exporter)
+        processors.append(processor)
+        return processor
+
+    def fail_otlp_exporter(**_kwargs: object) -> SpanExporter:
+        raise configuration_error
+
+    def fail_provider_shutdown(provider: TracerProvider) -> None:
+        real_provider_shutdown(provider)
+        raise TelemetryShutdownError
+
+    monkeypatch.setattr(telemetry_module, "BatchSpanProcessor", record_batch_span_processor)
+    monkeypatch.setattr(telemetry_module, "OTLPSpanExporter", fail_otlp_exporter)
+    monkeypatch.setattr(TracerProvider, "shutdown", fail_provider_shutdown)
+
+    settings = TelemetrySettings.model_validate(
+        {
+            "console": True,
+            "otlp_endpoint": "http://127.0.0.1:4318/v1/traces",
+        },
+    )
+    try:
+        with pytest.raises(TelemetryConfigurationError) as caught:
+            configure_telemetry(settings)
+
+        assert caught.value is configuration_error
+        assert len(processors) == 1
+        assert not _batch_worker_is_alive(processors[0])
+    finally:
+        for processor in processors:
+            _shutdown_batch_processor(processor)
 
 
 def test_console_telemetry_emits_moco_events_to_stderr_and_restores_logger(

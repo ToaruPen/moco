@@ -654,6 +654,7 @@ class _BrowserConnection:
     async def _handle_transcript(self, event: TranscriptEvent) -> None:
         if event.role == "user" and not self._user_utterance_active:
             self._user_utterance_active = True
+            self._transcripts.pop("assistant", None)
             await self._invalidate_speech()
         if event.role == "assistant":
             accumulated = self._transcripts.get(event.role, "")
