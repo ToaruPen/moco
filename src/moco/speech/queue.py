@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import logging
+import time
 from collections import deque
 from collections.abc import Awaitable, Callable
 from contextlib import suppress
@@ -11,11 +12,13 @@ from typing import Literal, Protocol, cast
 
 from moco.runtime.telemetry import safe_event
 from moco.speech.irodori import IrodoriError
-from moco.speech.text import TranscriptSegmenter
+from moco.speech.text import SegmentReason, TranscriptSegment, TranscriptSegmenter
 
 type TranscriptRole = Literal["assistant", "user"]
-type Delivery = Callable[[bytes], object | Awaitable[object]]
+type Delivery = Callable[[bytes, int, int], object | Awaitable[object]]
 type ErrorReporter = Callable[[str], object | Awaitable[object]]
+type AudioIdAllocator = Callable[[], int]
+type InvalidationReason = Literal["owner_request", "user_transcript", "queue_close"]
 logger = logging.getLogger(__name__)
 _PUBLIC_IRODORI_ERROR_CODES = frozenset(
     {
@@ -41,7 +44,11 @@ class Synthesizer(Protocol):
 @dataclass(frozen=True, slots=True)
 class _SpeechItem:
     text: str
+    audio_id: int
     generation: int
+    reason: SegmentReason
+    segment_index: int
+    segment_wait_ms: int
 
 
 class SpeechQueue:
@@ -52,18 +59,31 @@ class SpeechQueue:
         deliver: Delivery,
         max_chars: int,
         on_error: ErrorReporter | None = None,
+        initial_generation: int = 0,
+        reserve_audio_id: AudioIdAllocator | None = None,
+        first_segment_soft_break_min_chars: int | None = None,
     ) -> None:
+        if type(initial_generation) is not int or initial_generation < 0:
+            message = "initial_generation must be a non-negative integer"
+            raise ValueError(message)
         self._synthesizer = synthesizer
         self._deliver = deliver
         self._on_error = on_error
-        self._segmenter = TranscriptSegmenter(max_chars=max_chars)
+        self._reserve_audio_id = reserve_audio_id or self._reserve_local_audio_id
+        self._local_audio_id = 0
+        self._segmenter = TranscriptSegmenter(
+            max_chars=max_chars,
+            first_segment_soft_break_min_chars=first_segment_soft_break_min_chars,
+        )
         self._items: deque[_SpeechItem] = deque()
         self._condition = asyncio.Condition()
-        self._generation = 0
+        self._generation = initial_generation
         self._suppressed = False
-        self._assistant_has_streamed = False
+        self._turn_started_ns: int | None = None
+        self._next_segment_index = 1
         self._worker: asyncio.Task[None] | None = None
         self._active: asyncio.Task[None] | None = None
+        self._active_cancel_reason: InvalidationReason | None = None
         self._busy = False
         self._closed = False
         self._error_codes: list[str] = []
@@ -98,39 +118,41 @@ class SpeechQueue:
         if role == "user":
             if done:
                 self._suppressed = False
-                self._assistant_has_streamed = False
                 self._segmenter.clear()
+                self._reset_turn_state()
             return
         if self._suppressed or self._closed:
             return
 
-        text_to_push = delta
-        if done and self._assistant_has_streamed:
-            text_to_push = ""
-        if not done and delta:
-            self._assistant_has_streamed = True
-
-        segments = self._segmenter.push(text_to_push)
+        if delta and self._turn_started_ns is None:
+            self._turn_started_ns = time.monotonic_ns()
+        segments = self._segmenter.push(delta)
         if done:
             segments.extend(self._segmenter.flush())
-            self._assistant_has_streamed = False
         await self._enqueue(segments)
+        if done:
+            self._reset_turn_state()
 
-    async def invalidate(self) -> None:
+    async def invalidate(self, *, reason: InvalidationReason = "owner_request") -> None:
+        async with self._condition:
+            self._generation += 1
+            generation = self._generation
+            self._suppressed = True
+            self._segmenter.clear()
+            self._reset_turn_state()
+            self._items.clear()
+            active = self._active
+            if active is not None and not active.done() and self._active_cancel_reason is None:
+                self._active_cancel_reason = reason
+            self._condition.notify_all()
         safe_event(
             logger,
             "speech_invalidated",
             component="speech",
+            event_code=reason,
+            generation=generation,
             state="invalidating",
         )
-        async with self._condition:
-            self._generation += 1
-            self._suppressed = True
-            self._assistant_has_streamed = False
-            self._segmenter.clear()
-            self._items.clear()
-            active = self._active
-            self._condition.notify_all()
         if active is not None and not active.done():
             active.cancel()
             with suppress(asyncio.CancelledError):
@@ -143,7 +165,7 @@ class SpeechQueue:
     async def close(self) -> None:
         if self._closed:
             return
-        await self.invalidate()
+        await self.invalidate(reason="queue_close")
         async with self._condition:
             self._closed = True
             self._condition.notify_all()
@@ -152,12 +174,55 @@ class SpeechQueue:
             with suppress(asyncio.CancelledError):
                 await worker
 
-    async def _enqueue(self, segments: list[str]) -> None:
+    async def _enqueue(self, segments: list[TranscriptSegment]) -> None:
         if not segments:
             return
+        enqueued_ns = time.monotonic_ns()
+        segment_wait_ms = self._segment_wait_ms(enqueued_ns)
         async with self._condition:
-            self._items.extend(_SpeechItem(text, self._generation) for text in segments)
+            starting_depth = len(self._items)
+            items: list[_SpeechItem] = []
+            for segment in segments:
+                items.append(
+                    _SpeechItem(
+                        text=segment.text,
+                        audio_id=self._reserve_audio_id(),
+                        generation=self._generation,
+                        reason=segment.reason,
+                        segment_index=self._next_segment_index,
+                        segment_wait_ms=segment_wait_ms,
+                    ),
+                )
+                self._next_segment_index += 1
+            self._items.extend(items)
+            for offset, item in enumerate(items, start=1):
+                safe_event(
+                    logger,
+                    "speech_segment_ready",
+                    include_trace_id=False,
+                    audio_id=item.audio_id,
+                    component="speech",
+                    duration_ms=item.segment_wait_ms,
+                    generation=item.generation,
+                    queue_depth=starting_depth + offset,
+                    segment_index=item.segment_index,
+                    segment_reason=item.reason,
+                    text_chars=len(item.text),
+                )
             self._condition.notify_all()
+
+    def _segment_wait_ms(self, enqueued_ns: int) -> int:
+        if self._turn_started_ns is None:
+            return 0
+        return max(0, (enqueued_ns - self._turn_started_ns) // 1_000_000)
+
+    def _reset_turn_state(self) -> None:
+        self._turn_started_ns = None
+        self._next_segment_index = 1
+
+    def _reserve_local_audio_id(self) -> int:
+        self._local_audio_id += 1
+        return self._local_audio_id
 
     async def _run(self) -> None:
         while True:
@@ -181,13 +246,36 @@ class SpeechQueue:
                 async with self._condition:
                     if self._active is active:
                         self._active = None
+                        self._active_cancel_reason = None
                     self._busy = False
                     self._condition.notify_all()
 
     async def _process_item(self, item: _SpeechItem) -> None:
+        started_ns = time.monotonic_ns()
+        safe_event(
+            logger,
+            "synthesis_started",
+            audio_id=item.audio_id,
+            component="speech",
+            boundary="irodori_http",
+            generation=item.generation,
+            queue_depth=len(self._items),
+            text_chars=len(item.text),
+        )
         try:
             wav = await self._synthesizer.synthesize(item.text)
         except asyncio.CancelledError:
+            safe_event(
+                logger,
+                "synthesis_cancelled",
+                audio_id=item.audio_id,
+                component="speech",
+                boundary="irodori_http",
+                duration_ms=_elapsed_ms(started_ns),
+                event_code=self._active_cancel_reason or "owner_request",
+                generation=item.generation,
+                text_chars=len(item.text),
+            )
             raise
         except IrodoriError as error:
             code = error.code if error.code in _PUBLIC_IRODORI_ERROR_CODES else "synthesis_failed"
@@ -195,10 +283,14 @@ class SpeechQueue:
             safe_event(
                 logger,
                 "synthesis_failed",
+                audio_id=item.audio_id,
                 component="speech",
                 boundary="irodori_http",
+                duration_ms=_elapsed_ms(started_ns),
                 event_code=code,
+                generation=item.generation,
                 result="error",
+                text_chars=len(item.text),
             )
             await self._report_error(code)
             return
@@ -208,32 +300,41 @@ class SpeechQueue:
             safe_event(
                 logger,
                 "synthesis_failed",
+                audio_id=item.audio_id,
                 component="speech",
                 boundary="irodori_http",
+                duration_ms=_elapsed_ms(started_ns),
                 event_code=code,
+                generation=item.generation,
                 result="error",
+                text_chars=len(item.text),
             )
             await self._report_error(code)
             return
 
+        safe_event(
+            logger,
+            "synthesis_completed",
+            audio_id=item.audio_id,
+            component="speech",
+            boundary="irodori_http",
+            duration_ms=_elapsed_ms(started_ns),
+            generation=item.generation,
+            result="ok",
+            text_chars=len(item.text),
+            wav_bytes=len(wav),
+        )
+
         if item.generation != self._generation:
             return
         try:
-            result = self._deliver(wav)
+            result = self._deliver(wav, item.audio_id, item.generation)
             if inspect.isawaitable(result):
                 await cast("Awaitable[object]", result)
         except asyncio.CancelledError:
             raise
         except Exception:  # noqa: BLE001
             self._error_codes.append("audio_delivery_failed")
-            safe_event(
-                logger,
-                "audio_delivery_failed",
-                component="speech",
-                boundary="browser_audio",
-                event_code="audio_delivery_failed",
-                result="error",
-            )
             await self._report_error("audio_delivery_failed")
 
     async def _report_error(self, code: str) -> None:
@@ -252,3 +353,7 @@ class SpeechQueue:
                 event_code="speech_error_notification_failed",
                 result="error",
             )
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return (time.monotonic_ns() - started_ns) // 1_000_000

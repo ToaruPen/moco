@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
+from typing import Literal
 
 SENTENCE_ENDS = frozenset("。！？!?")
 TRAILING_CLOSERS = frozenset("」』）】》”’")
@@ -48,6 +50,19 @@ CONTROL_EMOJIS = (
 )
 NON_SPEECH_RE = re.compile(r"[\s。！？!?、，,；;：:…「」『』（）【】《》“”‘’]+")
 
+type SegmentReason = Literal[
+    "sentence_end",
+    "first_soft_break",
+    "max_chars",
+    "turn_flush",
+]
+
+
+@dataclass(frozen=True, slots=True)
+class TranscriptSegment:
+    text: str
+    reason: SegmentReason
+
 
 def strip_control_emojis(text: str) -> str:
     stripped = text
@@ -62,41 +77,67 @@ def is_speakable(text: str) -> bool:
 
 
 class TranscriptSegmenter:
-    def __init__(self, *, max_chars: int) -> None:
+    def __init__(
+        self,
+        max_chars: int,
+        first_segment_soft_break_min_chars: int | None = None,
+    ) -> None:
         if max_chars <= 0:
             msg = "max_chars must be positive"
             raise ValueError(msg)
         self._max_chars = max_chars
+        self._first_segment_soft_break_min_chars = first_segment_soft_break_min_chars
         self._buffer = ""
+        self._first_segment_emitted = False
 
-    def push(self, delta: str) -> list[str]:
+    def push(self, delta: str) -> list[TranscriptSegment]:
         self._buffer += delta
         return self._take_ready()
 
-    def flush(self) -> list[str]:
+    def flush(self) -> list[TranscriptSegment]:
         ready = self._take_ready()
         remainder = self._buffer.strip()
         self._buffer = ""
-        if remainder and is_speakable(remainder):
-            ready.append(remainder)
+        if remainder:
+            self._append_if_speakable(ready, remainder, "turn_flush")
+        self._first_segment_emitted = False
         return ready
 
     def clear(self) -> None:
         self._buffer = ""
+        self._first_segment_emitted = False
 
-    def _take_ready(self) -> list[str]:
-        ready: list[str] = []
+    def _take_ready(self) -> list[TranscriptSegment]:
+        ready: list[TranscriptSegment] = []
         while self._buffer:
             sentence_end = self._sentence_end()
             if sentence_end is not None:
                 segment = self._take(sentence_end)
+                reason: SegmentReason = "sentence_end"
+            elif (
+                not self._first_segment_emitted
+                and self._first_segment_soft_break_min_chars is not None
+                and (soft_break := self._first_soft_break()) is not None
+            ):
+                segment = self._take(soft_break)
+                reason = "first_soft_break"
             elif len(self._buffer) >= self._max_chars:
                 segment = self._take(self._long_text_cut())
+                reason = "max_chars"
             else:
                 break
-            if is_speakable(segment):
-                ready.append(segment)
+            self._append_if_speakable(ready, segment, reason)
         return ready
+
+    def _append_if_speakable(
+        self,
+        ready: list[TranscriptSegment],
+        text: str,
+        reason: SegmentReason,
+    ) -> None:
+        if is_speakable(text):
+            ready.append(TranscriptSegment(text, reason))
+            self._first_segment_emitted = True
 
     def _sentence_end(self) -> int | None:
         for index, character in enumerate(self._buffer):
@@ -115,6 +156,15 @@ class TranscriptSegmenter:
             if self._buffer[index] in SOFT_BREAKS:
                 return index + 1
         return self._max_chars
+
+    def _first_soft_break(self) -> int | None:
+        minimum = self._first_segment_soft_break_min_chars
+        if minimum is None:
+            return None
+        for index, character in enumerate(self._buffer):
+            if character in SOFT_BREAKS and index + 1 >= minimum:
+                return index + 1
+        return None
 
     def _take(self, end: int) -> str:
         segment = self._buffer[:end].strip()

@@ -24,8 +24,68 @@ def test_parses_start_control_and_playback_messages() -> None:
         {"type": "control", "control": "listen_stop"},
     ) == ControlMessage(control=ClientControl.LISTEN_STOP)
     assert parse_client_message(
-        {"type": "playback", "active": True},
-    ) == PlaybackMessage(active=True)
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+        },
+    ) == PlaybackMessage(
+        phase="started",
+        audio_id=17,
+        generation=3,
+        context_state="running",
+    )
+    assert parse_client_message(
+        {
+            "type": "playback",
+            "phase": "completed",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+        },
+    ) == PlaybackMessage(
+        phase="completed",
+        audio_id=17,
+        generation=3,
+        context_state="running",
+    )
+    assert parse_client_message(
+        {
+            "type": "playback",
+            "phase": "failed",
+            "audio_id": 18,
+            "generation": 3,
+            "context_state": "suspended",
+        },
+    ) == PlaybackMessage(
+        phase="failed",
+        audio_id=18,
+        generation=3,
+        context_state="suspended",
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {
+            "type": "playback",
+            "active": True,
+            "phase": "started",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+        },
+        {"type": "playback", "phase": "stopped"},
+    ],
+)
+def test_playback_contract_rejects_client_activity_and_uncorrelated_stop(
+    payload: object,
+) -> None:
+    with pytest.raises(ValidationError):
+        parse_client_message(payload)
 
 
 def test_parses_and_normalizes_an_opaque_voice_id() -> None:
@@ -39,7 +99,87 @@ def test_parses_and_normalizes_an_opaque_voice_id() -> None:
     [
         {"type": "start", "sdp": ""},
         {"type": "control", "control": "unknown"},
-        {"type": "playback", "active": "yes"},
+        {"type": "playback"},
+        {"type": "playback", "phase": "started"},
+        {"type": "playback", "phase": "completed", "audio_id": 17},
+        {
+            "type": "playback",
+            "phase": "unknown",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "stopped",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": -1,
+            "generation": 3,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": -1,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": "17",
+            "generation": 3,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": True,
+            "generation": 3,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": 3.5,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": True,
+            "context_state": "running",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "unknown",
+        },
+        {
+            "type": "playback",
+            "phase": "completed",
+            "audio_id": 17,
+            "generation": None,
+            "context_state": "closed",
+        },
+        {
+            "type": "playback",
+            "phase": "started",
+            "audio_id": 17,
+            "generation": 3,
+            "context_state": "running",
+            "extra": True,
+        },
         {"type": "select_voice", "voice_id": None},
         {"type": "select_voice", "voice_id": ""},
         {"type": "select_voice", "voice_id": "   "},

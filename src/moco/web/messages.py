@@ -3,7 +3,15 @@ from __future__ import annotations
 from enum import StrEnum
 from typing import Annotated, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, TypeAdapter, field_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    TypeAdapter,
+    field_validator,
+)
+
+NonNegativeStrictInt = Annotated[int, Field(strict=True, ge=0)]
 
 
 class ClientControl(StrEnum):
@@ -27,7 +35,10 @@ class ControlMessage(_ClientMessage):
 
 class PlaybackMessage(_ClientMessage):
     type: Literal["playback"] = "playback"
-    active: StrictBool
+    phase: Literal["started", "completed", "failed"]
+    audio_id: NonNegativeStrictInt
+    generation: NonNegativeStrictInt
+    context_state: Literal["running", "suspended", "closed", "interrupted"]
 
 
 class SelectVoiceMessage(_ClientMessage):

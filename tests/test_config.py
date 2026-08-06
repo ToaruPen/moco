@@ -3,12 +3,14 @@ from __future__ import annotations
 from pathlib import Path
 
 import pytest
+from pydantic import ValidationError
 
 from moco.config import (
     CodexSettings,
     ConfigError,
     IrodoriSettings,
     ServerSettings,
+    SpeechSettings,
     default_config_path,
     default_prompt_path,
     load_config,
@@ -47,6 +49,33 @@ def test_example_config_loads() -> None:
     settings = load_config(path)
 
     assert settings.irodori.caption_mode == "off"
+
+
+def test_speech_first_segment_soft_break_defaults_to_disabled() -> None:
+    assert SpeechSettings().first_segment_soft_break_min_chars is None
+
+
+def test_speech_first_segment_soft_break_can_be_disabled() -> None:
+    settings = SpeechSettings(first_segment_soft_break_min_chars=None)
+
+    assert settings.first_segment_soft_break_min_chars is None
+
+
+@pytest.mark.parametrize("value", [0, -1, True, 1.5, "18"])
+def test_speech_first_segment_soft_break_is_strict(value: object) -> None:
+    with pytest.raises(ValidationError):
+        SpeechSettings(first_segment_soft_break_min_chars=value)  # type: ignore[arg-type]
+
+
+def test_speech_first_segment_soft_break_cannot_exceed_segment_limit() -> None:
+    with pytest.raises(
+        ValidationError,
+        match="first_segment_soft_break_min_chars",
+    ):
+        SpeechSettings(
+            segment_max_chars=17,
+            first_segment_soft_break_min_chars=18,
+        )
 
 
 def test_load_config_rejects_unknown_keys(tmp_path: Path) -> None:

@@ -86,11 +86,21 @@ const THEME_GROUP_LABELS = Object.freeze({
 });
 
 export class AudioPlaybackQueue {
-  constructor(context, onState, onError = () => {}) {
+  constructor(
+    context,
+    onState,
+    onError = () => {},
+    timers = {
+      set: (callback, delayMs) => globalThis.setTimeout(callback, delayMs),
+      clear: (handle) => globalThis.clearTimeout(handle),
+    },
+  ) {
     this.context = context;
     this.onState = onState;
     this.onError = onError;
+    this.timers = timers;
     this.sources = new Set();
+    this.pendingStartAcknowledgements = new Map();
     this.epoch = 0;
     this.chain = Promise.resolve();
     this.nextStart = context.currentTime;
@@ -100,10 +110,26 @@ export class AudioPlaybackQueue {
     return this.sources.size > 0;
   }
 
-  enqueue(bytes) {
+  enqueue(bytes, metadata) {
     const epoch = this.epoch;
     this.chain = this.chain
       .then(async () => {
+        if (epoch !== this.epoch) {
+          return;
+        }
+        if (this.context.state === "suspended") {
+          try {
+            await this.context.resume();
+          } catch {
+            throw namedError("audio_resume_failed");
+          }
+          if (epoch !== this.epoch) {
+            return;
+          }
+          if (this.context.state !== "running") {
+            throw namedError("audio_resume_failed");
+          }
+        }
         const buffer = await this.context.decodeAudioData(bytes.slice(0));
         if (epoch !== this.epoch) {
           return;
@@ -115,11 +141,15 @@ export class AudioPlaybackQueue {
         source.addEventListener(
           "ended",
           () => {
+            if (epoch !== this.epoch) {
+              return;
+            }
+            this.#confirmStartAcknowledgement(source, metadata, epoch);
             this.sources.delete(source);
             if (!this.isPlaying) {
               this.nextStart = this.context.currentTime;
-              this.onState(false);
             }
+            this.onState(this.isPlaying, metadata, this.context.state, "completed");
           },
           { once: true },
         );
@@ -130,19 +160,30 @@ export class AudioPlaybackQueue {
         }
         this.nextStart = startAt + buffer.duration;
         this.sources.add(source);
-        this.onState(true);
+        this.#acknowledgeAtStart(source, metadata, epoch, startAt);
       })
       .catch((error) => {
+        if (epoch !== this.epoch) {
+          return;
+        }
         if (!this.isPlaying) {
           this.nextStart = this.context.currentTime;
-          this.onState(false);
         }
-        this.onError(error.name === "audio_start_failed" ? error.name : "audio_decode_failed");
+        this.onState(this.isPlaying, metadata, this.context.state, "failed");
+        this.onError(
+          error.name === "audio_resume_failed" || error.name === "audio_start_failed"
+            ? error.name
+            : "audio_decode_failed",
+        );
       });
   }
 
   stop() {
     this.epoch += 1;
+    this.chain = Promise.resolve();
+    for (const source of this.pendingStartAcknowledgements.keys()) {
+      this.#cancelStartAcknowledgement(source);
+    }
     for (const source of this.sources) {
       try {
         source.stop();
@@ -154,7 +195,47 @@ export class AudioPlaybackQueue {
     }
     this.sources.clear();
     this.nextStart = this.context.currentTime;
-    this.onState(false);
+    this.onState(false, undefined, undefined, "stopped");
+  }
+
+  #acknowledgeAtStart(source, metadata, epoch, startAt) {
+    const token = { handle: undefined };
+    const checkStart = () => {
+      if (this.pendingStartAcknowledgements.get(source) !== token) {
+        return;
+      }
+      const remainingMs = Math.max(0, (startAt - this.context.currentTime) * 1000);
+      if (this.context.state !== "running" || remainingMs > 0) {
+        const retryMs = this.context.state === "running" ? Math.max(1, remainingMs) : 50;
+        token.handle = this.timers.set(checkStart, retryMs);
+        return;
+      }
+      this.#confirmStartAcknowledgement(source, metadata, epoch);
+    };
+    this.pendingStartAcknowledgements.set(source, token);
+    const delayMs = Math.max(0, (startAt - this.context.currentTime) * 1000);
+    token.handle = this.timers.set(checkStart, delayMs);
+  }
+
+  #confirmStartAcknowledgement(source, metadata, epoch) {
+    if (!this.pendingStartAcknowledgements.has(source)) {
+      return;
+    }
+    this.#cancelStartAcknowledgement(source);
+    if (epoch === this.epoch && this.sources.has(source)) {
+      this.onState(true, metadata, this.context.state, "started");
+    }
+  }
+
+  #cancelStartAcknowledgement(source) {
+    const token = this.pendingStartAcknowledgements.get(source);
+    if (!token) {
+      return;
+    }
+    this.pendingStartAcknowledgements.delete(source);
+    if (token.handle !== undefined) {
+      this.timers.clear(token.handle);
+    }
   }
 }
 
@@ -368,6 +449,7 @@ export class MocoController {
   acceptAudio(metadata) {
     this.pendingAudio = {
       accepted: metadata.generation === this.audioGeneration,
+      metadata,
     };
   }
 
@@ -375,7 +457,7 @@ export class MocoController {
     const pending = this.pendingAudio;
     this.pendingAudio = null;
     if (pending?.accepted) {
-      this.playback.enqueue(bytes);
+      this.playback.enqueue(bytes, pending.metadata);
     }
   }
 
@@ -406,29 +488,30 @@ export class MocoController {
   }
 }
 
-class TranscriptView {
+export class TranscriptView {
   constructor(container) {
     this.container = container;
     this.active = new Map();
   }
 
-  append(role, delta, done) {
+  update(role, text, done) {
+    const document = this.container.ownerDocument;
     this.container.querySelector(".transcript-empty")?.remove();
     let entry = this.active.get(role);
     if (!entry) {
       const wrapper = document.createElement("article");
       const label = document.createElement("span");
-      const text = document.createElement("p");
+      const content = document.createElement("p");
       wrapper.className = "utterance";
       label.className = "utterance-role";
-      text.className = "utterance-text";
+      content.className = "utterance-text";
       label.textContent = role === "user" ? "YOU" : "MOCO";
-      wrapper.append(label, text);
+      wrapper.append(label, content);
       this.container.append(wrapper);
-      entry = text;
+      entry = content;
       this.active.set(role, entry);
     }
-    entry.append(document.createTextNode(delta));
+    entry.textContent = text;
     if (done) {
       this.active.delete(role);
     }
@@ -436,6 +519,7 @@ class TranscriptView {
   }
 
   clear() {
+    const document = this.container.ownerDocument;
     this.active.clear();
     this.container.replaceChildren();
     const empty = document.createElement("p");
@@ -1078,7 +1162,7 @@ function boot() {
       } else if (message.type === "audio_invalidate") {
         controller?.invalidateAudio(message.generation);
       } else if (message.type === "transcript") {
-        transcript.append(message.role, message.delta, message.done);
+        transcript.update(message.role, message.text, message.done);
       } else if (message.type === "voice") {
         voiceModels.confirm(message.selected);
         operatorStatus.addLocal({
@@ -1165,8 +1249,16 @@ function boot() {
       let playbackActive = false;
       const playback = new AudioPlaybackQueue(
         context,
-        (active) => {
-          send({ type: "playback", active });
+        (active, metadata, contextState, phase) => {
+          if (metadata) {
+            send({
+              type: "playback",
+              phase,
+              audio_id: metadata.audioId,
+              generation: metadata.generation,
+              context_state: contextState,
+            });
+          }
           if (playbackActive !== active) {
             playbackActive = active;
             operatorStatus.addLocal({

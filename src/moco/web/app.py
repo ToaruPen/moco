@@ -7,7 +7,7 @@ import secrets
 import time
 from contextlib import suppress
 from pathlib import Path
-from typing import TYPE_CHECKING, Protocol, assert_never, cast
+from typing import TYPE_CHECKING, Literal, Protocol, assert_never, cast
 from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
@@ -76,6 +76,7 @@ _ACTIVITY_LABELS = {
     "codex_work": ("work", "Codex 処理"),
 }
 logger = logging.getLogger(__name__)
+_PlaybackState = Literal["delivering", "delivered", "started"]
 
 
 class _CapabilityError(RuntimeError):
@@ -161,6 +162,10 @@ class _BrowserConnection:
         self._invalid_messages = 0
         self._generation = 0
         self._audio_id = 0
+        self._playback_states: dict[tuple[int, int], _PlaybackState] = {}
+        self._first_playback_started_ns: int | None = None
+        self._first_playback_audio_id: int | None = None
+        self._first_playback_generation: int | None = None
         self._transcripts: dict[str, str] = {}
         self._synthesis_busy = False
         self._delegated_busy = False
@@ -234,28 +239,95 @@ class _BrowserConnection:
         try:
             message = parse_client_message(json.loads(payload))
         except (json.JSONDecodeError, ValidationError):
-            self._invalid_messages += 1
-            await self._send_error("invalid_message")
-            return self._invalid_messages < _MAX_INVALID_MESSAGES
-        self._invalid_messages = 0
+            return await self._reject_invalid_message()
 
-        if isinstance(message, StartMessage):
-            await self._start(message)
-            return True
-        if isinstance(message, ControlMessage):
-            await self._apply_control(message.control)
-            return True
         if isinstance(message, PlaybackMessage):
-            self._lifecycle.set_busy(BusyKind.PLAYBACK, active=message.active)
-            if message.active:
-                self._lifecycle.set_state(LifecycleState.SPEAKING)
-            return True
-        if isinstance(message, SelectVoiceMessage):
+            if not await self._handle_playback(message):
+                safe_event(
+                    logger,
+                    "browser_playback_rejected",
+                    boundary="browser_audio",
+                    component="web",
+                    event_code="invalid_playback_transition",
+                    result="error",
+                    state="rejected",
+                )
+                return await self._reject_invalid_message()
+        elif isinstance(message, StartMessage):
+            await self._start(message)
+        elif isinstance(message, ControlMessage):
+            await self._apply_control(message.control)
+        elif isinstance(message, SelectVoiceMessage):
             await self._select_voice(message.voice_id)
-            return True
-        if isinstance(message, StopMessage):
+        elif isinstance(message, StopMessage):
             return False
-        assert_never(message)
+        else:
+            assert_never(message)
+        self._invalid_messages = 0
+        return True
+
+    async def _reject_invalid_message(self) -> bool:
+        self._invalid_messages += 1
+        await self._send_error("invalid_message")
+        return self._invalid_messages < _MAX_INVALID_MESSAGES
+
+    async def _handle_playback(self, message: PlaybackMessage) -> bool:
+        key = (message.audio_id, message.generation)
+        state = self._playback_states.get(key)
+        if state == "delivering":
+            async with self._send_lock:
+                pass
+            state = self._playback_states.get(key)
+        if message.generation != self._generation or state is None:
+            return False
+        if message.phase == "started":
+            if state != "delivered":
+                return False
+            self._playback_states[key] = "started"
+        else:
+            expected = "started" if message.phase == "completed" else "delivered"
+            if state != expected:
+                return False
+            del self._playback_states[key]
+
+        active = any(value == "started" for value in self._playback_states.values())
+        self._lifecycle.set_busy(BusyKind.PLAYBACK, active=active)
+        if active:
+            self._lifecycle.set_state(LifecycleState.SPEAKING)
+        safe_event(
+            logger,
+            "browser_playback",
+            **self._playback_attributes(message, active=active),
+        )
+        return True
+
+    def _playback_attributes(
+        self,
+        message: PlaybackMessage,
+        *,
+        active: bool,
+    ) -> dict[str, object]:
+        attributes: dict[str, object] = {
+            "component": "web",
+            "boundary": "browser_audio",
+            "phase": message.phase,
+            "state": "active" if active else "inactive",
+            "audio_id": message.audio_id,
+            "generation": message.generation,
+            "context_state": message.context_state,
+        }
+        if (
+            message.phase in {"started", "failed"}
+            and message.audio_id == self._first_playback_audio_id
+            and message.generation == self._first_playback_generation
+            and self._first_playback_started_ns is not None
+        ):
+            if message.phase == "started":
+                attributes["duration_ms"] = _elapsed_ms(self._first_playback_started_ns)
+            self._clear_first_playback_timing()
+        if message.phase == "failed":
+            attributes["result"] = "error"
+        return attributes
 
     async def _capability_loop(self) -> None:
         synthesizer: WebSynthesizer | None = None
@@ -412,6 +484,11 @@ class _BrowserConnection:
             deliver=self._deliver_audio,
             max_chars=self._settings.speech.segment_max_chars,
             on_error=self._handle_speech_error,
+            initial_generation=self._generation,
+            reserve_audio_id=self._reserve_audio_id,
+            first_segment_soft_break_min_chars=(
+                self._settings.speech.first_segment_soft_break_min_chars
+            ),
         )
         self._speech.start()
         self._lifecycle.enable()
@@ -578,55 +655,139 @@ class _BrowserConnection:
         if event.role == "user" and not self._user_utterance_active:
             self._user_utterance_active = True
             await self._invalidate_speech()
-        delta, done = self._transcript_delta(event)
+        if event.role == "assistant":
+            accumulated = self._transcripts.get(event.role, "")
+            if event.role not in self._transcripts:
+                self._clear_first_playback_timing()
+            if event.text and not accumulated and self._first_playback_started_ns is None:
+                self._first_playback_started_ns = time.monotonic_ns()
+        text, speech_delta, done = self._transcript_update(event)
         await self._send_json(
             {
                 "type": "transcript",
                 "role": event.role,
-                "delta": strip_control_emojis(delta),
+                "text": strip_control_emojis(text),
                 "done": done,
             },
         )
         speech = self._speech
         if speech is not None:
-            await speech.on_transcript(role=event.role, delta=delta, done=done)
+            await speech.on_transcript(role=event.role, delta=speech_delta, done=done)
         if event.role == "user" and done:
             self._user_utterance_active = False
         self._lifecycle.touch()
 
     async def _invalidate_speech(self) -> None:
         self._generation += 1
-        if self._speech is not None:
-            await self._speech.invalidate()
-        await self._send_json(
-            {"type": "audio_invalidate", "generation": self._generation},
+        self._clear_first_playback_timing()
+        self._clear_playback_states()
+        speech_invalidation = (
+            asyncio.create_task(
+                self._speech.invalidate(reason="user_transcript"),
+                name="moco-speech-invalidation",
+            )
+            if self._speech is not None
+            else None
         )
+        try:
+            await self._send_json(
+                {"type": "audio_invalidate", "generation": self._generation},
+            )
+        finally:
+            if speech_invalidation is not None:
+                await speech_invalidation
 
-    def _transcript_delta(self, event: TranscriptEvent) -> tuple[str, bool]:
+    def _transcript_update(self, event: TranscriptEvent) -> tuple[str, str, bool]:
         accumulated = self._transcripts.get(event.role, "")
         if event.kind == "delta":
-            self._transcripts[event.role] = accumulated + event.text
-            return event.text, False
+            text = accumulated + event.text
+            self._transcripts[event.role] = text
+            speech_delta = event.text if event.role == "assistant" else ""
+            return text, speech_delta, False
         self._transcripts.pop(event.role, None)
-        if event.text.startswith(accumulated):
-            return event.text[len(accumulated) :], True
-        if not accumulated or event.role == "user":
-            return event.text, True
-        message = "assistant transcript did not extend its deltas"
-        raise RuntimeError(message)
+        if event.role == "user":
+            return event.text, "", True
+        if accumulated and not event.text.startswith(accumulated):
+            message = "assistant transcript did not extend its deltas"
+            raise RuntimeError(message)
+        return event.text, event.text[len(accumulated) :], True
 
-    async def _deliver_audio(self, wav: bytes) -> None:
+    def _reserve_audio_id(self) -> int:
         self._audio_id += 1
-        async with self._send_lock:
-            await self._websocket.send_json(
-                {
-                    "type": "audio",
-                    "audioId": self._audio_id,
-                    "generation": self._generation,
-                },
+        if self._first_playback_started_ns is not None and self._first_playback_audio_id is None:
+            self._first_playback_audio_id = self._audio_id
+            self._first_playback_generation = self._generation
+        return self._audio_id
+
+    def _clear_first_playback_timing(self) -> None:
+        self._first_playback_started_ns = None
+        self._first_playback_audio_id = None
+        self._first_playback_generation = None
+
+    def _clear_playback_states(self) -> None:
+        self._playback_states.clear()
+        self._lifecycle.set_busy(BusyKind.PLAYBACK, active=False)
+
+    async def _deliver_audio(self, wav: bytes, audio_id: int, generation: int) -> None:
+        started_ns = time.monotonic_ns()
+        key = (audio_id, generation)
+        metadata = {
+            "component": "web",
+            "boundary": "browser_audio",
+            "audio_id": audio_id,
+            "generation": generation,
+            "wav_bytes": len(wav),
+        }
+        safe_event(logger, "audio_delivery_started", **metadata)
+        try:
+            async with self._send_lock:
+                await self._websocket.send_json(
+                    {
+                        "type": "audio",
+                        "audioId": audio_id,
+                        "generation": generation,
+                    },
+                )
+                if generation == self._generation:
+                    self._playback_states[key] = "delivering"
+                try:
+                    await self._websocket.send_bytes(wav)
+                except (asyncio.CancelledError, Exception):
+                    if self._playback_states.get(key) == "delivering":
+                        del self._playback_states[key]
+                    raise
+                if (
+                    generation == self._generation
+                    and self._playback_states.get(key) == "delivering"
+                ):
+                    self._playback_states[key] = "delivered"
+        except asyncio.CancelledError:
+            safe_event(
+                logger,
+                "audio_delivery_cancelled",
+                **metadata,
+                duration_ms=_elapsed_ms(started_ns),
             )
-            await self._websocket.send_bytes(wav)
-        self._lifecycle.set_state(LifecycleState.SPEAKING)
+            raise
+        except Exception:
+            safe_event(
+                logger,
+                "audio_delivery_failed",
+                **metadata,
+                duration_ms=_elapsed_ms(started_ns),
+                event_code="audio_delivery_failed",
+                result="error",
+            )
+            raise
+        safe_event(
+            logger,
+            "audio_delivery_completed",
+            **metadata,
+            duration_ms=_elapsed_ms(started_ns),
+            result="ok",
+        )
+        if generation == self._generation:
+            self._lifecycle.set_state(LifecycleState.SPEAKING)
 
     async def _idle_loop(self) -> None:
         interval = min(0.05, self._settings.runtime.idle_timeout_seconds / 2)
@@ -663,6 +824,8 @@ class _BrowserConnection:
 
     async def _close_conversation_resources(self) -> None:
         async with self._resource_lock:
+            self._clear_first_playback_timing()
+            self._clear_playback_states()
             notification_task = self._notifications_task
             self._notifications_task = None
             if notification_task is not None and notification_task is not asyncio.current_task():
@@ -877,6 +1040,10 @@ def _log_boundary_failure(boundary: str, error: BaseException) -> None:
 
 def _now_ms() -> int:
     return int(time.time() * 1000)
+
+
+def _elapsed_ms(started_ns: int) -> int:
+    return (time.monotonic_ns() - started_ns) // 1_000_000
 
 
 def _display_text(text: str) -> str:

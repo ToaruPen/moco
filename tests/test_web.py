@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import time
 from collections.abc import AsyncIterator
@@ -25,7 +26,13 @@ from moco.codex.session import (
     ReasoningSummaryEvent,
     TranscriptEvent,
 )
-from moco.config import IrodoriSettings, MocoSettings, RuntimeSettings, ServerSettings
+from moco.config import (
+    IrodoriSettings,
+    MocoSettings,
+    RuntimeSettings,
+    ServerSettings,
+    SpeechSettings,
+)
 from moco.runtime.hotkeys import Control
 from moco.speech.irodori import (
     _MAX_CAPABILITY_VOICES,
@@ -33,6 +40,7 @@ from moco.speech.irodori import (
     IrodoriError,
     IrodoriSynthesizer,
 )
+from moco.speech.queue import SpeechQueue
 from moco.web import app as web_app
 from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import StartMessage
@@ -125,6 +133,8 @@ class FakeSynthesizer:
         self.synthesis_error = synthesis_error
         self.selection_error = selection_error
         self.synthesized_texts: list[str] = []
+        self.synthesized = asyncio.Event()
+        self.second_synthesized = asyncio.Event()
 
     async def capabilities(self) -> CapabilitiesResponse:
         index = min(self.capability_calls, len(self.capability_responses) - 1)
@@ -136,6 +146,9 @@ class FakeSynthesizer:
 
     async def synthesize(self, text: str) -> bytes:
         self.synthesized_texts.append(text)
+        self.synthesized.set()
+        if len(self.synthesized_texts) >= 2:
+            self.second_synthesized.set()
         if self.synthesis_error is not None:
             raise self.synthesis_error
         return b"RIFF\x04\x00\x00\x00WAVE"
@@ -198,9 +211,98 @@ class InvalidNotificationSession(FakeSession):
 class CapturingWebSocket:
     def __init__(self) -> None:
         self.messages: list[dict[str, object]] = []
+        self.byte_messages: list[bytes] = []
 
     async def send_json(self, message: dict[str, object]) -> None:
         self.messages.append(message)
+
+    async def send_bytes(self, message: bytes) -> None:
+        self.byte_messages.append(message)
+
+
+def mark_audio_delivered(
+    connection: web_app._BrowserConnection,
+    audio_id: int,
+    generation: int,
+) -> None:
+    connection._playback_states[(audio_id, generation)] = "delivered"  # noqa: SLF001
+
+
+class AudioDeliveryError(RuntimeError):
+    """Synthetic browser audio delivery failure."""
+
+    def __init__(self) -> None:
+        super().__init__("private websocket failure detail")
+
+
+class FailingAudioWebSocket(CapturingWebSocket):
+    async def send_bytes(self, message: bytes) -> None:
+        del message
+        raise AudioDeliveryError
+
+
+class BlockingAudioWebSocket(CapturingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+
+    async def send_bytes(self, message: bytes) -> None:
+        del message
+        self.started.set()
+        await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
+
+
+class GatedAudioWebSocket(CapturingWebSocket):
+    def __init__(self) -> None:
+        super().__init__()
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send_bytes(self, message: bytes) -> None:
+        self.started.set()
+        await self.release.wait()
+        self.byte_messages.append(message)
+
+
+class InvalidationObservingWebSocket(CapturingWebSocket):
+    def __init__(self, *, fail: bool = False) -> None:
+        super().__init__()
+        self.invalidation_sent = asyncio.Event()
+        self.fail = fail
+
+    async def send_json(self, message: dict[str, object]) -> None:
+        await super().send_json(message)
+        if message.get("type") != "audio_invalidate":
+            return
+        self.invalidation_sent.set()
+        if self.fail:
+            raise AudioDeliveryError
+
+
+class CancellationCleanupSynthesizer(FakeSynthesizer):
+    def __init__(self) -> None:
+        super().__init__()
+        self.cancellation_started = asyncio.Event()
+        self.release_cancellation = asyncio.Event()
+
+    async def synthesize(self, text: str) -> bytes:
+        self.synthesized_texts.append(text)
+        self.synthesized.set()
+        try:
+            await asyncio.wait_for(asyncio.Event().wait(), timeout=1)
+        except asyncio.CancelledError:
+            self.cancellation_started.set()
+            await asyncio.wait_for(self.release_cancellation.wait(), timeout=1)
+            raise
+        return b""
+
+
+class RecordingSpeechInvalidation:
+    def __init__(self) -> None:
+        self.reasons: list[str] = []
+
+    async def invalidate(self, *, reason: str) -> None:
+        self.reasons.append(reason)
 
 
 def websocket_context(
@@ -750,13 +852,13 @@ def test_each_user_utterance_invalidates_old_speech_once() -> None:
             TranscriptEvent("delta", "thr_test", "user", "一"),
         )
         assert socket.receive_json()["type"] == "audio_invalidate"
-        assert socket.receive_json()["delta"] == "一"
+        assert socket.receive_json()["text"] == "一"
 
         portal.call(
             sessions[0].emit,
             TranscriptEvent("delta", "thr_test", "user", "つ"),
         )
-        assert socket.receive_json()["delta"] == "つ"
+        assert socket.receive_json()["text"] == "一つ"
         portal.call(
             sessions[0].emit,
             TranscriptEvent("done", "thr_test", "user", "一つ"),
@@ -768,7 +870,223 @@ def test_each_user_utterance_invalidates_old_speech_once() -> None:
             TranscriptEvent("delta", "thr_test", "user", "次"),
         )
         assert socket.receive_json()["type"] == "audio_invalidate"
-        assert socket.receive_json()["delta"] == "次"
+        assert socket.receive_json()["text"] == "次"
+
+
+def test_streamed_assistant_response_displays_and_synthesizes_complete_text() -> None:
+    session = FakeSession()
+    synthesizer = FakeSynthesizer()
+    app = create_app(
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+        capability_token=CAPABILITY,
+    )
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        receive_ready_catalog(socket)
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        socket.receive_json()
+        socket.receive_json()
+        socket.receive_json()
+        portal = client.portal
+        assert portal is not None
+
+        portal.call(
+            session.emit,
+            TranscriptEvent("delta", "thr_test", "assistant", "確"),
+        )
+        streamed = socket.receive_json()
+        portal.call(
+            session.emit,
+            TranscriptEvent("done", "thr_test", "assistant", "確認します。"),
+        )
+        completed = socket.receive_json()
+
+        assert streamed == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "確",
+            "done": False,
+        }
+        assert completed == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "確認します。",
+            "done": True,
+        }
+
+        async def wait_for_synthesis() -> None:
+            try:
+                await asyncio.wait_for(synthesizer.synthesized.wait(), timeout=1)
+            except TimeoutError:
+                pytest.fail(
+                    "assistant response was not synthesized within one second; "
+                    f"calls={synthesizer.synthesized_texts!r}",
+                )
+
+        portal.call(wait_for_synthesis)
+
+    assert synthesizer.synthesized_texts == ["確認します。"]
+
+
+def test_first_segment_setting_synthesizes_soft_break_then_remainder_fifo() -> None:
+    capabilities = make_capabilities(3, default_index=1)
+    runtime_default = next(voice for voice in capabilities.voices if voice.default)
+    settings = MocoSettings(
+        speech=SpeechSettings(first_segment_soft_break_min_chars=18),
+    )
+    session = FakeSession()
+    synthesizer = FakeSynthesizer(capabilities)
+    first_segment = "これは最初の音声を早く届けるための自然な区切りです、"
+    remainder = "残りを順番に届けます。"
+    app = create_app(
+        settings,
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+        capability_token=CAPABILITY,
+    )
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        receive_ready_catalog(socket)
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        socket.receive_json()
+        socket.receive_json()
+        socket.receive_json()
+        portal = client.portal
+        assert portal is not None
+
+        portal.call(
+            session.emit,
+            TranscriptEvent("delta", "thr_test", "assistant", first_segment),
+        )
+        assert socket.receive_json() == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": first_segment,
+            "done": False,
+        }
+        portal.call(
+            session.emit,
+            TranscriptEvent(
+                "done",
+                "thr_test",
+                "assistant",
+                first_segment + remainder,
+            ),
+        )
+
+        portal.call(asyncio.wait_for, synthesizer.second_synthesized.wait(), 1)
+
+    assert runtime_default.id in synthesizer.selected_voices
+    assert synthesizer.synthesized_texts == [first_segment, remainder]
+
+
+def test_user_final_transcript_replaces_incorrect_interim_text() -> None:
+    session = FakeSession()
+    app = create_app(
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+        capability_token=CAPABILITY,
+    )
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        receive_ready_catalog(socket)
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        socket.receive_json()
+        socket.receive_json()
+        socket.receive_json()
+        portal = client.portal
+        assert portal is not None
+
+        portal.call(
+            session.emit,
+            TranscriptEvent("delta", "thr_test", "user", "きょは"),
+        )
+        assert socket.receive_json()["type"] == "audio_invalidate"
+        assert socket.receive_json() == {
+            "type": "transcript",
+            "role": "user",
+            "text": "きょは",
+            "done": False,
+        }
+
+        portal.call(
+            session.emit,
+            TranscriptEvent("done", "thr_test", "user", "今日は"),
+        )
+        assert socket.receive_json() == {
+            "type": "transcript",
+            "role": "user",
+            "text": "今日は",
+            "done": True,
+        }
+
+
+def test_control_emoji_split_across_deltas_is_sanitized_after_accumulation() -> None:
+    session = FakeSession()
+    synthesizer = FakeSynthesizer()
+    app = create_app(
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+        capability_token=CAPABILITY,
+    )
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        receive_ready_catalog(socket)
+        socket.send_json({"type": "start", "sdp": "offer-sdp"})
+        socket.receive_json()
+        socket.receive_json()
+        socket.receive_json()
+        portal = client.portal
+        assert portal is not None
+
+        portal.call(
+            session.emit,
+            TranscriptEvent("delta", "thr_test", "assistant", "😮"),
+        )
+        assert socket.receive_json()["text"] == ""
+        portal.call(
+            session.emit,
+            TranscriptEvent("delta", "thr_test", "assistant", "\u200d💨確認"),
+        )
+        assert socket.receive_json() == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "確認",
+            "done": False,
+        }
+        portal.call(
+            session.emit,
+            TranscriptEvent("done", "thr_test", "assistant", "😮‍💨確認"),
+        )
+        assert socket.receive_json() == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "確認",
+            "done": True,
+        }
+
+        async def wait_for_synthesis() -> None:
+            try:
+                await asyncio.wait_for(synthesizer.synthesized.wait(), timeout=1)
+            except TimeoutError:
+                pytest.fail(
+                    "raw assistant cue was not synthesized within one second; "
+                    f"calls={synthesizer.synthesized_texts!r}",
+                )
+
+        portal.call(wait_for_synthesis)
+
+    assert synthesizer.synthesized_texts == ["😮‍💨確認"]
 
 
 def test_forwards_safe_codex_activity_without_payload_details() -> None:
@@ -993,6 +1311,935 @@ async def test_failed_active_voice_selection_keeps_the_confirmed_voice() -> None
 
     assert websocket.messages == [{"type": "error", "code": "voice_not_available"}]
     assert connection._selected_voice_id == capabilities.voices[0].id  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_audio_delivery_logs_correlated_bounded_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._generation = 9  # noqa: SLF001
+    wav = b"private audio bytes"
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    await connection._deliver_audio(wav, audio_id, 4)  # noqa: SLF001
+
+    started = next(
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_started" in record.message
+    )
+    completed = next(
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_completed" in record.message
+    )
+    for event in (started, completed):
+        assert "audio_id=1" in event
+        assert "boundary=browser_audio" in event
+        assert "generation=4" in event
+        assert f"wav_bytes={len(wav)}" in event
+    assert "duration_ms=" in completed
+    assert "result=ok" in completed
+    assert wav.decode() not in caplog.text
+    assert websocket.messages == [{"type": "audio", "audioId": 1, "generation": 4}]
+    assert websocket.byte_messages == [wav]
+
+
+@pytest.mark.asyncio
+async def test_two_segments_share_unique_correlation_across_audio_stages(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO)
+    await connection._start(StartMessage(sdp="offer-sdp"))  # noqa: SLF001
+    speech = connection._speech  # noqa: SLF001
+    assert speech is not None
+    caplog.clear()
+
+    await speech.on_transcript(role="assistant", delta="一つ。二つ。", done=True)
+    await asyncio.wait_for(speech.join(), timeout=1)
+    for audio_id in (1, 2):
+        for phase in ("started", "completed"):
+            await connection._handle(  # noqa: SLF001
+                json.dumps(
+                    {
+                        "type": "playback",
+                        "phase": phase,
+                        "audio_id": audio_id,
+                        "generation": 0,
+                        "context_state": "running",
+                    },
+                ),
+            )
+
+    def correlations(event_name: str) -> list[tuple[int, int]]:
+        matched: list[tuple[int, int]] = []
+        for record in caplog.records:
+            if f"event={event_name}" not in record.message:
+                continue
+            attributes = dict(
+                field.split("=", maxsplit=1) for field in record.message.split() if "=" in field
+            )
+            matched.append((int(attributes["audio_id"]), int(attributes["generation"])))
+        return matched
+
+    expected = [(1, 0), (2, 0)]
+    assert correlations("synthesis_started") == expected
+    assert correlations("synthesis_completed") == expected
+    assert correlations("audio_delivery_started") == expected
+    assert correlations("audio_delivery_completed") == expected
+    assert correlations("browser_playback") == [(1, 0), (1, 0), (2, 0), (2, 0)]
+    assert "一つ" not in caplog.text
+    assert "二つ" not in caplog.text
+    await connection._close_conversation_resources()  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_audio_delivery_failure_is_logged_once_without_private_exception(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = FailingAudioWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO)
+    queue = SpeechQueue(
+        FakeSynthesizer(),
+        deliver=connection._deliver_audio,  # noqa: SLF001
+        max_chars=80,
+        reserve_audio_id=connection._reserve_audio_id,  # noqa: SLF001
+    )
+    queue.start()
+
+    await queue.on_transcript(role="assistant", delta="失敗する本文。", done=True)
+    await queue.join()
+
+    failures = [
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_failed" in record.message
+    ]
+    assert len(failures) == 1
+    assert "audio_id=1" in failures[0]
+    assert "boundary=browser_audio" in failures[0]
+    assert "generation=0" in failures[0]
+    assert "result=error" in failures[0]
+    assert "private websocket failure detail" not in caplog.text
+    assert "失敗する本文" not in caplog.text
+    assert queue.error_codes == ("audio_delivery_failed",)
+    await queue.close()
+
+
+@pytest.mark.asyncio
+async def test_audio_delivery_cancellation_is_logged_without_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = BlockingAudioWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    delivery = asyncio.create_task(
+        connection._deliver_audio(b"private", audio_id, 0),  # noqa: SLF001
+    )
+    await asyncio.wait_for(websocket.started.wait(), timeout=1)
+
+    delivery.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await delivery
+
+    cancelled = next(
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_cancelled" in record.message
+    )
+    assert "audio_id=1" in cancelled
+    assert "boundary=browser_audio" in cancelled
+    assert "duration_ms=" in cancelled
+    assert "result=error" not in cancelled
+
+
+@pytest.mark.asyncio
+async def test_correlated_browser_playback_logs_only_validated_metadata(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    connection._generation = 4  # noqa: SLF001
+    mark_audio_delivered(connection, 9, 4)
+
+    handled = await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "failed",
+                "audio_id": 9,
+                "generation": 4,
+                "context_state": "suspended",
+            },
+        ),
+    )
+
+    assert handled
+    playback = next(
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    )
+    assert "audio_id=9" in playback
+    assert "context_state=suspended" in playback
+    assert "generation=4" in playback
+    assert "phase=failed" in playback
+    assert "result=error" in playback
+    assert "state=inactive" in playback
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_requires_a_delivered_current_audio(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._lifecycle.enable()  # noqa: SLF001
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    handled = await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": 999,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    assert handled
+    assert not connection._lifecycle.is_busy  # noqa: SLF001
+    assert connection._lifecycle.state.value == "ready"  # noqa: SLF001
+    assert websocket.messages[-1] == {"type": "error", "code": "invalid_message"}
+    assert "event=browser_playback_rejected" in caplog.text
+    assert "event=browser_playback " not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_rejects_stale_replayed_and_out_of_order_transitions(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._lifecycle.enable()  # noqa: SLF001
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    await connection._deliver_audio(b"RIFF-fixture", 1, 0)  # noqa: SLF001
+    completed_before_started = {
+        "type": "playback",
+        "phase": "completed",
+        "audio_id": 1,
+        "generation": 0,
+        "context_state": "running",
+    }
+    await connection._handle(json.dumps(completed_before_started))  # noqa: SLF001
+
+    started = {**completed_before_started, "phase": "started"}
+    await connection._handle(json.dumps(started))  # noqa: SLF001
+    await connection._handle(json.dumps(started))  # noqa: SLF001
+
+    completed = {**completed_before_started, "phase": "completed"}
+    await connection._handle(json.dumps(completed))  # noqa: SLF001
+    await connection._handle(json.dumps(completed))  # noqa: SLF001
+
+    await connection._deliver_audio(b"RIFF-fixture", 2, 0)  # noqa: SLF001
+    connection._generation = 1  # noqa: SLF001
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": 2,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    playback = [
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    ]
+    rejected = [
+        record.message
+        for record in caplog.records
+        if "event=browser_playback_rejected" in record.message
+    ]
+    assert ["phase=started" in event for event in playback] == [True, False]
+    assert len(rejected) == 4
+    assert not connection._lifecycle.is_busy  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_playback_ack_waits_for_in_flight_audio_delivery(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = GatedAudioWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._lifecycle.enable()  # noqa: SLF001
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    delivery = asyncio.create_task(
+        connection._deliver_audio(b"RIFF-fixture", 1, 0),  # noqa: SLF001
+    )
+    await asyncio.wait_for(websocket.started.wait(), timeout=1)
+    acknowledgement = asyncio.create_task(
+        connection._handle(  # noqa: SLF001
+            json.dumps(
+                {
+                    "type": "playback",
+                    "phase": "started",
+                    "audio_id": 1,
+                    "generation": 0,
+                    "context_state": "running",
+                },
+            ),
+        ),
+    )
+    await asyncio.sleep(0)
+    assert not acknowledgement.done()
+
+    websocket.release.set()
+    await asyncio.wait_for(delivery, timeout=1)
+    assert await asyncio.wait_for(acknowledgement, timeout=1)
+
+    assert websocket.messages == [{"type": "audio", "audioId": 1, "generation": 0}]
+    assert connection._lifecycle.is_busy  # noqa: SLF001
+    assert "event=browser_playback " in caplog.text
+    assert "event=browser_playback_rejected" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_matches_first_audio_and_does_not_rearm(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((1_000_000_000, 1_123_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    private_text = "ログに残してはいけない最初の応答"
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", private_text),
+    )
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, audio_id, 0)
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id + 1,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "後続delta"),
+    )
+
+    playback = [
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    ]
+    assert len(playback) == 1
+    assert "duration_ms=123" in playback[0]
+    assert private_text not in caplog.text
+    assert connection._first_playback_started_ns is None  # noqa: SLF001
+    assert connection._first_playback_audio_id is None  # noqa: SLF001
+    assert connection._first_playback_generation is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_starts_at_first_non_empty_assistant_event(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((2_000_000_000, 2_041_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    private_text = "ログに残してはいけない非空の応答"
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", ""),
+    )
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (None, None, None)
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", private_text),
+    )
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (2_000_000_000, None, None)
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, audio_id, 0)
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    playback = next(
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    )
+    assert "duration_ms=41" in playback
+    assert private_text not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_generation_mismatch_preserves_timing(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((3_000_000_000, 3_222_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    private_text = "generation不一致でもログに残さない応答"
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", private_text),
+    )
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, audio_id, 0)
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id,
+                "generation": 1,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    assert "event=browser_playback_rejected" in caplog.text
+    assert "event=browser_playback " not in caplog.text
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (3_000_000_000, audio_id, 0)
+
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    playback = [
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    ]
+    assert "duration_ms=222" in playback[0]
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (None, None, None)
+    assert private_text not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_out_of_order_completion_preserves_timing(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((4_000_000_000, 4_375_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    private_text = "非開始phaseでもログに残さない応答"
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", private_text),
+    )
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, audio_id, 0)
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "completed",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    assert "event=browser_playback_rejected" in caplog.text
+    assert "event=browser_playback " not in caplog.text
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (4_000_000_000, audio_id, 0)
+
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+
+    playback = [
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    ]
+    assert "duration_ms=375" in playback[0]
+    timing = (
+        connection._first_playback_started_ns,  # noqa: SLF001
+        connection._first_playback_audio_id,  # noqa: SLF001
+        connection._first_playback_generation,  # noqa: SLF001
+    )
+    assert timing == (None, None, None)
+    assert private_text not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_failed_phase_is_terminal(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((8_000_000, 20_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", "失敗する応答。"),
+    )
+    audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, audio_id, 0)
+    await connection._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "failed",
+                "audio_id": audio_id,
+                "generation": 0,
+                "context_state": "suspended",
+            },
+        ),
+    )
+
+    playback = next(
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    )
+    assert "duration_ms" not in playback
+    assert connection._first_playback_started_ns is None  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_discards_previous_turn_timing(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    clock = iter((1_000_000_000, 2_000_000_000, 2_250_000_000))
+    monkeypatch.setattr("moco.web.app.time.monotonic_ns", lambda: next(clock))
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "古い応答"),
+    )
+    old_audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", "古い応答です。"),
+    )
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "新しい応答"),
+    )
+    new_audio_id = connection._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(connection, old_audio_id, 0)
+    mark_audio_delivered(connection, new_audio_id, 0)
+    for audio_id in (old_audio_id, new_audio_id):
+        await connection._handle(  # noqa: SLF001
+            json.dumps(
+                {
+                    "type": "playback",
+                    "phase": "started",
+                    "audio_id": audio_id,
+                    "generation": 0,
+                    "context_state": "running",
+                },
+            ),
+        )
+
+    playback = [
+        record.message for record in caplog.records if "event=browser_playback " in record.message
+    ]
+    assert "duration_ms" not in playback[0]
+    assert "duration_ms=250" in playback[1]
+
+
+@pytest.mark.asyncio
+async def test_first_playback_duration_is_cleared_by_user_invalidation_and_close() -> None:
+    invalidated = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    await invalidated._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "中断される応答"),
+    )
+    invalidated_audio_id = invalidated._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(invalidated, invalidated_audio_id, 0)
+    await invalidated._handle(  # noqa: SLF001
+        json.dumps(
+            {
+                "type": "playback",
+                "phase": "started",
+                "audio_id": invalidated_audio_id,
+                "generation": 0,
+                "context_state": "running",
+            },
+        ),
+    )
+    was_busy = invalidated._lifecycle.is_busy  # noqa: SLF001
+    assert was_busy
+    await invalidated._invalidate_speech()  # noqa: SLF001
+    assert invalidated._first_playback_started_ns is None  # noqa: SLF001
+    assert invalidated._first_playback_audio_id is None  # noqa: SLF001
+    assert invalidated._first_playback_generation is None  # noqa: SLF001
+    assert invalidated._playback_states == {}  # noqa: SLF001
+    assert not invalidated._lifecycle.is_busy  # noqa: SLF001
+
+    closed = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    await closed._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "閉じられる応答"),
+    )
+    closed_audio_id = closed._reserve_audio_id()  # noqa: SLF001
+    mark_audio_delivered(closed, closed_audio_id, 0)
+    await closed._close_conversation_resources()  # noqa: SLF001
+    assert closed._first_playback_started_ns is None  # noqa: SLF001
+    assert closed._first_playback_audio_id is None  # noqa: SLF001
+    assert closed._first_playback_generation is None  # noqa: SLF001
+    assert closed._playback_states == {}  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_invalidate_before_cancel_cleanup_reaches_browser_first() -> None:
+    websocket = InvalidationObservingWebSocket()
+    synthesizer = CancellationCleanupSynthesizer()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+    )
+    speech = SpeechQueue(
+        synthesizer,
+        deliver=connection._deliver_audio,  # noqa: SLF001
+        max_chars=80,
+    )
+    connection._speech = speech  # noqa: SLF001
+    speech.start()
+    await speech.on_transcript(role="assistant", delta="取り消す応答。", done=True)
+    await asyncio.wait_for(synthesizer.synthesized.wait(), timeout=1)
+
+    user_transcript = asyncio.create_task(
+        connection._handle_transcript(  # noqa: SLF001
+            TranscriptEvent("delta", "thr_test", "user", "割り込み"),
+        ),
+    )
+    await asyncio.wait_for(websocket.invalidation_sent.wait(), timeout=1)
+    await asyncio.wait_for(synthesizer.cancellation_started.wait(), timeout=1)
+
+    assert not user_transcript.done()
+    assert websocket.messages[0] == {"type": "audio_invalidate", "generation": 1}
+    synthesizer.release_cancellation.set()
+    await asyncio.wait_for(user_transcript, timeout=1)
+    await speech.close()
+
+
+@pytest.mark.asyncio
+async def test_invalidate_cancels_blocked_audio_delivery_before_sending_notice() -> None:
+    websocket = GatedAudioWebSocket()
+    synthesizer = FakeSynthesizer()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+    )
+    speech = SpeechQueue(
+        synthesizer,
+        deliver=connection._deliver_audio,  # noqa: SLF001
+        max_chars=80,
+    )
+    connection._speech = speech  # noqa: SLF001
+    speech.start()
+    await speech.on_transcript(role="assistant", delta="取り消す応答。", done=True)
+    await asyncio.wait_for(websocket.started.wait(), timeout=1)
+
+    invalidation = asyncio.create_task(connection._invalidate_speech())  # noqa: SLF001
+    try:
+        await asyncio.wait_for(asyncio.shield(invalidation), timeout=0.1)
+    finally:
+        websocket.release.set()
+        await asyncio.wait_for(invalidation, timeout=1)
+        await speech.close()
+
+    assert websocket.messages == [
+        {"type": "audio", "audioId": 1, "generation": 0},
+        {"type": "audio_invalidate", "generation": 1},
+    ]
+    assert websocket.byte_messages == []
+
+
+@pytest.mark.asyncio
+async def test_invalidate_send_failure_still_invalidates_speech() -> None:
+    websocket = InvalidationObservingWebSocket(fail=True)
+    speech = RecordingSpeechInvalidation()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+
+    with pytest.raises(AudioDeliveryError):
+        await connection._invalidate_speech()  # noqa: SLF001
+
+    assert speech.reasons == ["user_transcript"]
+
+
+@pytest.mark.asyncio
+async def test_uncorrelated_stopped_playback_is_rejected(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    handled = await connection._handle(  # noqa: SLF001
+        json.dumps({"type": "playback", "active": False, "phase": "stopped"}),
+    )
+
+    assert handled
+    assert websocket.messages == [{"type": "error", "code": "invalid_message"}]
+    assert "event=browser_playback " not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_recreated_speech_queue_preserves_generation_across_audio_stages(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    websocket = CapturingWebSocket()
+    synthesizers = [FakeSynthesizer(), FakeSynthesizer()]
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizers.pop(0)),
+    )
+    caplog.set_level(logging.INFO)
+
+    await connection._start(StartMessage(sdp="offer-sdp"))  # noqa: SLF001
+    first_speech = connection._speech  # noqa: SLF001
+    assert first_speech is not None
+    caplog.clear()
+    await first_speech.on_transcript(role="assistant", delta="再開前の音声。", done=True)
+    await asyncio.wait_for(first_speech.join(), timeout=1)
+    first_synthesis = next(
+        record.message for record in caplog.records if "event=synthesis_started" in record.message
+    )
+    first_delivery = next(
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_completed" in record.message
+    )
+    assert "audio_id=1" in first_synthesis
+    assert "generation=0" in first_synthesis
+    assert "audio_id=1" in first_delivery
+    assert "generation=0" in first_delivery
+
+    await connection._invalidate_speech()  # noqa: SLF001
+    assert connection._generation == 1  # noqa: SLF001
+    invalidated = next(
+        record.message for record in caplog.records if "event=speech_invalidated" in record.message
+    )
+    assert "generation=1" in invalidated
+    await connection._close_conversation_resources()  # noqa: SLF001
+
+    await connection._start(StartMessage(sdp="offer-sdp"))  # noqa: SLF001
+    speech = connection._speech  # noqa: SLF001
+    assert speech is not None
+    caplog.clear()
+    await speech.on_transcript(role="assistant", delta="再開後の音声。", done=True)
+    await asyncio.wait_for(speech.join(), timeout=1)
+
+    synthesis = next(
+        record.message for record in caplog.records if "event=synthesis_started" in record.message
+    )
+    delivery = next(
+        record.message
+        for record in caplog.records
+        if "event=audio_delivery_completed" in record.message
+    )
+    assert "generation=1" in synthesis
+    assert "audio_id=2" in synthesis
+    assert "generation=1" in delivery
+    assert "audio_id=2" in delivery
+    audio_headers = [message for message in websocket.messages if message.get("type") == "audio"]
+    assert audio_headers == [
+        {"type": "audio", "audioId": 1, "generation": 0},
+        {"type": "audio", "audioId": 2, "generation": 1},
+    ]
+    assert "再開後の音声" not in caplog.text
+    await connection._close_conversation_resources()  # noqa: SLF001
 
 
 @pytest.mark.asyncio
