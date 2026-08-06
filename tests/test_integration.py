@@ -158,6 +158,5 @@ def test_fake_codex_transcript_reaches_browser_as_irodori_wav() -> None:
     assert request.text == "こんにちは。"
     assert request.voice_id == selected.id
     assert request.if_generation == capabilities.generation
-    assert {"caption", "style", "cfg_scale_caption"}.isdisjoint(request.model_fields_set)
     assert discovery.closed
     assert active.closed

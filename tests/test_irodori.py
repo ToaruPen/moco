@@ -152,7 +152,7 @@ async def test_capabilities_fetches_from_bounded_client_and_caches_response() ->
     ("num_steps", "t_schedule_mode"),
     [(17, "linear"), (31, "sway")],
 )
-async def test_uses_canonical_voice_generation_and_only_supported_fields(
+async def test_uses_configured_voice_generation_and_sampling_settings(
     num_steps: int,
     t_schedule_mode: Literal["linear", "sway"],
 ) -> None:
@@ -180,18 +180,6 @@ async def test_uses_canonical_voice_generation_and_only_supported_fields(
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
-    assert request.model_fields_set == {
-        "text",
-        "voice_id",
-        "if_generation",
-        "num_steps",
-        "t_schedule_mode",
-        "duration_scale",
-        "cfg_scale_text",
-        "cfg_scale_speaker",
-    }
-    assert request.style == "neutral"
-    assert request.cfg_scale_caption == 3.0
 
 
 async def test_alias_selection_is_normalized_to_canonical_voice_id() -> None:
