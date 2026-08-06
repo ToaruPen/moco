@@ -27,18 +27,244 @@ const {
   setTransportOffline,
   shouldHandleHotkey,
   ThemePanel,
+  TranscriptView,
   VoiceModelController,
   waitForIce,
   waitForSocketOpen,
   watchPeerFailure,
 } = appModule;
 
+describe("TranscriptView", () => {
+  it("replaces an active utterance with each authoritative text update", () => {
+    assert.equal(typeof TranscriptView, "function", "TranscriptView must be exported");
+    const dom = new JSDOM(`
+      <section id="transcript"><p class="transcript-empty">Empty</p></section>
+    `);
+    const container = dom.window.document.querySelector("#transcript");
+    const view = new TranscriptView(container);
+
+    view.update("user", "きょは", false);
+    view.update("user", "今日は", true);
+
+    assert.equal(container.querySelectorAll(".utterance").length, 1);
+    assert.equal(container.querySelector(".utterance-text").textContent, "今日は");
+  });
+});
+
 describe("AudioPlaybackQueue", () => {
+  function createPlaybackQueue(context, onState, onError = () => {}) {
+    const timers = {
+      set(callback, delayMs) {
+        context.currentTime += delayMs / 1000;
+        callback();
+        return 0;
+      },
+      clear() {},
+    };
+    return new AudioPlaybackQueue(context, onState, onError, timers);
+  }
+
+  it("resumes a suspended context before decoding and tracks correlated playback", async () => {
+    const order = [];
+    const states = [];
+    const source = new EventTarget();
+    source.connect = () => {};
+    source.start = () => order.push("start");
+    const context = {
+      state: "suspended",
+      currentTime: 0,
+      destination: {},
+      async resume() {
+        order.push("resume");
+        this.state = "running";
+      },
+      async decodeAudioData() {
+        order.push("decode");
+        return { duration: 0.1 };
+      },
+      createBufferSource: () => source,
+    };
+    const metadata = { audioId: 7, generation: 3 };
+    const queue = createPlaybackQueue(context, (active, correlated, contextState, phase) =>
+      states.push({ active, metadata: correlated, contextState, phase }),
+    );
+
+    queue.enqueue(new ArrayBuffer(1), metadata);
+    await assert.doesNotReject(queue.chain);
+
+    assert.deepEqual(order, ["resume", "decode", "start"]);
+    assert.equal(queue.sources.has(source), true);
+    assert.deepEqual(states, [
+      { active: true, metadata, contextState: "running", phase: "started" },
+    ]);
+
+    source.dispatchEvent(new Event("ended"));
+
+    assert.equal(queue.sources.has(source), false);
+    assert.deepEqual(states.at(-1), {
+      active: false,
+      metadata,
+      contextState: "running",
+      phase: "completed",
+    });
+  });
+
+  it("reports every source completion while aggregate playback remains active", async () => {
+    const events = [];
+    const activity = [];
+    const sources = [new EventTarget(), new EventTarget()];
+    for (const source of sources) {
+      source.connect = () => {};
+      source.start = () => {};
+    }
+    const context = {
+      state: "running",
+      currentTime: 0,
+      destination: {},
+      async decodeAudioData() {
+        return { duration: 0.1 };
+      },
+      createBufferSource: () => sources.shift(),
+    };
+    let playbackActive = false;
+    const queue = createPlaybackQueue(context, (active, metadata, contextState, phase) => {
+      events.push({ active, metadata, contextState, phase });
+      if (playbackActive !== active) {
+        playbackActive = active;
+        activity.push(active ? "started" : "completed");
+      }
+    });
+    const first = { audioId: 1, generation: 0 };
+    const second = { audioId: 2, generation: 0 };
+    const [firstSource, secondSource] = [...sources];
+
+    queue.enqueue(new ArrayBuffer(1), first);
+    queue.enqueue(new ArrayBuffer(1), second);
+    await assert.doesNotReject(queue.chain);
+    firstSource.dispatchEvent(new Event("ended"));
+
+    assert.deepEqual(events.at(-1), {
+      active: true,
+      metadata: first,
+      contextState: "running",
+      phase: "completed",
+    });
+    assert.deepEqual(activity, ["started"]);
+
+    secondSource.dispatchEvent(new Event("ended"));
+
+    assert.deepEqual(events.at(-1), {
+      active: false,
+      metadata: second,
+      contextState: "running",
+      phase: "completed",
+    });
+    assert.deepEqual(activity, ["started", "completed"]);
+  });
+
+  it("reports resume failure without playing and recovers on a later enqueue", async () => {
+    const errors = [];
+    const events = [];
+    let resumeAttempts = 0;
+    const context = {
+      state: "suspended",
+      currentTime: 0,
+      destination: {},
+      async resume() {
+        resumeAttempts += 1;
+        if (resumeAttempts === 1) {
+          throw new Error("activation denied");
+        }
+        this.state = "running";
+      },
+      async decodeAudioData() {
+        return { duration: 0.1 };
+      },
+      createBufferSource() {
+        const source = new EventTarget();
+        source.connect = () => {};
+        source.start = () => {};
+        return source;
+      },
+    };
+    const queue = createPlaybackQueue(
+      context,
+      (active, metadata, contextState, phase) =>
+        events.push({ active, metadata, contextState, phase }),
+      (code) => errors.push(code),
+    );
+
+    const failed = { audioId: 8, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), failed);
+    await assert.doesNotReject(queue.chain);
+    assert.equal(queue.isPlaying, false);
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata: failed,
+        contextState: "suspended",
+        phase: "failed",
+      },
+    ]);
+
+    const recovered = { audioId: 9, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), recovered);
+    await assert.doesNotReject(queue.chain);
+
+    assert.equal(resumeAttempts, 2);
+    assert.deepEqual(errors, ["audio_resume_failed"]);
+    assert.equal(queue.isPlaying, true);
+    assert.deepEqual(events.at(-1), {
+      active: true,
+      metadata: recovered,
+      contextState: "running",
+      phase: "started",
+    });
+  });
+
+  it("reports resume failure when a suspended context stays suspended", async () => {
+    const errors = [];
+    const events = [];
+    let decodeCalls = 0;
+    const context = {
+      state: "suspended",
+      currentTime: 0,
+      async resume() {},
+      async decodeAudioData() {
+        decodeCalls += 1;
+        return { duration: 0.1 };
+      },
+    };
+    const queue = createPlaybackQueue(
+      context,
+      (active, metadata, contextState, phase) =>
+        events.push({ active, metadata, contextState, phase }),
+      (code) => errors.push(code),
+    );
+
+    const metadata = { audioId: 10, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), metadata);
+    await assert.doesNotReject(queue.chain);
+
+    assert.equal(decodeCalls, 0);
+    assert.equal(queue.isPlaying, false);
+    assert.deepEqual(errors, ["audio_resume_failed"]);
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata,
+        contextState: "suspended",
+        phase: "failed",
+      },
+    ]);
+  });
+
   it("reports a decode error and continues with later audio", async () => {
     const errors = [];
-    const states = [];
+    const events = [];
     let attempts = 0;
     const context = {
+      state: "running",
       currentTime: 0,
       destination: {},
       async decodeAudioData() {
@@ -55,31 +281,48 @@ describe("AudioPlaybackQueue", () => {
         return source;
       },
     };
-    const queue = new AudioPlaybackQueue(
+    const queue = createPlaybackQueue(
       context,
-      (active) => states.push(active),
+      (active, metadata, contextState, phase) =>
+        events.push({ active, metadata, contextState, phase }),
       (code) => errors.push(code),
     );
 
-    queue.enqueue(new ArrayBuffer(1));
+    const failed = { audioId: 11, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), failed);
     await assert.doesNotReject(queue.chain);
-    queue.enqueue(new ArrayBuffer(1));
+    const recovered = { audioId: 12, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), recovered);
     await assert.doesNotReject(queue.chain);
 
     assert.equal(attempts, 2);
     assert.deepEqual(errors, ["audio_decode_failed"]);
-    assert.deepEqual(states, [false, true]);
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata: failed,
+        contextState: "running",
+        phase: "failed",
+      },
+      {
+        active: true,
+        metadata: recovered,
+        contextState: "running",
+        phase: "started",
+      },
+    ]);
   });
 
   it("recovers when an audio source cannot start", async () => {
     const errors = [];
-    const states = [];
+    const events = [];
     const source = new EventTarget();
     source.connect = () => {};
     source.start = () => {
       throw new Error("output unavailable");
     };
     const context = {
+      state: "running",
       currentTime: 0,
       destination: {},
       async decodeAudioData() {
@@ -87,18 +330,352 @@ describe("AudioPlaybackQueue", () => {
       },
       createBufferSource: () => source,
     };
-    const queue = new AudioPlaybackQueue(
+    const queue = createPlaybackQueue(
       context,
-      (active) => states.push(active),
+      (active, metadata, contextState, phase) =>
+        events.push({ active, metadata, contextState, phase }),
       (code) => errors.push(code),
     );
 
-    queue.enqueue(new ArrayBuffer(1));
+    const metadata = { audioId: 13, generation: 3 };
+    queue.enqueue(new ArrayBuffer(1), metadata);
     await assert.doesNotReject(queue.chain);
 
     assert.equal(queue.isPlaying, false);
-    assert.deepEqual(states, [false]);
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata,
+        contextState: "running",
+        phase: "failed",
+      },
+    ]);
     assert.deepEqual(errors, ["audio_start_failed"]);
+  });
+
+  it("reports an uncorrelated stopped phase for invalidation", async () => {
+    const events = [];
+    const source = new EventTarget();
+    source.connect = () => {};
+    source.start = () => {};
+    source.stop = () => source.dispatchEvent(new Event("ended"));
+    const context = {
+      state: "running",
+      currentTime: 0,
+      destination: {},
+      async decodeAudioData() {
+        return { duration: 0.1 };
+      },
+      createBufferSource: () => source,
+    };
+    const queue = createPlaybackQueue(context, (active, metadata, contextState, phase) =>
+      events.push({ active, metadata, contextState, phase }),
+    );
+
+    queue.enqueue(new ArrayBuffer(1), { audioId: 14, generation: 3 });
+    await assert.doesNotReject(queue.chain);
+    events.length = 0;
+    queue.stop();
+
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata: undefined,
+        contextState: undefined,
+        phase: "stopped",
+      },
+    ]);
+  });
+
+  it("skips stale queued audio and suppresses an in-flight stale failure", async () => {
+    const decodeCalls = [];
+    const errors = [];
+    const events = [];
+    const starts = [];
+    let rejectStale;
+    const context = {
+      state: "running",
+      currentTime: 0,
+      destination: {},
+      decodeAudioData(bytes) {
+        const id = new Uint8Array(bytes)[0];
+        decodeCalls.push(id);
+        if (id === 15) {
+          return new Promise((_resolve, reject) => {
+            rejectStale = reject;
+          });
+        }
+        return Promise.resolve({ duration: 0.1 });
+      },
+      createBufferSource() {
+        const source = new EventTarget();
+        source.connect = () => {};
+        source.start = () => starts.push(true);
+        return source;
+      },
+    };
+    const queue = createPlaybackQueue(
+      context,
+      (active, metadata, contextState, phase) =>
+        events.push({ active, metadata, contextState, phase }),
+      (code) => errors.push(code),
+    );
+    const staleInFlight = { audioId: 15, generation: 3 };
+    const staleQueued = { audioId: 16, generation: 3 };
+    const current = { audioId: 17, generation: 4 };
+
+    queue.enqueue(Uint8Array.of(15).buffer, staleInFlight);
+    await Promise.resolve();
+    queue.enqueue(Uint8Array.of(16).buffer, staleQueued);
+    queue.stop();
+    queue.enqueue(Uint8Array.of(17).buffer, current);
+    rejectStale(new Error("stale decode failed"));
+    await assert.doesNotReject(queue.chain);
+
+    assert.deepEqual(decodeCalls, [15, 17]);
+    assert.deepEqual(errors, []);
+    assert.deepEqual(events, [
+      {
+        active: false,
+        metadata: undefined,
+        contextState: undefined,
+        phase: "stopped",
+      },
+      {
+        active: true,
+        metadata: current,
+        contextState: "running",
+        phase: "started",
+      },
+    ]);
+    assert.equal(starts.length, 1);
+  });
+
+  it("skips stale audio after an in-flight resume completes", async () => {
+    const decodeCalls = [];
+    const events = [];
+    let finishResume;
+    const context = {
+      state: "suspended",
+      currentTime: 0,
+      destination: {},
+      resume() {
+        return new Promise((resolve) => {
+          finishResume = () => {
+            this.state = "running";
+            resolve();
+          };
+        });
+      },
+      async decodeAudioData(bytes) {
+        decodeCalls.push(new Uint8Array(bytes)[0]);
+        return { duration: 0.1 };
+      },
+      createBufferSource() {
+        const source = new EventTarget();
+        source.connect = () => {};
+        source.start = () => {};
+        return source;
+      },
+    };
+    const queue = createPlaybackQueue(context, (active, metadata, contextState, phase) =>
+      events.push({ active, metadata, contextState, phase }),
+    );
+    const current = { audioId: 19, generation: 4 };
+
+    queue.enqueue(Uint8Array.of(18).buffer, { audioId: 18, generation: 3 });
+    await Promise.resolve();
+    queue.stop();
+    queue.enqueue(Uint8Array.of(19).buffer, current);
+    finishResume();
+    await assert.doesNotReject(queue.chain);
+
+    assert.deepEqual(decodeCalls, [19]);
+    assert.deepEqual(events.at(-1), {
+      active: true,
+      metadata: current,
+      contextState: "running",
+      phase: "started",
+    });
+  });
+
+  it("preserves aggregate activity and scheduling after a queued decode failure", async () => {
+    const events = [];
+    const activity = [];
+    const starts = [];
+    let decodeCalls = 0;
+    const context = {
+      state: "running",
+      currentTime: 0,
+      destination: {},
+      async decodeAudioData() {
+        decodeCalls += 1;
+        if (decodeCalls === 2) {
+          throw new Error("invalid wav");
+        }
+        return { duration: decodeCalls === 1 ? 1 : 0.1 };
+      },
+      createBufferSource() {
+        const source = new EventTarget();
+        source.connect = () => {};
+        source.start = (startAt) => starts.push(startAt);
+        return source;
+      },
+    };
+    let playbackActive = false;
+    const queue = createPlaybackQueue(context, (active, metadata, contextState, phase) => {
+      events.push({ active, metadata, contextState, phase });
+      if (playbackActive !== active) {
+        playbackActive = active;
+        activity.push(active ? "started" : "completed");
+      }
+    });
+    const failed = { audioId: 21, generation: 4 };
+
+    queue.enqueue(new ArrayBuffer(1), { audioId: 20, generation: 4 });
+    queue.enqueue(new ArrayBuffer(1), failed);
+    queue.enqueue(new ArrayBuffer(1), { audioId: 22, generation: 4 });
+    await assert.doesNotReject(queue.chain);
+
+    assert.deepEqual(events[1], {
+      active: true,
+      metadata: failed,
+      contextState: "running",
+      phase: "failed",
+    });
+    assert.deepEqual(activity, ["started"]);
+    assert.deepEqual(starts, [0.02, 1.02]);
+  });
+
+  it("does not acknowledge playback before the scheduled audio time", async () => {
+    const events = [];
+    const scheduled = [];
+    const source = new EventTarget();
+    source.connect = () => {};
+    source.start = () => {};
+    const context = {
+      state: "running",
+      currentTime: 5,
+      destination: {},
+      async decodeAudioData() {
+        return { duration: 0.1 };
+      },
+      createBufferSource: () => source,
+    };
+    const timers = {
+      set(callback, delayMs) {
+        const handle = scheduled.length;
+        scheduled.push({ callback, delayMs, handle });
+        return handle;
+      },
+      clear() {},
+    };
+    const metadata = { audioId: 23, generation: 4 };
+    const queue = new AudioPlaybackQueue(
+      context,
+      (active, correlated, contextState, phase) =>
+        events.push({ active, metadata: correlated, contextState, phase }),
+      () => {},
+      timers,
+    );
+
+    queue.enqueue(new ArrayBuffer(1), metadata);
+    await assert.doesNotReject(queue.chain);
+
+    assert.deepEqual(events, []);
+    assert.ok(scheduled[0].delayMs >= 19.9);
+    context.currentTime = 5.019;
+    scheduled[0].callback();
+    assert.deepEqual(events, []);
+
+    context.currentTime = 5.02;
+    scheduled[1].callback();
+    assert.deepEqual(events, [
+      { active: true, metadata, contextState: "running", phase: "started" },
+    ]);
+  });
+
+  it("acknowledges a short playback before completion when its timer is delayed", async () => {
+    const events = [];
+    const scheduled = [];
+    const source = new EventTarget();
+    source.connect = () => {};
+    source.start = () => {};
+    const context = {
+      state: "running",
+      currentTime: 5,
+      destination: {},
+      async decodeAudioData() {
+        return { duration: 0.01 };
+      },
+      createBufferSource: () => source,
+    };
+    const timers = {
+      set(callback, delayMs) {
+        const handle = scheduled.length;
+        scheduled.push({ callback, delayMs, handle });
+        return handle;
+      },
+      clear() {},
+    };
+    const metadata = { audioId: 24, generation: 4 };
+    const queue = new AudioPlaybackQueue(
+      context,
+      (active, correlated, contextState, phase) =>
+        events.push({ active, metadata: correlated, contextState, phase }),
+      () => {},
+      timers,
+    );
+
+    queue.enqueue(new ArrayBuffer(1), metadata);
+    await assert.doesNotReject(queue.chain);
+    assert.deepEqual(events, []);
+
+    context.currentTime = 5.1;
+    source.dispatchEvent(new Event("ended"));
+
+    assert.deepEqual(events, [
+      { active: true, metadata, contextState: "running", phase: "started" },
+      { active: false, metadata, contextState: "running", phase: "completed" },
+    ]);
+  });
+
+  it("lets current audio start while a stale decode remains unresolved", async () => {
+    const starts = [];
+    let finishStaleDecode;
+    const context = {
+      state: "running",
+      currentTime: 0,
+      destination: {},
+      decodeAudioData(bytes) {
+        const id = new Uint8Array(bytes)[0];
+        if (id === 24) {
+          return new Promise((resolve) => {
+            finishStaleDecode = resolve;
+          });
+        }
+        return Promise.resolve({ duration: 0.1 });
+      },
+      createBufferSource() {
+        const source = new EventTarget();
+        source.connect = () => {};
+        source.start = () => starts.push(true);
+        return source;
+      },
+    };
+    const queue = createPlaybackQueue(context, () => {});
+
+    queue.enqueue(Uint8Array.of(24).buffer, { audioId: 24, generation: 4 });
+    await Promise.resolve();
+    queue.stop();
+    queue.enqueue(Uint8Array.of(25).buffer, { audioId: 25, generation: 5 });
+    await new Promise((resolve) => setImmediate(resolve));
+    const currentStartedWhileStalePending = starts.length === 1;
+
+    finishStaleDecode({ duration: 0.1 });
+    await assert.doesNotReject(queue.chain);
+
+    assert.equal(currentStartedWhileStalePending, true);
   });
 });
 
@@ -107,7 +684,11 @@ function harness() {
   const track = { enabled: false };
   const playback = {
     isPlaying: true,
+    enqueues: [],
     stops: 0,
+    enqueue(bytes, metadata) {
+      this.enqueues.push({ bytes, metadata });
+    },
     stop() {
       this.isPlaying = false;
       this.stops += 1;
@@ -123,6 +704,26 @@ function harness() {
 }
 
 describe("MocoController", () => {
+  it("passes matching server audio metadata into playback", () => {
+    const { controller, playback } = harness();
+    const bytes = new ArrayBuffer(1);
+    const metadata = { audioId: 17, generation: controller.audioGeneration };
+
+    controller.acceptAudio(metadata);
+    controller.consumeAudio(bytes);
+
+    assert.deepEqual(playback.enqueues, [{ bytes, metadata }]);
+  });
+
+  it("discards audio whose generation does not match", () => {
+    const { controller, playback } = harness();
+
+    controller.acceptAudio({ audioId: 17, generation: controller.audioGeneration + 1 });
+    controller.consumeAudio(new ArrayBuffer(1));
+
+    assert.deepEqual(playback.enqueues, []);
+  });
+
   it("keeps the microphone enabled until listening is explicitly stopped", async () => {
     const { controller, track } = harness();
 

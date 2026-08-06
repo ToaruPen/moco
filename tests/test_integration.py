@@ -147,7 +147,7 @@ def test_fake_codex_transcript_reaches_browser_as_irodori_wav() -> None:
     assert transcript == {
         "type": "transcript",
         "role": "assistant",
-        "delta": "こんにちは。",
+        "text": "こんにちは。",
         "done": True,
     }
     assert audio["type"] == "audio"

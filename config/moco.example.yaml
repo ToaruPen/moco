@@ -42,6 +42,8 @@ irodori:
 
 speech:
   segment_max_chars: 80
+  # Disabled until the adaptive first-segment rollout gates are approved.
+  first_segment_soft_break_min_chars: null
   vad_threshold: 0.04
   vad_hold_ms: 120
 

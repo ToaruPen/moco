@@ -224,8 +224,20 @@ class IrodoriSettings(StrictSettings):
 
 class SpeechSettings(StrictSettings):
     segment_max_chars: PositiveInt = 80
+    first_segment_soft_break_min_chars: PositiveInt | None = Field(
+        default=None,
+        strict=True,
+    )
     vad_threshold: VadThreshold = 0.04
     vad_hold_ms: PositiveInt = 120
+
+    @model_validator(mode="after")
+    def _validate_segment_limits(self) -> Self:
+        minimum = self.first_segment_soft_break_min_chars
+        if minimum is not None and minimum > self.segment_max_chars:
+            msg = "first_segment_soft_break_min_chars must not exceed segment_max_chars"
+            raise ValueError(msg)
+        return self
 
 
 class TelemetrySettings(StrictSettings):
