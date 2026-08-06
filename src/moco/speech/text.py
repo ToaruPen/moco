@@ -161,8 +161,8 @@ class TranscriptSegmenter:
         minimum = self._first_segment_soft_break_min_chars
         if minimum is None:
             return None
-        for index, character in enumerate(self._buffer):
-            if character in SOFT_BREAKS and index + 1 >= minimum:
+        for index in range(min(len(self._buffer), self._max_chars)):
+            if self._buffer[index] in SOFT_BREAKS and index + 1 >= minimum:
                 return index + 1
         return None
 

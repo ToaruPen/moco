@@ -4,7 +4,7 @@ import logging
 import re
 import sys
 import threading
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, cast
 
@@ -15,6 +15,7 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import (
     BatchSpanProcessor,
     ConsoleSpanExporter,
+    SpanExporter,
 )
 
 if TYPE_CHECKING:
@@ -167,27 +168,49 @@ def safe_event(
     logger.info("event=%s %s", event, details)
 
 
+def _add_batch_span_processor(
+    provider: TracerProvider,
+    exporter: SpanExporter,
+) -> None:
+    processor = BatchSpanProcessor(exporter)
+    try:
+        provider.add_span_processor(processor)
+    except BaseException:
+        with suppress(BaseException):
+            processor.shutdown()  # type: ignore[no-untyped-call]
+        raise
+
+
 def configure_telemetry(settings: TelemetrySettings) -> TelemetryRuntime:
     resource = Resource.create({"service.name": settings.service_name})
     provider = TracerProvider(resource=resource, shutdown_on_exit=False)
     exporter_names: list[str] = []
-    if settings.console:
-        _acquire_console_logging()
-        provider.add_span_processor(BatchSpanProcessor(ConsoleSpanExporter()))
-        exporter_names.append("console")
-    if settings.otlp_endpoint is not None:
-        provider.add_span_processor(
-            BatchSpanProcessor(
+    console_acquired = False
+    try:
+        if settings.console:
+            _acquire_console_logging()
+            console_acquired = True
+            _add_batch_span_processor(provider, ConsoleSpanExporter())
+            exporter_names.append("console")
+        if settings.otlp_endpoint is not None:
+            _add_batch_span_processor(
+                provider,
                 OTLPSpanExporter(endpoint=str(settings.otlp_endpoint)),
-            ),
+            )
+            exporter_names.append("otlp_http")
+        return TelemetryRuntime(
+            provider=provider,
+            tracer=provider.get_tracer("moco"),
+            exporter_names=tuple(exporter_names),
+            console_logging=settings.console,
         )
-        exporter_names.append("otlp_http")
-    return TelemetryRuntime(
-        provider=provider,
-        tracer=provider.get_tracer("moco"),
-        exporter_names=tuple(exporter_names),
-        console_logging=settings.console,
-    )
+    except BaseException:
+        with suppress(BaseException):
+            provider.shutdown()
+        if console_acquired:
+            with suppress(BaseException):
+                _release_console_logging()
+        raise
 
 
 def _is_safe_value(key: str, value: object) -> bool:
@@ -202,7 +225,7 @@ def _is_safe_value(key: str, value: object) -> bool:
     if key == "context_state":
         return isinstance(value, str) and value in _SAFE_AUDIO_CONTEXT_STATES
     if isinstance(value, bool):
-        valid = key not in _AUDIO_NUMERIC_ATTRIBUTES
+        valid = False
     elif isinstance(value, int | float):
         valid = value >= 0 and (key not in _AUDIO_NUMERIC_ATTRIBUTES or type(value) is int)
     elif (

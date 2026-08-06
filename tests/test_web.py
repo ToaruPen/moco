@@ -1029,6 +1029,35 @@ def test_user_final_transcript_replaces_incorrect_interim_text() -> None:
         }
 
 
+@pytest.mark.asyncio
+async def test_user_interruption_discards_partial_assistant_transcript() -> None:
+    websocket = CapturingWebSocket()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "中断される応答"),
+    )
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "user", "割り込み"),
+    )
+    await connection._handle_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", "新しい応答です。"),
+    )
+
+    assert websocket.messages[-1] == {
+        "type": "transcript",
+        "role": "assistant",
+        "text": "新しい応答です。",
+        "done": True,
+    }
+
+
 def test_control_emoji_split_across_deltas_is_sanitized_after_accumulation() -> None:
     session = FakeSession()
     synthesizer = FakeSynthesizer()

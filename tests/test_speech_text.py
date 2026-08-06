@@ -40,6 +40,15 @@ def test_first_soft_break_waits_for_first_eligible_break() -> None:
     ]
 
 
+def test_first_soft_break_does_not_extend_past_segment_limit() -> None:
+    segmenter = TranscriptSegmenter(
+        max_chars=8,
+        first_segment_soft_break_min_chars=4,
+    )
+
+    assert segmenter.push("あ" * 8 + "、続きます") == [TranscriptSegment("あ" * 8, "max_chars")]
+
+
 def test_sentence_end_takes_priority_over_first_soft_break() -> None:
     segmenter = TranscriptSegmenter(
         max_chars=80,
