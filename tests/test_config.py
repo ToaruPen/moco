@@ -320,6 +320,11 @@ def test_synthesis_ranges_are_enforced(tmp_path: Path, yaml_text: str) -> None:
         load_config(path)
 
 
+@pytest.mark.parametrize("num_steps", [1, 64])
+def test_irodori_num_steps_accepts_supported_boundaries(num_steps: int) -> None:
+    assert IrodoriSettings(num_steps=num_steps).num_steps == num_steps
+
+
 @pytest.mark.parametrize("url", ["file:///tmp/otel", "ftp://127.0.0.1"])
 def test_otlp_endpoint_requires_http(tmp_path: Path, url: str) -> None:
     path = tmp_path / "moco.yaml"
