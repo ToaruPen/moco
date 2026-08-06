@@ -358,7 +358,8 @@ voice bank、active configは変更していない。
 
 ### 後続のsampling変更
 
-同日の独立したv4推論高速化評価で、`12 steps / sway / neutral`は客観metric上の最良候補に
-なったが、blind AB未完のためproduction既定値には昇格していない。上記の`24 steps / linear`
-は引き続きactive baselineであり、first-segment candidateの採否は変わらない。
-`speech.first_segment_soft_break_min_chars`も`null`のままとする。
+同日の独立したv4推論高速化評価で、`12 steps / sway / neutral`は客観metric上の最良候補になった。
+2026-08-06のblind ABでは12組すべてが同等と回答され、明示承認後にmocoの現在の運用設定へ
+採用した。これは通信契約の固定値ではなく、sampling設定から変更可能であり、testも選択中profileを
+固定しない。このsampling変更はfirst-segment candidateの採否を変えず、
+`speech.first_segment_soft_break_min_chars`は`null`のままとする。

@@ -32,7 +32,9 @@ irodori:
   speaker: null
   # Captions remain disabled during the initial v4 migration.
   caption_mode: "off"
-  num_steps: 24
+  # Current operational choice; these remain tunable sampling settings, not protocol constants.
+  num_steps: 12
+  t_schedule_mode: sway
   duration_scale: 1.0
   cfg_scale_text: 3.0
   cfg_scale_speaker: 5.0

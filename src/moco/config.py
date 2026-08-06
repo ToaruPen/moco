@@ -22,6 +22,7 @@ PositiveInt = Annotated[int, Field(gt=0)]
 PositiveFloat = Annotated[float, Field(gt=0.0)]
 Port = Annotated[int, Field(gt=0, le=65_535)]
 VadThreshold = Annotated[float, Field(gt=0.0, le=1.0)]
+IrodoriNumSteps = Annotated[int, Field(gt=0, le=64)]
 _MIN_PUBLIC_DNS_LABELS = 2
 _MAX_DNS_LABEL_LENGTH = 63
 
@@ -180,7 +181,8 @@ class IrodoriSettings(StrictSettings):
     connect_ip: IPvAnyAddress | None = None
     speaker: str | None = None
     caption_mode: Literal["off"] = "off"
-    num_steps: PositiveInt = 24
+    num_steps: IrodoriNumSteps = 12
+    t_schedule_mode: Literal["linear", "sway"] = "sway"
     duration_scale: PositiveFloat = 1.0
     cfg_scale_text: PositiveFloat = 3.0
     cfg_scale_speaker: PositiveFloat = 5.0

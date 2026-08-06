@@ -303,9 +303,11 @@ def test_irodori_connect_ip_requires_portless_https_fqdn(
     "yaml_text",
     [
         "irodori:\n  num_steps: 0\n",
+        "irodori:\n  num_steps: 65\n",
         "irodori:\n  duration_scale: 0\n",
         "irodori:\n  cfg_scale_text: 0\n",
         "irodori:\n  cfg_scale_speaker: 0\n",
+        "irodori:\n  t_schedule_mode: unsupported\n",
         "speech:\n  vad_threshold: 0\n",
         "speech:\n  vad_threshold: 1.1\n",
     ],

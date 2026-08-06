@@ -230,6 +230,7 @@ class IrodoriSynthesizer:
             voice_id=voice_id,
             if_generation=capabilities.generation,
             num_steps=config.num_steps,
+            t_schedule_mode=config.t_schedule_mode,
             duration_scale=config.duration_scale,
             cfg_scale_text=config.cfg_scale_text,
             cfg_scale_speaker=config.cfg_scale_speaker,
