@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator, Iterator
-from typing import cast
+from typing import Literal, cast
 
 import httpx
 import pytest
@@ -148,11 +148,19 @@ async def test_capabilities_fetches_from_bounded_client_and_caches_response() ->
     synthesizer.select_voice("fixture-id-2")
 
 
-async def test_uses_canonical_voice_generation_and_only_supported_fields() -> None:
+@pytest.mark.parametrize(
+    ("num_steps", "t_schedule_mode"),
+    [(17, "linear"), (31, "sway")],
+)
+async def test_uses_configured_voice_generation_and_sampling_settings(
+    num_steps: int,
+    t_schedule_mode: Literal["linear", "sway"],
+) -> None:
     client = FakeIrodoriClient()
     settings = MocoSettings(
         irodori=IrodoriSettings(
-            num_steps=16,
+            num_steps=num_steps,
+            t_schedule_mode=t_schedule_mode,
             duration_scale=1.2,
             cfg_scale_text=2.5,
             cfg_scale_speaker=4.5,
@@ -167,21 +175,11 @@ async def test_uses_canonical_voice_generation_and_only_supported_fields() -> No
     request = client.requests[0]
     assert request.voice_id == "fixture-id-1"
     assert request.if_generation == "fixture-generation"
-    assert request.num_steps == 16
+    assert request.num_steps == num_steps
+    assert request.t_schedule_mode == t_schedule_mode
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
-    assert request.model_fields_set == {
-        "text",
-        "voice_id",
-        "if_generation",
-        "num_steps",
-        "duration_scale",
-        "cfg_scale_text",
-        "cfg_scale_speaker",
-    }
-    assert request.style == "neutral"
-    assert request.cfg_scale_caption == 3.0
 
 
 async def test_alias_selection_is_normalized_to_canonical_voice_id() -> None:

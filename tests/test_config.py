@@ -303,9 +303,11 @@ def test_irodori_connect_ip_requires_portless_https_fqdn(
     "yaml_text",
     [
         "irodori:\n  num_steps: 0\n",
+        "irodori:\n  num_steps: 65\n",
         "irodori:\n  duration_scale: 0\n",
         "irodori:\n  cfg_scale_text: 0\n",
         "irodori:\n  cfg_scale_speaker: 0\n",
+        "irodori:\n  t_schedule_mode: unsupported\n",
         "speech:\n  vad_threshold: 0\n",
         "speech:\n  vad_threshold: 1.1\n",
     ],
@@ -316,6 +318,11 @@ def test_synthesis_ranges_are_enforced(tmp_path: Path, yaml_text: str) -> None:
 
     with pytest.raises(ConfigError):
         load_config(path)
+
+
+@pytest.mark.parametrize("num_steps", [1, 64])
+def test_irodori_num_steps_accepts_supported_boundaries(num_steps: int) -> None:
+    assert IrodoriSettings(num_steps=num_steps).num_steps == num_steps
 
 
 @pytest.mark.parametrize("url", ["file:///tmp/otel", "ftp://127.0.0.1"])
