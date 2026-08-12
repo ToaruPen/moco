@@ -14,6 +14,11 @@
         const start = () => {
           import("/static/review.js").then(({ startReviewPage }) => {
             startReviewPage({ window, nonce });
+          }).catch(() => {
+            const status = document.getElementById("review-status");
+            if (status) {
+              status.textContent = "Reviewer を読み込めませんでした";
+            }
           });
         };
         if (document.readyState === "loading") {

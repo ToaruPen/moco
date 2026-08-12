@@ -65,6 +65,10 @@ _EVENTS_END = object()
 logger = logging.getLogger(__name__)
 
 
+class _RealtimeBacklogExceededError(CodexRpcError):
+    """The bounded Realtime event queue cannot accept another event."""
+
+
 @dataclass(frozen=True, slots=True)
 class TranscriptEvent:
     kind: TranscriptKind
@@ -322,6 +326,8 @@ class CodexRealtimeSession:
         if notification.method in {"item/started", "item/completed"}:
             try:
                 self._handle_item_notification(notification)
+            except _RealtimeBacklogExceededError:
+                raise
             except CodexRpcError:
                 safe_event(
                     logger,
@@ -333,6 +339,8 @@ class CodexRealtimeSession:
         if notification.method == "item/reasoning/summaryTextDelta":
             try:
                 self._handle_reasoning_summary(notification)
+            except _RealtimeBacklogExceededError:
+                raise
             except CodexRpcError:
                 safe_event(
                     logger,
@@ -457,7 +465,7 @@ class CodexRealtimeSession:
     def _enqueue_event(self, event: RealtimeEvent) -> None:
         if self._events.qsize() >= _MAX_PENDING_REALTIME_EVENTS:
             message = "Codex Realtime event backlog limit exceeded"
-            raise CodexRpcError(message)
+            raise _RealtimeBacklogExceededError(message)
         self._events.put_nowait(event)
 
     def _fail_session(self, error: CodexRpcError) -> None:

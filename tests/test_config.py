@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import sys
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -21,6 +22,12 @@ from moco.config import (
     load_config,
 )
 from moco.errors import PrivateStateError
+
+
+@pytest.fixture(autouse=True)
+def _protect_windows_config_test_directory(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        config_module._protect_windows_config_path(tmp_path)  # noqa: SLF001
 
 
 def test_load_config_applies_defaults(tmp_path: Path) -> None:
@@ -284,6 +291,19 @@ def test_codex_prompt_file_rejects_named_user_when_host_does_not_expand_it(
 
     with pytest.raises(ValidationError, match="home directory"):
         CodexSettings(prompt_file=Path("~unknown-moco-user/prompt.md"))
+
+
+def test_codex_prompt_file_rejects_named_user_even_when_host_expands_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "expanduser",
+        lambda _path: Path("/Users/another-user/prompt.md"),
+    )
+
+    with pytest.raises(ValidationError, match="home directory"):
+        CodexSettings(prompt_file=Path("~another-user/prompt.md"))
 
 
 def test_codex_prompt_file_rejects_relative_path(tmp_path: Path) -> None:

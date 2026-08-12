@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import time
 from contextlib import contextmanager
 from typing import TYPE_CHECKING, Protocol, cast
 
@@ -13,6 +14,8 @@ import win32security
 
 from moco.errors import PrivateStateError
 from moco.runtime.private_state import WindowsSecuritySnapshot
+
+_STATE_LOCK_RETRY_DELAY_SECONDS = 0.01
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -138,28 +141,41 @@ def protect_windows_handle_dacl(handle: object) -> None:
 
 
 @contextmanager
-def hold_windows_state_lock(path: Path) -> Iterator[tuple[object, bool]]:
-    try:
-        handle = cast(
-            "_WindowsHandle",
-            win32file.CreateFile(
-                str(path),
-                win32con.GENERIC_READ
-                | win32con.GENERIC_WRITE
-                | win32con.READ_CONTROL
-                | win32con.WRITE_DAC
-                | win32con.WRITE_OWNER,
-                0,
-                None,
-                win32con.OPEN_ALWAYS,
-                win32con.FILE_ATTRIBUTE_NORMAL | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
-                None,
-            ),
-        )
-        created = win32api.GetLastError() != getattr(win32con, "ERROR_ALREADY_EXISTS", 183)
-    except Exception:  # noqa: BLE001 - normalize the OS security boundary
-        msg = "runtime state lock could not be acquired"
-        raise PrivateStateError(msg) from None
+def hold_windows_state_lock(
+    path: Path,
+    *,
+    blocking: bool,
+) -> Iterator[tuple[object, bool]]:
+    while True:
+        try:
+            handle = cast(
+                "_WindowsHandle",
+                win32file.CreateFile(
+                    str(path),
+                    win32con.GENERIC_READ
+                    | win32con.GENERIC_WRITE
+                    | win32con.READ_CONTROL
+                    | win32con.WRITE_DAC
+                    | win32con.WRITE_OWNER,
+                    0,
+                    None,
+                    win32con.OPEN_ALWAYS,
+                    win32con.FILE_ATTRIBUTE_NORMAL | win32file.FILE_FLAG_OPEN_REPARSE_POINT,
+                    None,
+                ),
+            )
+            created = win32api.GetLastError() != getattr(
+                win32con,
+                "ERROR_ALREADY_EXISTS",
+                183,
+            )
+            break
+        except Exception as error:  # noqa: BLE001 - normalize the OS security boundary
+            sharing_violation = getattr(win32con, "ERROR_SHARING_VIOLATION", 32)
+            if not blocking or getattr(error, "winerror", None) != sharing_violation:
+                msg = "runtime state lock could not be acquired"
+                raise PrivateStateError(msg) from None
+            time.sleep(_STATE_LOCK_RETRY_DELAY_SECONDS)
     try:
         yield handle, created
     finally:

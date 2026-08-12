@@ -13,6 +13,13 @@ import yaml
 ROOT = Path(__file__).parents[1]
 
 
+def test_global_test_fixtures_do_not_disable_windows_config_acl_validation() -> None:
+    path = ROOT / "tests" / "conftest.py"
+    conftest = path.read_text(encoding="utf-8") if path.exists() else ""
+
+    assert "_validate_windows_config_path" not in conftest
+
+
 def test_frontend_recipe_supports_one_optional_focused_pattern() -> None:
     justfile = (ROOT / "justfile").read_text(encoding="utf-8")
     recipe = (
@@ -214,11 +221,19 @@ def test_readme_documents_current_codex_requirements_and_doctor_codes() -> None:
     for requirement in [
         "macOS-first",
         "Windows 11",
+        "Edge",
         "公開 Codex CLI",
         "macOS Input Monitoring",
         "Windows ではブラウザ",
     ]:
         assert requirement in requirements
+
+    operator_design = (
+        ROOT / "docs" / "superpowers" / "specs" / "2026-07-31-operator-console-design.md"
+    ).read_text(encoding="utf-8")
+    assert "reasoning summary の本文は表示しない" in operator_design
+    assert "reasoning summary 更新中: 取得した短い要約" not in operator_design
+    assert "reasoning summary の短い要約" not in operator_design
 
     doctor = readme.split("## `doctor` の見方", maxsplit=1)[1].split(
         "## プライバシーと観測", maxsplit=1

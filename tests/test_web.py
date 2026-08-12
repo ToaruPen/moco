@@ -5235,6 +5235,7 @@ async def test_terminal_invalidation_and_agent_final_speech_are_fifo() -> None:
     connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
 
     speech.is_busy = True
+    connection._turn_cancel_pending = True  # noqa: SLF001
     connection.on_turn_terminal_claimed()
     connection.on_turn_finished(TurnResult(final_answer="Agent の最終回答。", error_code=None))
     await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
@@ -5246,6 +5247,73 @@ async def test_terminal_invalidation_and_agent_final_speech_are_fifo() -> None:
         ("speech", "assistant", "Agent の最終回答。", True),
     ]
     assert connection._generation == 1  # noqa: SLF001
+
+
+@pytest.mark.asyncio
+async def test_later_successful_turn_does_not_invalidate_prior_final_speech() -> None:
+    events: list[object] = []
+    speech = RecordingSpeechComposition(events)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+
+    connection.on_turn_terminal_claimed()
+    connection.on_turn_finished(TurnResult(final_answer="最初の確定回答。", error_code=None))
+    await connection._await_speech_effects()  # noqa: SLF001
+
+    connection.on_turn_terminal_claimed()
+    connection.on_turn_finished(TurnResult(final_answer="次の確定回答。", error_code=None))
+    await connection._await_speech_effects()  # noqa: SLF001
+
+    assert speech.invalidations == []
+    assert speech.transcripts == [
+        ("assistant", "最初の確定回答。", True),
+        ("assistant", "次の確定回答。", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_promoted_turn_connection_loss_invalidates_prior_final_speech() -> None:
+    speech = RecordingSpeechComposition()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    running = InteractionSnapshot(
+        connection=ConnectionState.READY,
+        voice=VoiceState.IDLE,
+        task=TaskState.RUNNING,
+        speech=SpeechState.SILENT,
+    )
+    connection.on_snapshot_changed(running)
+
+    connection.on_turn_terminal_claimed()
+    connection.on_snapshot_changed(running)
+    connection.on_turn_finished(TurnResult(final_answer="最初の確定回答。", error_code=None))
+    await connection._await_speech_effects()  # noqa: SLF001
+    generation = connection._speech_effect_generation  # noqa: SLF001
+
+    connection.on_snapshot_changed(
+        replace(
+            running,
+            connection=ConnectionState.DISCONNECTED,
+            task=TaskState.FAILED,
+        )
+    )
+
+    assert connection._speech_effect_generation == generation + 1  # noqa: SLF001
+    await connection._await_speech_effects()  # noqa: SLF001
+    assert speech.invalidations == ["owner_request"]
+    await connection.close()
 
 
 @pytest.mark.asyncio

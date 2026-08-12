@@ -33,13 +33,13 @@ Reviewer はこの画面と認証を共有しない別の loopback-only surface 
 
 ## 必要なもの
 
-- macOS-first。macOS、または Windows 11 の対話デスクトップと Chrome
+- macOS-first。macOS、または Windows 11 の対話デスクトップと Chrome / Edge
 - スマートフォンから使う場合は iOS Safari または Android Chrome
 - Python 3.13、[uv](https://docs.astral.sh/uv/)、Node.js、`just`
 - `PATH` 上、または `codex.command` に設定した公開 Codex CLI と、利用可能な ChatGPT
   アカウント。macOS では ChatGPT.app の bundle を fallback として利用できます
 - Irodori-TTS API。通常は Windows GPU ホストで起動し、Tailscale 経由で接続します
-- 初回利用時の Chrome マイク許可
+- 初回利用時の Chrome または Edge のマイク許可
 - グローバルキーを使う場合、macOS では moco を起動するターミナルまたは実行ファイルへの
   macOS Input Monitoring 許可。Windows ではブラウザのフォールバック操作を利用でき、
   ネイティブホットキーの可否は対話デスクトップ上で確認します

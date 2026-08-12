@@ -186,6 +186,7 @@ def clear_proxy_environment(monkeypatch: pytest.MonkeyPatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
+@pytest.mark.integration
 def test_review_bootstrap_never_uses_environment_proxy(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -203,6 +204,7 @@ def test_review_bootstrap_never_uses_environment_proxy(
     assert proxy_requests == []
 
 
+@pytest.mark.integration
 def test_review_bootstrap_rejects_hostname_authority_before_network(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -217,6 +219,7 @@ def test_review_bootstrap_rejects_hostname_authority_before_network(
     assert requests == []
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize("cross_authority", [False, True])
 def test_review_bootstrap_rejects_redirects_without_following(
     monkeypatch: pytest.MonkeyPatch,
@@ -245,6 +248,7 @@ def test_review_bootstrap_rejects_redirects_without_following(
     assert final_requests == []
 
 
+@pytest.mark.integration
 @pytest.mark.parametrize(
     ("endpoint_host", "expected_host"),
     [("127.0.0.1", "127.0.0.1:80"), ("[::1]", "[::1]:80")],
@@ -765,6 +769,7 @@ async def test_review_bootstrap_endpoint_requires_private_loopback_boundary() ->
     assert public_origin.status_code == 404
 
 
+@pytest.mark.integration
 @pytest.mark.asyncio
 async def test_review_bootstrap_rejects_non_ascii_control_secret_at_raw_http_boundary() -> None:
     application = create_app(

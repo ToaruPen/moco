@@ -37,3 +37,11 @@ test("removes the review nonce before the external module loads", async ({ page 
 
   await expect.poll(() => page.evaluate(() => window.location.hash)).toBe("");
 });
+
+test("shows a stable error when the reviewer module cannot load", async ({ page }) => {
+  await page.route("**/static/review.js", (route) => route.abort());
+
+  await page.goto("/review");
+
+  await expect(page.locator("#review-status")).toHaveText("Reviewer を読み込めませんでした");
+});

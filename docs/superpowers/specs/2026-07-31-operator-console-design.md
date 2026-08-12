@@ -60,7 +60,7 @@ moco のブラウザ画面を、紹介ページ風の画面から、会話と処
 上部バー直下に、現在の最も重要な処理を一行で表示する。
 
 - turn 稼働中: `Codex が処理を続けています`
-- reasoning summary 更新中: 取得した短い要約
+- reasoning activity 更新中: `推論要約を更新しています`
 - コマンド実行中: `コマンドを実行しています`
 - Web 検索中: `Web を検索しています`
 - MCP または動的ツール: `外部ツールを実行しています`
@@ -91,13 +91,15 @@ turn、音声生成、再生のいずれかが稼働中のときだけ、開始�
 | `CONNECTION` | `Realtime に接続`、`WebSocket が切断` |
 | `MIC` | `音声入力を開始`、`音声入力を停止` |
 | `TURN` | `応答処理を開始`、`応答処理を完了` |
-| `REASONING` | App Server が送る reasoning summary の短い要約 |
+| `REASONING` | `推論要約を更新`という固定ラベル |
 | `WORK` | `コマンド実行`、`ファイル変更`、`Web 検索`、`外部ツール`、`サブエージェント`、`画像確認`、`コンテキスト整理` |
 | `VOICE` | `音声生成を開始`、`音声生成を完了`、`再生を開始`、`再生を完了`、`音声モデルを変更` |
 | `ERROR` | 安定したエラーコードと短い説明 |
 | `SETTINGS` | テーマ設定の読込失敗など、表示設定に関する警告 |
 
-コマンド文字列、作業パス、検索語、MCP 引数、ツール結果、reasoning の raw text は表示しない。reasoning は `item/reasoning/summaryTextDelta` だけを使用し、`item/reasoning/textDelta` は破棄する。
+コマンド文字列、作業パス、検索語、MCP 引数、ツール結果、reasoning の raw text と
+reasoning summary の本文は表示しない。`item/reasoning/summaryTextDelta` と
+`item/reasoning/textDelta` は本文を破棄し、schemaで証明されたitem lifecycleだけを固定ラベルへ変換する。
 
 ## Codex イベント契約
 
@@ -136,20 +138,10 @@ turn、音声生成、再生のいずれかが稼働中のときだけ、開始�
 }
 ```
 
-reasoning summary は別メッセージとし、ブラウザ側で item 単位に差分を連結する。
-
-```json
-{
-  "type": "reasoning_summary",
-  "itemId": "item_opaque",
-  "delta": "設定と実行状態を確認しています。",
-  "occurredAtMs": 1785496801000
-}
-```
-
-item ID はブラウザ内の差分連結にだけ使い、DOM へ表示しない。summary は制御文字と制御絵文字を除去し、一項目 500 文字までに制限する。ブラウザログは永続化しない。
-
-Realtime turn で reasoning summary 通知が発生しない場合は、turn と item の開始・完了だけを表示する。summary を推測または生成して補わない。
+reasoning summary の本文は表示しない。item ID、delta、raw reasoning はBrowserへ転送せず、
+`item/started` と `item/completed` から導いた固定category／phase／labelだけを表示する。
+Realtime turnでreasoning item通知が発生しない場合は、turnと他itemの開始・完了だけを表示し、
+summaryを推測または生成して補わない。
 
 ## 音声とセッションの状態分離
 
@@ -244,7 +236,7 @@ capability、会話、音声モデル、ホットキー、Realtime 状態は保�
 ### Python
 
 - turn と item 通知を厳密にパースし、安全な activity event へ変換する。
-- reasoning summary delta だけを転送し、raw reasoning delta を転送しない。
+- reasoning summary と raw reasoning の本文を転送しない。
 - 他 thread/turn のイベントを無視する。
 - 未知 item type を安全な一般ラベルへ変換する。
 - ブラウザメッセージにコマンド、パス、引数、結果が含まれない。
@@ -254,7 +246,7 @@ capability、会話、音声モデル、ホットキー、Realtime 状態は保�
 
 - activity ring buffer が 200 件を超えない。
 - turn 経過時間と最終更新時間を決定論的な時計で表示する。
-- reasoning summary delta を item 単位に連結し、上限を適用する。
+- reasoning activity は固定ラベルだけを表示する。
 - 切断時に現在処理を failed/offline とし、エラー履歴を残す。
 - テーマ保存値を strict に検証する。
 - 全プリセットと custom override を適用・リセットできる。
@@ -267,7 +259,7 @@ capability、会話、音声モデル、ホットキー、Realtime 状態は保�
 - desktop、820px、520px、320px で会話とアクティビティが読める。
 - light/dark/high-contrast と custom theme を実ブラウザで確認する。
 - キーボードだけで接続、音声選択、開始、停止、テーマ変更、ログ移動、消去ができる。
-- 長い会話、200 件のログ、長い reasoning summary、現在エラーを同時表示しても操作が隠れない。
+- 長い会話、200 件のログ、現在エラーを同時表示しても操作が隠れない。
 
 ## 実装境界
 

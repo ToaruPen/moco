@@ -28,6 +28,12 @@ from moco.service.launchd import LaunchdError, ServiceStatus
 runner = CliRunner()
 
 
+@pytest.fixture(autouse=True)
+def _protect_windows_config_test_directory(tmp_path: Path) -> None:
+    if sys.platform == "win32":
+        config_module._protect_windows_config_path(tmp_path)  # noqa: SLF001
+
+
 def _patch_private_state_boundary(
     monkeypatch: pytest.MonkeyPatch,
     *,
@@ -319,6 +325,16 @@ def test_config_init_does_not_use_posix_fchmod_on_windows(
     assert result.exit_code == 0
     assert path.parent in protected
     assert len(protected) == 2
+    assert load_config(path) == MocoSettings()
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows DACLs")
+def test_windows_config_init_loads_through_real_acl_boundary(tmp_path: Path) -> None:
+    path = tmp_path / "config" / "moco.yaml"
+
+    result = runner.invoke(app, ["config", "init", "--path", str(path)])
+
+    assert result.exit_code == 0
     assert load_config(path) == MocoSettings()
 
 

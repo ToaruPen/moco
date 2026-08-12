@@ -53,7 +53,7 @@ def default_config_path(
     values = os.environ if environ is None else environ
     if platform_value == "win32":
         return _required_environment_path(values, "APPDATA") / "moco" / "moco.yaml"
-    home = Path(values.get("HOME", str(Path.home())))
+    home = _home_directory(values)
     return home / "Library" / "Application Support" / "moco" / "moco.yaml"
 
 
@@ -66,7 +66,7 @@ def default_prompt_path(
     values = os.environ if environ is None else environ
     if platform_value == "win32":
         return _required_environment_path(values, "APPDATA") / "moco" / "prompt.md"
-    home = Path(values.get("HOME", str(Path.home())))
+    home = _home_directory(values)
     return home / ".moco" / "prompt.md"
 
 
@@ -80,7 +80,7 @@ def default_runtime_state_path(
     if platform_value == "win32":
         root = _required_environment_path(values, "LOCALAPPDATA") / "moco" / "runtime-private"
     else:
-        home = Path(values.get("HOME", str(Path.home())))
+        home = _home_directory(values)
         root = home / "Library" / "Application Support" / "moco"
     return root / "runtime.json"
 
@@ -139,6 +139,16 @@ def _required_environment_path(values: Mapping[str, str], name: str) -> Path:
     raw = values.get(name)
     if raw is None or not raw.strip():
         message = f"{name} is unavailable"
+        raise HostPlatformError(message)
+    return Path(raw)
+
+
+def _home_directory(values: Mapping[str, str]) -> Path:
+    raw = values.get("HOME")
+    if raw is None:
+        return Path.home()
+    if not raw.strip():
+        message = "HOME is unavailable"
         raise HostPlatformError(message)
     return Path(raw)
 

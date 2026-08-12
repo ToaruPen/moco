@@ -393,7 +393,7 @@ def _hold_private_lock(
     blocking: bool,
 ) -> Iterator[None]:
     if platform_name == "win32":
-        with _hold_windows_state_lock(lock_path) as (handle, created):
+        with _hold_windows_state_lock(lock_path, blocking=blocking) as (handle, created):
             try:
                 _validate_windows_state_lock(lock_path, handle, created=created)
             except (OSError, PrivateStateError):
@@ -470,10 +470,12 @@ def _validate_windows_state_lock(path: Path, handle: object, *, created: bool) -
 
 def _hold_windows_state_lock(
     path: Path,
+    *,
+    blocking: bool,
 ) -> AbstractContextManager[tuple[object, bool]]:
     from moco.runtime._windows_acl import hold_windows_state_lock  # noqa: PLC0415
 
-    return hold_windows_state_lock(path)
+    return hold_windows_state_lock(path, blocking=blocking)
 
 
 def _protect_windows_handle_dacl(handle: object) -> None:
@@ -499,7 +501,7 @@ def _best_effort_remove_owned_state(
             return
         path.unlink()
         _sync_directory(path.parent, platform_name=platform_name)
-    except Exception:  # noqa: BLE001 - cleanup must preserve the primary failure
+    except BaseException:  # noqa: BLE001 - cleanup must preserve the primary failure
         return
 
 

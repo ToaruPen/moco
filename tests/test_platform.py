@@ -75,6 +75,17 @@ def test_non_windows_paths_keep_existing_macos_locations() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    "path_function",
+    [default_config_path, default_prompt_path, default_runtime_state_path],
+)
+def test_non_windows_paths_reject_an_empty_home(
+    path_function: Callable[..., Path],
+) -> None:
+    with pytest.raises(HostPlatformError, match="HOME"):
+        path_function(platform_name="darwin", environ={"HOME": ""})
+
+
 def test_service_and_hotkey_host_policy_is_explicit() -> None:
     assert service_supported(platform_name="darwin")
     assert not service_supported(platform_name="win32")

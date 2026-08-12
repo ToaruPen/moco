@@ -12,7 +12,7 @@ from contextlib import AbstractContextManager, contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import cast
+from typing import Protocol, cast
 
 import pytest
 
@@ -31,6 +31,15 @@ from moco.runtime.private_state import (
 )
 
 requires_posix = pytest.mark.skipif(sys.platform == "win32", reason="requires POSIX ownership")
+
+
+class _WindowsStateLockHolder(Protocol):
+    def __call__(
+        self,
+        path: Path,
+        *,
+        blocking: bool,
+    ) -> AbstractContextManager[tuple[object, bool]]: ...
 
 
 @pytest.fixture(autouse=True)
@@ -337,13 +346,17 @@ def test_windows_namespace_guard_holds_parent_and_leaf_without_share_delete(
 
 
 @pytest.mark.skipif(sys.platform == "win32", reason="uses injected pywin32 bindings")
-def test_windows_state_lock_handle_denies_all_sharing(
+def test_windows_blocking_state_lock_retries_sharing_violation_without_allowing_sharing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     opened: list[tuple[str, int, int, int, int]] = []
+    attempts = 0
     handle = SimpleNamespace(closed=False)
     handle.Close = lambda: setattr(handle, "closed", True)
+
+    class SharingViolationError(OSError):
+        winerror = 32
 
     def create_file(
         path: str,
@@ -354,6 +367,10 @@ def test_windows_state_lock_handle_denies_all_sharing(
         flags: int,
         _template: object,
     ) -> SimpleNamespace:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise SharingViolationError
         opened.append((path, access, share, creation, flags))
         return handle
 
@@ -362,6 +379,7 @@ def test_windows_state_lock_handle_denies_all_sharing(
         GENERIC_READ=0x80000000,
         GENERIC_WRITE=0x40000000,
         OPEN_ALWAYS=4,
+        ERROR_SHARING_VIOLATION=32,
         READ_CONTROL=0x00020000,
         WRITE_DAC=0x00040000,
         WRITE_OWNER=0x00080000,
@@ -377,13 +395,22 @@ def test_windows_state_lock_handle_denies_all_sharing(
     monkeypatch.setitem(sys.modules, "ntsecuritycon", SimpleNamespace())
     sys.modules.pop("moco.runtime._windows_acl", None)
     module = importlib.import_module("moco.runtime._windows_acl")
+    timestamps = iter([0.0, 2.0])
+    monkeypatch.setattr(
+        module,
+        "time",
+        SimpleNamespace(
+            monotonic=lambda: next(timestamps),
+            sleep=lambda _seconds: None,
+        ),
+    )
     holder = cast(
-        "Callable[[Path], AbstractContextManager[tuple[object, bool]]]",
+        "_WindowsStateLockHolder",
         module.hold_windows_state_lock,
     )
     lock_path = tmp_path / "runtime-private" / ".runtime-state.lock"
     try:
-        with holder(lock_path) as (held, created):
+        with holder(lock_path, blocking=True) as (held, created):
             assert held is handle
             assert created
             assert not handle.closed
@@ -403,7 +430,40 @@ def test_windows_state_lock_handle_denies_all_sharing(
             fake_con.FILE_ATTRIBUTE_NORMAL | fake_file.FILE_FLAG_OPEN_REPARSE_POINT,
         ),
     ]
+    assert attempts == 2
     assert handle.closed
+
+
+@pytest.mark.parametrize("blocking", [False, True])
+def test_windows_private_lock_forwards_blocking_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    blocking: bool,
+) -> None:
+    observed: list[bool] = []
+
+    @contextmanager
+    def state_lock(
+        _path: Path,
+        *,
+        blocking: bool,
+    ) -> Generator[tuple[object, bool]]:
+        observed.append(blocking)
+        yield object(), False
+
+    monkeypatch.setattr(private_state, "_hold_windows_state_lock", state_lock)
+    monkeypatch.setattr(
+        private_state, "_validate_windows_state_lock", lambda *_args, **_kwargs: None
+    )
+
+    with private_state._hold_private_lock(  # noqa: SLF001
+        tmp_path / ".runtime.lock",
+        platform_name="win32",
+        blocking=blocking,
+    ):
+        pass
+
+    assert observed == [blocking]
 
 
 def test_runtime_lease_excludes_a_second_daemon_and_is_reusable(
@@ -644,7 +704,12 @@ def test_windows_new_temporary_file_is_dacl_protected_before_secret_write(
         yield
 
     @contextmanager
-    def state_lock(lock_path: Path) -> Generator[tuple[object, bool]]:
+    def state_lock(
+        lock_path: Path,
+        *,
+        blocking: bool,
+    ) -> Generator[tuple[object, bool]]:
+        assert blocking
         lock_path.touch()
         yield lock_path, True
 
@@ -691,7 +756,12 @@ def test_windows_existing_unsafe_state_lock_is_not_repaired(
         yield
 
     @contextmanager
-    def existing_lock(lock_path: Path) -> Generator[tuple[object, bool]]:
+    def existing_lock(
+        lock_path: Path,
+        *,
+        blocking: bool,
+    ) -> Generator[tuple[object, bool]]:
+        assert blocking
         assert lock_path == lock
         yield lock_path, False
 
@@ -923,6 +993,28 @@ def test_post_replace_directory_sync_failure_removes_owned_destination_and_temp(
 
     assert not path.exists()
     assert all(b"RUNTIME_SECRET" not in item.read_bytes() for item in path.parent.iterdir())
+
+
+def test_best_effort_owned_state_cleanup_preserves_primary_base_exception(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    expected = private_state._PathIdentity(1, 2)  # noqa: SLF001
+
+    class InterruptingPath:
+        parent = tmp_path
+
+        def unlink(self) -> None:
+            raise KeyboardInterrupt
+
+    path = cast("Path", InterruptingPath())
+    monkeypatch.setattr(private_state, "_path_identity", lambda _path: expected)
+
+    private_state._best_effort_remove_owned_state(  # noqa: SLF001
+        path,
+        expected,
+        platform_name="darwin",
+    )
 
 
 @requires_posix

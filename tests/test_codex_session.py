@@ -848,6 +848,44 @@ async def test_realtime_event_backlog_is_bounded_and_fails_closed(tmp_path: Path
     await session.close()
 
 
+async def test_auxiliary_event_backlog_fails_session_instead_of_looking_invalid(
+    tmp_path: Path,
+) -> None:
+    rpc = FakeRpc()
+    session = CodexRealtimeSession(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+    )
+    await session.start("offer-sdp")
+    notification_task = cast("asyncio.Task[None]", session._notification_task)  # noqa: SLF001
+
+    try:
+        await rpc.emit(
+            "turn/started",
+            {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+        )
+        for index in range(session_module._MAX_PENDING_REALTIME_EVENTS):  # noqa: SLF001
+            await rpc.emit(
+                "item/started",
+                {
+                    "threadId": "thr_test",
+                    "turnId": "turn-1",
+                    "item": {"type": "commandExecution"},
+                    "startedAtMs": index,
+                },
+            )
+
+        await asyncio.wait_for(asyncio.shield(notification_task), 0.5)
+        events = session.notifications()
+        for _index in range(session_module._MAX_PENDING_REALTIME_EVENTS):  # noqa: SLF001
+            assert isinstance(await anext(events), ActivityEvent)
+        with pytest.raises(CodexRpcError, match="event backlog limit exceeded"):
+            await anext(events)
+    finally:
+        await session.close()
+
+
 async def test_exposes_reasoning_summary_but_not_raw_reasoning(tmp_path: Path) -> None:
     rpc = FakeRpc()
     session = CodexRealtimeSession(

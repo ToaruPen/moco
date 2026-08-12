@@ -445,6 +445,7 @@ export class MocoController {
     this.reconnectRequired = false;
     this.pendingAudio = null;
     this.controlEpoch = 0;
+    this.listeningRequested = false;
   }
 
   async applyControl(control) {
@@ -476,8 +477,10 @@ export class MocoController {
         }
       }
       track.enabled = true;
+      this.listeningRequested = true;
     } else if (control === "listen_stop") {
       track.enabled = false;
+      this.listeningRequested = false;
     } else {
       return false;
     }
@@ -508,6 +511,7 @@ export class MocoController {
 
   disconnect() {
     this.controlEpoch += 1;
+    this.listeningRequested = false;
     const track = this.stream.getAudioTracks()[0];
     if (track) {
       track.enabled = false;
@@ -519,6 +523,7 @@ export class MocoController {
 
   expire() {
     this.controlEpoch += 1;
+    this.listeningRequested = false;
     const track = this.stream.getAudioTracks()[0];
     if (track) {
       track.enabled = false;
@@ -528,6 +533,7 @@ export class MocoController {
   }
 
   requireReconnect() {
+    this.listeningRequested = false;
     const track = this.stream.getAudioTracks()[0];
     if (track) {
       track.enabled = false;
@@ -541,7 +547,7 @@ export function reconcileListeningState({ controller, state, listenStart, micSta
     return;
   }
   const track = controller.stream.getAudioTracks()[0];
-  if (state === "listening") {
+  if (state === "listening" && controller.listeningRequested) {
     if (track) {
       track.enabled = true;
     }

@@ -919,6 +919,35 @@ describe("MocoController", () => {
     assert.deepEqual(micState, { textContent: "MIC ON", dataset: { status: "ok" } });
   });
 
+  it("does not let a stale listening state undo the latest local stop", async () => {
+    const { controller, track } = harness();
+    const listenStart = {
+      classes: new Set(),
+      attributes: new Map(),
+      classList: {
+        add(name) {
+          listenStart.classes.add(name);
+        },
+        remove(name) {
+          listenStart.classes.delete(name);
+        },
+      },
+      setAttribute(name, value) {
+        this.attributes.set(name, value);
+      },
+    };
+    const micState = { textContent: "MIC OFF", dataset: { status: "muted" } };
+
+    await controller.applyControl("listen_start");
+    await controller.applyControl("listen_stop");
+    reconcileListeningState({ controller, state: "listening", listenStart, micState });
+
+    assert.equal(track.enabled, false);
+    assert.equal(listenStart.classes.has("is-active"), false);
+    assert.equal(listenStart.attributes.get("aria-pressed"), "false");
+    assert.deepEqual(micState, { textContent: "MIC OFF", dataset: { status: "muted" } });
+  });
+
   it("stops stale input while preserving output when a conversation expires", () => {
     const { controller, playback, track } = harness();
     track.enabled = true;

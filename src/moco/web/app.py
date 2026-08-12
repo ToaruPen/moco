@@ -921,6 +921,8 @@ class _BrowserConnection:
         self._agent_activity_backpressure_reported = False
         self._speech_effect_tail: asyncio.Task[None] | None = None
         self._speech_effect_generation = 0
+        self._turn_cancel_pending = False
+        self._turn_result_claimed = False
         self._terminal_speech_delivery: tuple[SpeechQueue, asyncio.Task[None]] | None = None
         self._connection_loss_task: asyncio.Task[None] | None = None
 
@@ -984,6 +986,8 @@ class _BrowserConnection:
         self._snapshot = snapshot
         self._idle_timer.touch()
         if is_task_active != was_task_active:
+            if is_task_active:
+                self._turn_result_claimed = False
             self.on_agent_activity(
                 AgentActivityEvent(
                     "turn",
@@ -995,6 +999,8 @@ class _BrowserConnection:
             self._voice_reconnect_required = False
             self._claim_conversation_close()
             if self._connection_loss_task is None:
+                if not self._turn_result_claimed:
+                    self._queue_owner_speech_invalidation()
                 task = self._spawn_effect(
                     self._close_connection_lost_lease(self._session),
                     name="moco-connection-lost-close",
@@ -1006,14 +1012,17 @@ class _BrowserConnection:
         self._spawn_effect(self._send_state(), name="moco-interaction-state")
 
     def on_turn_terminal_claimed(self) -> None:
-        self._terminal_speech_delivery = None
-        self._speech_effect_generation += 1
-        self._queue_speech_effect(
-            self._invalidate_terminal_speech,
-            name="moco-terminal-speech-invalidation",
-        )
+        if not self._turn_cancel_pending:
+            return
+        self._turn_cancel_pending = False
+        self._queue_owner_speech_invalidation()
 
     def on_turn_finished(self, result: TurnResult) -> None:
+        self._turn_result_claimed = self._snapshot.task not in {
+            TaskState.QUEUED,
+            TaskState.RUNNING,
+            TaskState.WAITING_REVIEW,
+        }
         text = result.final_answer
         if text is None:
             text = _turn_failure_speech(result.error_code)
@@ -1208,6 +1217,14 @@ class _BrowserConnection:
     def _forget_speech_effect_tail(self, task: asyncio.Task[None]) -> None:
         if task is self._speech_effect_tail:
             self._speech_effect_tail = None
+
+    def _queue_owner_speech_invalidation(self) -> None:
+        self._terminal_speech_delivery = None
+        self._speech_effect_generation += 1
+        self._queue_speech_effect(
+            self._invalidate_terminal_speech,
+            name="moco-terminal-speech-invalidation",
+        )
 
     async def _invalidate_terminal_speech(self) -> None:
         speech = self._speech
@@ -1740,11 +1757,7 @@ class _BrowserConnection:
             control=control.value,
         )
         if control is ClientControl.TURN_CANCEL:
-            session = self._session
-            if session is None or not await session.cancel_turn():
-                await self._send_error("turn_not_active")
-            else:
-                await self._await_speech_effects()
+            await self._apply_turn_cancel()
             return
         if control is ClientControl.LISTEN_START:
             if self._session is None:
@@ -1770,6 +1783,24 @@ class _BrowserConnection:
             await self._send_state()
             return
         assert_never(control)
+
+    async def _apply_turn_cancel(self) -> None:
+        session = self._session
+        if session is None:
+            await self._send_error("turn_not_active")
+            return
+        self._turn_cancel_pending = True
+        try:
+            cancelled = await session.cancel_turn()
+        except BaseException:
+            self._turn_cancel_pending = False
+            raise
+        if not cancelled:
+            self._turn_cancel_pending = False
+            await self._send_error("turn_not_active")
+            return
+        self._turn_cancel_pending = False
+        await self._await_speech_effects()
 
     async def _select_voice(self, voice_id: str) -> None:
         async with self._capability_lock:

@@ -194,14 +194,14 @@ class CodexSettings(StrictSettings):
             has_named_home = (
                 raw_path.startswith("~") and len(raw_path) > 1 and raw_path[1] not in {"/", "\\"}
             )
+            if has_named_home:
+                msg = "prompt path uses an unknown home directory"
+                raise ValueError(msg)
             try:
                 path = Path(value).expanduser()
             except RuntimeError as error:
                 msg = "prompt path uses an unknown home directory"
                 raise ValueError(msg) from error
-            if has_named_home and (sys.platform == "win32" or str(path).startswith("~")):
-                msg = "prompt path uses an unknown home directory"
-                raise ValueError(msg)
             if "\0" in str(path):
                 msg = "prompt path must not contain NUL"
                 raise ValueError(msg)
