@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="ja">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>moco — local reviewer</title>
+    <script>
+      (() => {
+        const hash = typeof window.location.hash === "string" ? window.location.hash : "";
+        const nonce = hash.startsWith("#") ? hash.slice(1) : "";
+        if (nonce) {
+          window.history.replaceState(null, "", window.location.pathname);
+        }
+        const start = () => {
+          import("/static/review.js").then(({ startReviewPage }) => {
+            startReviewPage({ window, nonce });
+          }).catch(() => {
+            const status = document.getElementById("review-status");
+            if (status) {
+              status.textContent = "Reviewer を読み込めませんでした";
+            }
+          });
+        };
+        if (document.readyState === "loading") {
+          document.addEventListener("DOMContentLoaded", start, { once: true });
+        } else {
+          start();
+        }
+      })();
+    </script>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+      body { margin: 0; padding: 2rem; }
+      main { margin: auto; max-width: 46rem; }
+      .review-card { border: 1px solid currentColor; margin-top: 1rem; padding: 1rem; }
+      .review-actions { display: flex; gap: 0.75rem; margin-top: 1rem; }
+      button { min-height: 2.75rem; padding: 0.5rem 1rem; }
+      pre { overflow-wrap: anywhere; white-space: pre-wrap; }
+      .review-command-text, .review-argument, .review-cwd, .review-change-source,
+      .review-change-destination {
+        overflow-wrap: anywhere;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>ローカル Reviewer</h1>
+      <p id="review-status" role="status" aria-live="polite">接続しています</p>
+      <section id="reviews" aria-live="polite"></section>
+    </main>
+  </body>
+</html>

@@ -16,11 +16,20 @@ runtime:
   idle_timeout_seconds: 300
 
 codex:
-  binary: /Applications/ChatGPT.app/Contents/Resources/codex
-  working_directory: /Users/your-name
-  # null checks ~/.moco/prompt.md and falls back to the built-in prompt when absent.
-  # Set an absolute path (or a path beginning with ~) to require another prompt file.
+  # null resolves codex from PATH; macOS may then use the official app bundle resource.
+  command: null
+  # null uses moco's startup working directory on each host.
+  working_directory: null
+  # null checks the host-specific implicit prompt path.
   prompt_file: null
+
+agent:
+  # Capability profile moco requests for Codex Agent turns. Default: read_only.
+  #   read_only:       request Codex's read-only profile.
+  #   workspace_write: request Codex's workspace-write profile.
+  #   inherit_codex:   send no override and keep Codex's own effective settings.
+  # This file is the only way to set the profile today, and it is read at startup.
+  profile: read_only
 
 irodori:
   # Replace with the Windows node's portless Tailscale Serve URL.

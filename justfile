@@ -25,14 +25,23 @@ test:
     uv run pytest --durations=10
     npm run test:frontend
 
+test-frontend pattern="":
+    node --test {{ if pattern == "" { "" } else { "--test-name-pattern=" + quote(pattern) } }} tests/js/*.test.js
+
+test-python *args:
+    uv run pytest -m "not live and not slow and not contract" --durations=10 {{args}}
+
 test-integration:
     uv run pytest -m integration --durations=10
 
 test-live:
     uv run pytest -m live --durations=10
 
+contract-codex:
+    uv run pytest -m contract tests/test_codex_contract.py --durations=10
+
 test-cov:
-    uv run pytest -m "not live and not slow" --cov --cov-report=term-missing --cov-report=xml
+    uv run pytest -m "not live and not slow and not contract" --cov --cov-report=term-missing --cov-report=xml
     npm run test:frontend
 
 test-browser:

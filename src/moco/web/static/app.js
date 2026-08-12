@@ -11,7 +11,6 @@ import {
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
 const CAPABILITY_STORAGE_KEY = "moco.capability";
-const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
 
@@ -30,6 +29,8 @@ const ERROR_COPY = Object.freeze({
   voice_not_found: "選択した音声モデルが見つかりません",
   conversation_start_failed: "Realtime 会話を開始できませんでした",
   conversation_not_started: "Realtime 会話が開始していません",
+  interaction_busy: "別の処理を受け付けています",
+  turn_not_active: "取り消せる処理はありません",
   voice_not_available: "選択した音声モデルを利用できません",
   codex_realtime_error: "Codex Realtime でエラーが発生しました",
   invalid_realtime_event: "Codex から不正なイベントを受信しました",
@@ -284,6 +285,27 @@ export class BrowserHotkeyMapper {
   }
 }
 
+export class TurnCancelController {
+  constructor({ button, send }) {
+    this.button = button;
+    this.send = send;
+    this.button.addEventListener("click", () => this.cancel());
+  }
+
+  configure(canCancel) {
+    this.button.disabled = canCancel !== true;
+  }
+
+  cancel() {
+    if (this.button.disabled) {
+      return false;
+    }
+    this.button.disabled = true;
+    this.send({ type: "control", control: "turn_cancel" });
+    return true;
+  }
+}
+
 export function shouldHandleHotkey(event, mapper) {
   return !isEditableTarget(event.target) && mapper.handles(event.key);
 }
@@ -411,6 +433,8 @@ export class VoiceModelController {
 }
 
 export class MocoController {
+  #reconnectPromise = null;
+
   constructor({ stream, playback, send, reconnect }) {
     this.stream = stream;
     this.playback = playback;
@@ -418,8 +442,10 @@ export class MocoController {
     this.reconnect = reconnect;
     this.audioGeneration = 0;
     this.idleExpired = false;
+    this.reconnectRequired = false;
     this.pendingAudio = null;
     this.controlEpoch = 0;
+    this.listeningRequested = false;
   }
 
   async applyControl(control) {
@@ -429,16 +455,32 @@ export class MocoController {
       return false;
     }
     if (control === "listen_start") {
-      if (this.idleExpired) {
-        await this.reconnect();
+      if (this.idleExpired || this.reconnectRequired) {
+        let reconnectPromise = this.#reconnectPromise;
+        if (!reconnectPromise) {
+          reconnectPromise = this.reconnect();
+          this.#reconnectPromise = reconnectPromise;
+        }
+        try {
+          await reconnectPromise;
+        } finally {
+          if (this.#reconnectPromise === reconnectPromise) {
+            this.#reconnectPromise = null;
+          }
+        }
+        // The replacement succeeded even if a newer stop superseded this start. Keep the
+        // microphone stopped, but do not ask the next start to replace the healthy Voice.
+        this.idleExpired = false;
+        this.reconnectRequired = false;
         if (epoch !== this.controlEpoch) {
           return false;
         }
-        this.idleExpired = false;
       }
       track.enabled = true;
+      this.listeningRequested = true;
     } else if (control === "listen_stop") {
       track.enabled = false;
+      this.listeningRequested = false;
     } else {
       return false;
     }
@@ -469,6 +511,7 @@ export class MocoController {
 
   disconnect() {
     this.controlEpoch += 1;
+    this.listeningRequested = false;
     const track = this.stream.getAudioTracks()[0];
     if (track) {
       track.enabled = false;
@@ -480,12 +523,47 @@ export class MocoController {
 
   expire() {
     this.controlEpoch += 1;
+    this.listeningRequested = false;
     const track = this.stream.getAudioTracks()[0];
     if (track) {
       track.enabled = false;
     }
     this.idleExpired = true;
+    this.reconnectRequired = true;
   }
+
+  requireReconnect() {
+    this.listeningRequested = false;
+    const track = this.stream.getAudioTracks()[0];
+    if (track) {
+      track.enabled = false;
+    }
+    this.reconnectRequired = true;
+  }
+}
+
+export function reconcileListeningState({ controller, state, listenStart, micState }) {
+  if (!controller) {
+    return;
+  }
+  const track = controller.stream.getAudioTracks()[0];
+  if (state === "listening" && controller.listeningRequested) {
+    if (track) {
+      track.enabled = true;
+    }
+    listenStart.classList.add("is-active");
+    listenStart.setAttribute("aria-pressed", "true");
+    micState.textContent = "MIC ON";
+    micState.dataset.status = "ok";
+    return;
+  }
+  if (track) {
+    track.enabled = false;
+  }
+  listenStart.classList.remove("is-active");
+  listenStart.setAttribute("aria-pressed", "false");
+  micState.textContent = "MIC OFF";
+  micState.dataset.status = "muted";
 }
 
 export class TranscriptView {
@@ -639,8 +717,42 @@ export function watchPeerFailure(peer, onFailure) {
   return () => peer.removeEventListener("connectionstatechange", listener);
 }
 
-export function closeSocketForFailure(socket, error, onFailure) {
-  if (!socket) {
+export function closeCurrentPeer(failedPeer, currentPeer, { stopWatching, requireReconnect }) {
+  if (failedPeer !== currentPeer) {
+    return false;
+  }
+  stopWatching?.();
+  failedPeer.close();
+  requireReconnect();
+  return true;
+}
+
+export function closeFailedHandshakePeer(
+  failedPeer,
+  currentPeer,
+  { replacement, startSent, stopWatching, requireReconnect, send, claimVoiceLoss },
+) {
+  const closed = closeCurrentPeer(failedPeer, currentPeer, {
+    stopWatching,
+    requireReconnect,
+  });
+  if (closed) {
+    if (claimVoiceLoss) {
+      claimVoiceLoss();
+    } else if (replacement && startSent) {
+      send({ type: "voice_lost" });
+    }
+  }
+  return closed;
+}
+
+export function closeSocketForFailure(
+  socket,
+  error,
+  onFailure,
+  { preserveTransport = false } = {},
+) {
+  if (!socket || preserveTransport) {
     return false;
   }
   const code = error?.name && error.name !== "Error" ? error.name : "conversation_start_failed";
@@ -718,6 +830,19 @@ export function setTransportOffline({ connection, micState }) {
   micState.dataset.status = "muted";
 }
 
+function isLoopbackHostname(hostname) {
+  const normalized = hostname.toLowerCase();
+  if (normalized === "localhost" || normalized === "::1" || normalized === "[::1]") {
+    return true;
+  }
+  const octets = normalized.split(".");
+  return (
+    octets.length === 4 &&
+    octets.every((octet) => /^(0|[1-9]\d{0,2})$/.test(octet) && Number(octet) <= 255) &&
+    Number(octets[0]) === 127
+  );
+}
+
 export function loadCapability({ location, history, storage }) {
   const capabilityFromUrl = location.hash.slice(1);
   if (capabilityFromUrl) {
@@ -756,7 +881,7 @@ export class PairingPanel {
   }
 
   async probe() {
-    if (!LOOPBACK_HOSTS.has(this.location.hostname)) {
+    if (!isLoopbackHostname(this.location.hostname)) {
       return;
     }
     try {
@@ -962,6 +1087,7 @@ function boot() {
     listenStart: document.querySelector("#listen-start"),
     startKey: document.querySelector("#start-key"),
     listenStop: document.querySelector("#listen-stop"),
+    turnCancel: document.querySelector("#turn-cancel"),
     stopKey: document.querySelector("#stop-key"),
     voice: document.querySelector("#voice"),
     error: document.querySelector("#error"),
@@ -1045,6 +1171,7 @@ function boot() {
   let openPromise;
   let progressTimer;
   let conversationHandshake;
+  let discardFailedHandshakeTerminal = false;
   let stopPeerWatch;
   let socketCloseError;
   const hotkeyMapper = new BrowserHotkeyMapper({
@@ -1062,6 +1189,7 @@ function boot() {
     select: dom.voice,
     send,
   });
+  const turnCancel = new TurnCancelController({ button: dom.turnCancel, send });
 
   const connectSocket = () => {
     if (openPromise) {
@@ -1094,10 +1222,11 @@ function boot() {
         displayed: true,
       });
       conversationHandshake = undefined;
+      discardFailedHandshakeTerminal = false;
       const disconnectedMedia = {
         context,
         controller,
-        controls: [dom.listenStart, dom.listenStop, dom.voice],
+        controls: [dom.listenStart, dom.listenStop, dom.turnCancel, dom.voice],
         peer,
         stream,
       };
@@ -1125,6 +1254,14 @@ function boot() {
         operatorStatus.showError("invalid_message");
         return;
       }
+      if (
+        discardFailedHandshakeTerminal &&
+        (message.type === "sdp_answer" ||
+          (message.type === "error" && CONVERSATION_START_ERRORS.has(message.code)))
+      ) {
+        discardFailedHandshakeTerminal = false;
+        return;
+      }
       if (conversationHandshake && (await conversationHandshake.consume(message))) {
         return;
       }
@@ -1133,7 +1270,22 @@ function boot() {
         dom.state.dataset.status = message.state === "ready" ? "ok" : "info";
         if (controller) {
           controller.idleExpired = message.state === "idle_expired";
+          if (message.state === "voice_reconnect_required" || message.state === "connection_lost") {
+            controller.requireReconnect();
+          }
         }
+        if (message.state === "voice_reconnect_required") {
+          progress.consume({ kind: "turn", source: "voice", phase: "completed" });
+          operatorStatus.renderProgress();
+        } else if (message.state === "connection_lost") {
+          operatorStatus.disconnect();
+        }
+        reconcileListeningState({
+          controller,
+          state: message.state,
+          listenStart: dom.listenStart,
+          micState: dom.micState,
+        });
         if (message.state === "idle_expired") {
           controller?.expire();
           dom.micState.textContent = "MIC OFF";
@@ -1155,6 +1307,7 @@ function boot() {
         dom.startKey.textContent = startKey.toUpperCase();
         dom.stopKey.textContent = stopKey.toUpperCase();
         voiceModels.configure(message.voice);
+        turnCancel.configure(message.canCancel);
       } else if (message.type === "control") {
         await apply(message.control);
       } else if (message.type === "audio") {
@@ -1203,33 +1356,73 @@ function boot() {
   };
 
   const connectConversation = async () => {
+    const replacement = controller?.reconnectRequired === true;
+    let startSent = false;
+    let established = false;
+    let voiceLossClaimed = false;
+    const claimVoiceLoss = () => {
+      if (voiceLossClaimed || (!established && !(replacement && startSent))) {
+        return;
+      }
+      voiceLossClaimed = true;
+      send({ type: "voice_lost" });
+    };
     await connectSocket();
     stopPeerWatch?.();
     peer?.close();
     const nextPeer = new RTCPeerConnection();
     peer = nextPeer;
+    let handshake;
     stopPeerWatch = watchPeerFailure(nextPeer, (code) => {
-      if (peer !== nextPeer) {
+      if (
+        !closeCurrentPeer(nextPeer, peer, {
+          stopWatching: stopPeerWatch,
+          requireReconnect: () => controller?.requireReconnect(),
+        })
+      ) {
         return;
       }
-      closeSocketForFailure(socket, namedError(code), (failure) => {
-        socketCloseError = failure;
-      });
+      stopPeerWatch = undefined;
+      peer = undefined;
+      claimVoiceLoss();
+      if (handshake && conversationHandshake === handshake) {
+        conversationHandshake = undefined;
+        discardFailedHandshakeTerminal = true;
+        handshake.cancel(code, { displayed: true });
+      }
+      operatorStatus.showError(code);
     });
-    nextPeer.addTrack(stream.getAudioTracks()[0], stream);
-    nextPeer.createDataChannel("oai-events");
-    const offer = await nextPeer.createOffer();
-    await nextPeer.setLocalDescription(offer);
-    await waitForIce(nextPeer);
-    const handshake = new ConversationHandshake((sdp) =>
-      nextPeer.setRemoteDescription({ type: "answer", sdp }),
-    );
-    conversationHandshake = handshake;
-    send({ type: "start", sdp: nextPeer.localDescription.sdp });
     try {
+      nextPeer.addTrack(stream.getAudioTracks()[0], stream);
+      nextPeer.createDataChannel("oai-events");
+      const offer = await nextPeer.createOffer();
+      await nextPeer.setLocalDescription(offer);
+      await waitForIce(nextPeer);
+      handshake = new ConversationHandshake((sdp) =>
+        nextPeer.setRemoteDescription({ type: "answer", sdp }),
+      );
+      conversationHandshake = handshake;
+      send({ type: "start", sdp: nextPeer.localDescription.sdp });
+      startSent = true;
       await handshake.promise;
+      established = true;
+    } catch (error) {
+      if (
+        closeFailedHandshakePeer(nextPeer, peer, {
+          replacement,
+          startSent,
+          stopWatching: stopPeerWatch,
+          requireReconnect: () => controller?.requireReconnect(),
+          send,
+          claimVoiceLoss,
+        })
+      ) {
+        stopPeerWatch = undefined;
+        peer = undefined;
+      }
+      throw error;
     } finally {
-      if (conversationHandshake === handshake) {
+      if (handshake && conversationHandshake === handshake) {
         conversationHandshake = undefined;
       }
     }
@@ -1314,9 +1507,14 @@ function boot() {
     try {
       applied = await controller.applyControl(control);
     } catch (error) {
-      const closing = closeSocketForFailure(socket, error, (failure) => {
-        socketCloseError = failure;
-      });
+      const closing = closeSocketForFailure(
+        socket,
+        error,
+        (failure) => {
+          socketCloseError = failure;
+        },
+        { preserveTransport: controller.reconnectRequired },
+      );
       if (!closing && !error.displayed) {
         operatorStatus.showError(error.name || "conversation_start_failed");
       }

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import pytest
 
-from moco.runtime.lifecycle import BusyKind, LifecycleController, LifecycleState
+from moco.runtime.lifecycle import IdleLeaseTimer
 
 
 class Clock:
@@ -13,100 +13,39 @@ class Clock:
         return self.now
 
 
-@pytest.mark.parametrize(
-    "kind",
-    [BusyKind.LISTENING, BusyKind.DELEGATED, BusyKind.SYNTHESIS, BusyKind.PLAYBACK],
-)
-async def test_busy_activity_prevents_idle_expiry(kind: BusyKind) -> None:
+def test_idle_lease_timer_records_only_timestamp_and_expired_claim() -> None:
     clock = Clock()
-    expirations = 0
+    timer = IdleLeaseTimer(idle_timeout_seconds=5, clock=clock)
 
-    async def expire() -> None:
-        nonlocal expirations
-        expirations += 1
-
-    lifecycle = LifecycleController(
-        idle_timeout_seconds=10,
-        clock=clock,
-        on_expire=expire,
-    )
-    lifecycle.enable()
-    lifecycle.set_busy(kind, active=True)
-    clock.now = 100
-
-    assert not await lifecycle.poll()
-    assert lifecycle.state is not LifecycleState.IDLE_EXPIRED
-
-    lifecycle.set_busy(kind, active=False)
-    clock.now = 109
-    assert not await lifecycle.poll()
-    clock.now = 110
-    assert await lifecycle.poll()
-    assert expirations == 1
+    assert timer.last_activity == 0
+    assert not timer.expired
+    assert set(vars(timer)) == {"_clock", "_idle_timeout_seconds", "_last_activity", "_expired"}
 
 
-async def test_idle_expiry_fires_once() -> None:
+def test_idle_lease_timer_expires_once_only_while_snapshot_is_idle() -> None:
     clock = Clock()
-    expirations = 0
-
-    async def expire() -> None:
-        nonlocal expirations
-        expirations += 1
-
-    lifecycle = LifecycleController(
-        idle_timeout_seconds=5,
-        clock=clock,
-        on_expire=expire,
-    )
-    lifecycle.enable()
+    timer = IdleLeaseTimer(idle_timeout_seconds=5, clock=clock)
     clock.now = 5
 
-    assert await lifecycle.poll()
-    assert not await lifecycle.poll()
-    assert expirations == 1
-    assert lifecycle.state is LifecycleState.IDLE_EXPIRED
+    assert not timer.claim_expired(is_idle=False)
+    assert not timer.expired
+    assert timer.claim_expired(is_idle=True)
+    assert timer.expired
+    assert not timer.claim_expired(is_idle=True)  # type: ignore[unreachable]
 
 
-async def test_listen_start_after_expiry_requests_fresh_session() -> None:
+def test_idle_lease_timer_touch_starts_a_fresh_period() -> None:
     clock = Clock()
+    timer = IdleLeaseTimer(idle_timeout_seconds=5, clock=clock)
+    clock.now = 4
+    timer.touch()
+    clock.now = 8
 
-    async def expire() -> None:
-        return None
-
-    lifecycle = LifecycleController(
-        idle_timeout_seconds=5,
-        clock=clock,
-        on_expire=expire,
-    )
-    lifecycle.enable()
-    clock.now = 5
-    await lifecycle.poll()
-
-    starts_fresh = lifecycle.listen_start()
-
-    assert starts_fresh
-    assert lifecycle.state is LifecycleState.LISTENING
-    assert lifecycle.is_busy
+    assert not timer.claim_expired(is_idle=True)
+    clock.now = 9
+    assert timer.claim_expired(is_idle=True)
 
 
-def test_listening_start_and_stop_update_state_and_activity() -> None:
-    clock = Clock()
-
-    async def expire() -> None:
-        return None
-
-    lifecycle = LifecycleController(
-        idle_timeout_seconds=5,
-        clock=clock,
-        on_expire=expire,
-    )
-    lifecycle.enable()
-
-    assert not lifecycle.listen_start()
-    assert lifecycle.state.value == "listening"
-    clock.now = 2
-    lifecycle.listen_stop()
-
-    assert lifecycle.state is LifecycleState.READY
-    assert not lifecycle.is_busy
-    assert lifecycle.last_activity == 2
+def test_idle_lease_timer_rejects_nonpositive_timeout() -> None:
+    with pytest.raises(ValueError, match="positive"):
+        IdleLeaseTimer(idle_timeout_seconds=0)

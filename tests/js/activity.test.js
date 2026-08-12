@@ -98,6 +98,68 @@ describe("ProgressTracker", () => {
     assert.equal(tracker.snapshot().label, "発話を待っています");
   });
 
+  it("keeps Agent progress active when an overlapping Voice turn completes", () => {
+    const tracker = new ProgressTracker({ now: () => 30_000 });
+    tracker.consume({
+      kind: "turn",
+      source: "voice",
+      phase: "started",
+      label: "応答処理",
+      occurredAtMs: 1_000,
+    });
+    tracker.consume({
+      kind: "turn",
+      source: "agent",
+      phase: "started",
+      label: "応答処理",
+      occurredAtMs: 2_000,
+    });
+    tracker.consume({
+      kind: "turn",
+      source: "voice",
+      phase: "completed",
+      label: "応答処理",
+      occurredAtMs: 3_000,
+    });
+
+    assert.deepEqual(tracker.snapshot(), {
+      active: true,
+      label: "Codex が処理を続けています",
+      elapsedMs: 29_000,
+      staleMs: 27_000,
+    });
+
+    tracker.consume({
+      kind: "turn",
+      source: "agent",
+      phase: "completed",
+      label: "応答処理",
+      occurredAtMs: 4_000,
+    });
+    assert.equal(tracker.snapshot().active, false);
+  });
+
+  it("does not settle an Agent turn when Voice loss has no active Voice turn", () => {
+    const tracker = new ProgressTracker({ now: () => 30_000 });
+    tracker.consume({
+      kind: "turn",
+      source: "agent",
+      phase: "started",
+      label: "応答処理",
+      occurredAtMs: 1_000,
+    });
+    tracker.consume({
+      kind: "turn",
+      source: "voice",
+      phase: "completed",
+      label: "応答処理",
+      occurredAtMs: 2_000,
+    });
+
+    assert.equal(tracker.snapshot().active, true);
+    assert.equal(tracker.snapshot().label, "Codex が処理を続けています");
+  });
+
   it("keeps playback visible after turn and synthesis complete", () => {
     const tracker = new ProgressTracker({ now: () => 30_000 });
     tracker.consume({ kind: "turn", phase: "started", label: "応答処理", occurredAtMs: 1_000 });

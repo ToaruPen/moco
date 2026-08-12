@@ -13,9 +13,11 @@ const {
   beginAudioActivation,
   BrowserHotkeyMapper,
   closeAudioContext,
+  closeCurrentPeer,
   connectionCloseErrorCode,
   connectionSetupErrorCode,
   closeDisconnectedMedia,
+  closeFailedHandshakePeer,
   closeSocketForFailure,
   ConversationHandshake,
   MocoController,
@@ -23,10 +25,12 @@ const {
   PairingPanel,
   renderPresetChoices,
   resetConnectionAttempt,
+  reconcileListeningState,
   setConnectionAction,
   setTransportOffline,
   shouldHandleHotkey,
   ThemePanel,
+  TurnCancelController,
   TranscriptView,
   VoiceModelController,
   waitForIce,
@@ -804,6 +808,146 @@ describe("MocoController", () => {
     assert.equal(reconnects, 1);
   });
 
+  it("manually reconnects Voice or a lost lease exactly once on the next listen", async () => {
+    const { controller } = harness();
+    let reconnects = 0;
+    controller.reconnect = async () => {
+      reconnects += 1;
+    };
+    controller.requireReconnect();
+
+    await controller.applyControl("listen_start");
+    await controller.applyControl("listen_stop");
+
+    assert.equal(reconnects, 1);
+  });
+
+  it("shares one in-flight reconnect across concurrent listen starts", async () => {
+    const { controller, messages } = harness();
+    let finishReconnect;
+    let reconnects = 0;
+    controller.reconnect = () => {
+      reconnects += 1;
+      return new Promise((resolve) => {
+        finishReconnect = resolve;
+      });
+    };
+    controller.requireReconnect();
+
+    const first = controller.applyControl("listen_start");
+    const second = controller.applyControl("listen_start");
+    await Promise.resolve();
+
+    assert.equal(reconnects, 1);
+    finishReconnect();
+    assert.deepEqual(await Promise.all([first, second]), [false, true]);
+    assert.deepEqual(messages, [{ type: "control", control: "listen_start" }]);
+  });
+
+  it("allows an explicit retry after a shared reconnect failure", async () => {
+    const { controller, messages } = harness();
+    const reconnectError = new Error("synthetic reconnect failure");
+    let reconnects = 0;
+    controller.reconnect = async () => {
+      reconnects += 1;
+      if (reconnects === 1) {
+        throw reconnectError;
+      }
+    };
+    controller.requireReconnect();
+
+    await assert.rejects(controller.applyControl("listen_start"), reconnectError);
+    assert.equal(controller.reconnectRequired, true);
+    assert.equal(await controller.applyControl("listen_start"), true);
+
+    assert.equal(reconnects, 2);
+    assert.deepEqual(messages, [{ type: "control", control: "listen_start" }]);
+  });
+
+  it("reconciles a non-listening transcribing state to microphone off", async () => {
+    const { controller, track } = harness();
+    const listenStart = {
+      classes: new Set(["is-active"]),
+      attributes: new Map([["aria-pressed", "true"]]),
+      classList: {
+        remove(name) {
+          listenStart.classes.delete(name);
+        },
+      },
+      setAttribute(name, value) {
+        this.attributes.set(name, value);
+      },
+    };
+    const micState = { textContent: "MIC ON", dataset: { status: "ok" } };
+    await controller.applyControl("listen_start");
+
+    reconcileListeningState({ controller, state: "transcribing", listenStart, micState });
+
+    assert.equal(track.enabled, false);
+    assert.equal(listenStart.classes.has("is-active"), false);
+    assert.equal(listenStart.attributes.get("aria-pressed"), "false");
+    assert.deepEqual(micState, { textContent: "MIC OFF", dataset: { status: "muted" } });
+  });
+
+  it("restores microphone state when listening follows a delayed stop state", async () => {
+    const { controller, track } = harness();
+    const listenStart = {
+      classes: new Set(),
+      attributes: new Map([["aria-pressed", "false"]]),
+      classList: {
+        add(name) {
+          listenStart.classes.add(name);
+        },
+        remove(name) {
+          listenStart.classes.delete(name);
+        },
+      },
+      setAttribute(name, value) {
+        this.attributes.set(name, value);
+      },
+    };
+    const micState = { textContent: "MIC OFF", dataset: { status: "muted" } };
+
+    await controller.applyControl("listen_stop");
+    await controller.applyControl("listen_start");
+    reconcileListeningState({ controller, state: "ready", listenStart, micState });
+    reconcileListeningState({ controller, state: "listening", listenStart, micState });
+
+    assert.equal(track.enabled, true);
+    assert.equal(listenStart.classes.has("is-active"), true);
+    assert.equal(listenStart.attributes.get("aria-pressed"), "true");
+    assert.deepEqual(micState, { textContent: "MIC ON", dataset: { status: "ok" } });
+  });
+
+  it("does not let a stale listening state undo the latest local stop", async () => {
+    const { controller, track } = harness();
+    const listenStart = {
+      classes: new Set(),
+      attributes: new Map(),
+      classList: {
+        add(name) {
+          listenStart.classes.add(name);
+        },
+        remove(name) {
+          listenStart.classes.delete(name);
+        },
+      },
+      setAttribute(name, value) {
+        this.attributes.set(name, value);
+      },
+    };
+    const micState = { textContent: "MIC OFF", dataset: { status: "muted" } };
+
+    await controller.applyControl("listen_start");
+    await controller.applyControl("listen_stop");
+    reconcileListeningState({ controller, state: "listening", listenStart, micState });
+
+    assert.equal(track.enabled, false);
+    assert.equal(listenStart.classes.has("is-active"), false);
+    assert.equal(listenStart.attributes.get("aria-pressed"), "false");
+    assert.deepEqual(micState, { textContent: "MIC OFF", dataset: { status: "muted" } });
+  });
+
   it("stops stale input while preserving output when a conversation expires", () => {
     const { controller, playback, track } = harness();
     track.enabled = true;
@@ -818,11 +962,13 @@ describe("MocoController", () => {
   it("lets a later stop supersede an in-flight reconnect", async () => {
     const { controller, messages, track } = harness();
     let finishReconnect;
+    let reconnects = 0;
     controller.reconnect = () =>
       new Promise((resolve) => {
+        reconnects += 1;
         finishReconnect = resolve;
       });
-    controller.idleExpired = true;
+    controller.requireReconnect();
 
     const starting = controller.applyControl("listen_start");
     await Promise.resolve();
@@ -831,7 +977,15 @@ describe("MocoController", () => {
     await starting;
 
     assert.equal(track.enabled, false);
+    assert.equal(controller.reconnectRequired, false);
     assert.deepEqual(messages, [{ type: "control", control: "listen_stop" }]);
+
+    assert.equal(await controller.applyControl("listen_start"), true);
+    assert.equal(reconnects, 1);
+    assert.deepEqual(messages, [
+      { type: "control", control: "listen_stop" },
+      { type: "control", control: "listen_start" },
+    ]);
   });
 });
 
@@ -886,6 +1040,42 @@ describe("BrowserHotkeyMapper", () => {
 
     assert.equal(shouldHandleHotkey({ target: input, key: "v" }, mapper), false);
     assert.equal(shouldHandleHotkey({ target: null, key: "v" }, mapper), true);
+  });
+
+  it("never maps a global or browser fallback key to turn cancellation", () => {
+    const mapper = new BrowserHotkeyMapper({
+      globalHotkeysEnabled: false,
+      startKey: "v",
+      stopKey: "escape",
+    });
+
+    for (const key of ["c", "delete", "backspace", "enter", " "]) {
+      assert.equal(mapper.keyDown(key), null);
+      assert.equal(mapper.keyUp(key), null);
+    }
+  });
+});
+
+describe("turn cancel", () => {
+  it("sends one explicit control only while the server says cancellation is allowed", () => {
+    const dom = new JSDOM('<button id="turn-cancel" type="button" disabled>取消</button>');
+    const button = dom.window.document.querySelector("#turn-cancel");
+    const messages = [];
+    const controller = new TurnCancelController({
+      button,
+      send: (message) => messages.push(message),
+    });
+
+    button.click();
+    controller.configure(true);
+    assert.equal(button.disabled, false);
+    button.click();
+    button.click();
+
+    assert.deepEqual(messages, [{ type: "control", control: "turn_cancel" }]);
+    assert.equal(button.disabled, true);
+    controller.configure(false);
+    assert.equal(button.disabled, true);
   });
 });
 
@@ -971,6 +1161,24 @@ describe("operator status", () => {
       "enable_failed — 音声セッションを開始できませんでした",
     );
   });
+
+  it("renders interaction backpressure without falling back to an unknown error", () => {
+    const dom = new JSDOM(`
+      <section id="error" hidden><span id="error-text"></span></section>
+    `);
+    const status = new OperatorStatus({
+      activityBuffer: new ActivityBuffer(),
+      activityView: { render: () => {} },
+      error: dom.window.document.querySelector("#error"),
+      errorText: dom.window.document.querySelector("#error-text"),
+      progress: new ProgressTracker(),
+      progressView: { render: () => {} },
+    });
+
+    status.showError("interaction_busy");
+
+    assert.equal(status.errorText.textContent, "interaction_busy — 別の処理を受け付けています");
+  });
 });
 
 describe("operator console DOM", () => {
@@ -1021,6 +1229,7 @@ describe("operator console DOM", () => {
       "voice",
       "listen-start",
       "listen-stop",
+      "turn-cancel",
       "progress-label",
       "progress-elapsed",
       "progress-updated",
@@ -1067,6 +1276,10 @@ describe("operator console DOM", () => {
       document.querySelector("#listen-stop").getAttribute("aria-label"),
       "音声入力を停止",
     );
+    assert.equal(
+      document.querySelector("#turn-cancel").getAttribute("aria-label"),
+      "実行中の処理を取り消す",
+    );
     assert.equal(document.querySelector("#voice").getAttribute("aria-label"), "音声モデル");
     assert.equal(document.querySelector("#pairing-panel").getAttribute("role"), "dialog");
   });
@@ -1107,6 +1320,57 @@ describe("operator console DOM", () => {
     assert.equal(image.src, "");
     assert.equal(calls.at(-1), "blob:pairing");
     assert.equal(calls[0].headers["X-Moco-Capability"], "private-capability");
+  });
+
+  it("treats arbitrary numeric IPv4 loopback as local for pairing probe", async () => {
+    const calls = [];
+    const panel = new PairingPanel({
+      capability: "private-capability",
+      dom: { open: { hidden: true } },
+      fetch: async (_url, options) => {
+        calls.push(options);
+        return { ok: true };
+      },
+      location: { hostname: "127.0.0.42" },
+      createObjectURL: () => "blob:pairing",
+      revokeObjectURL: () => {},
+    });
+
+    await panel.probe();
+
+    assert.equal(calls.length, 1);
+    assert.equal(calls[0].method, "HEAD");
+    assert.equal(panel.dom.open.hidden, false);
+  });
+
+  it("does not probe non-loopback or hostname-trick pairing locations", async () => {
+    for (const hostname of [
+      "192.0.2.1",
+      "127.0.0.42.evil",
+      "evil127.0.0.42",
+      "[::ffff:7f00:1]",
+      "::ffff:7f00:1",
+      "[::1%lo0]",
+      "::1%lo0",
+    ]) {
+      const calls = [];
+      const panel = new PairingPanel({
+        capability: "private-capability",
+        dom: { open: { hidden: true } },
+        fetch: async (_url, options) => {
+          calls.push(options);
+          return { ok: true };
+        },
+        location: { hostname },
+        createObjectURL: () => "blob:pairing",
+        revokeObjectURL: () => {},
+      });
+
+      await panel.probe();
+
+      assert.equal(calls.length, 0);
+      assert.equal(panel.dom.open.hidden, true);
+    }
   });
 
   it("applies a hex color edit while the user is typing", () => {
@@ -1285,7 +1549,398 @@ describe("VoiceModelController", () => {
   });
 });
 
+let bootHarnessSequence = 0;
+
+async function bootConversationHarness({ answerStarts = [], pendingOffers = [] } = {}) {
+  const html = await readFile(
+    new URL("../../src/moco/web/static/index.html", import.meta.url),
+    "utf8",
+  );
+  const dom = new JSDOM(html, { url: "http://127.0.0.1:8765/?capability=test-capability" });
+  dom.window.matchMedia = () => ({ matches: false, addEventListener() {} });
+  dom.window.fetch = async () => ({ ok: false });
+
+  const sent = [];
+  const sockets = [];
+  const peers = [];
+  let startIndex = 0;
+
+  class FakeSocket extends dom.window.EventTarget {
+    static CONNECTING = 0;
+    static OPEN = 1;
+    static CLOSED = 3;
+
+    constructor() {
+      super();
+      this.readyState = FakeSocket.CONNECTING;
+      sockets.push(this);
+      queueMicrotask(() => {
+        this.readyState = FakeSocket.OPEN;
+        this.dispatchEvent(new dom.window.Event("open"));
+      });
+    }
+
+    send(payload) {
+      const message = JSON.parse(payload);
+      sent.push(message);
+      if (message.type !== "start") {
+        return;
+      }
+      const currentStart = startIndex;
+      startIndex += 1;
+      if (answerStarts.includes(currentStart)) {
+        queueMicrotask(() => this.receive({ type: "sdp_answer", sdp: `answer-${currentStart}` }));
+      }
+    }
+
+    receive(message) {
+      this.dispatchEvent(new dom.window.MessageEvent("message", { data: JSON.stringify(message) }));
+    }
+
+    close() {
+      if (this.readyState === FakeSocket.CLOSED) {
+        return;
+      }
+      this.readyState = FakeSocket.CLOSED;
+      this.dispatchEvent(new dom.window.Event("close"));
+    }
+  }
+
+  class FakePeer extends dom.window.EventTarget {
+    constructor() {
+      super();
+      this.index = peers.length;
+      this.connectionState = "connecting";
+      this.iceGatheringState = "complete";
+      this.localDescription = undefined;
+      this.closeCalls = 0;
+      this.remoteDescriptions = [];
+      peers.push(this);
+    }
+
+    addTrack() {}
+
+    createDataChannel() {}
+
+    createOffer() {
+      if (!pendingOffers.includes(this.index)) {
+        return Promise.resolve({ type: "offer", sdp: `offer-${this.index}` });
+      }
+      return new Promise((_resolve, reject) => {
+        this.rejectOffer = reject;
+      });
+    }
+
+    async setLocalDescription(description) {
+      this.localDescription = description;
+    }
+
+    async setRemoteDescription(description) {
+      this.remoteDescriptions.push(description);
+    }
+
+    close() {
+      this.closeCalls += 1;
+      this.rejectOffer?.(new Error("peer closed before offer"));
+      this.rejectOffer = undefined;
+    }
+
+    fail() {
+      this.connectionState = "failed";
+      this.dispatchEvent(new dom.window.Event("connectionstatechange"));
+    }
+  }
+
+  class FakeAudioContext {
+    constructor() {
+      this.state = "running";
+      this.currentTime = 0;
+      this.destination = {};
+    }
+
+    async resume() {}
+
+    async close() {
+      this.state = "closed";
+    }
+  }
+
+  const track = { enabled: false, stop() {} };
+  const stream = {
+    getAudioTracks: () => [track],
+    getTracks: () => [track],
+  };
+  Object.defineProperty(dom.window.navigator, "mediaDevices", {
+    configurable: true,
+    value: { getUserMedia: async () => stream },
+  });
+
+  const replacements = {
+    window: dom.window,
+    document: dom.window.document,
+    navigator: dom.window.navigator,
+    HTMLInputElement: dom.window.HTMLInputElement,
+    Option: dom.window.Option,
+    WebSocket: FakeSocket,
+    RTCPeerConnection: FakePeer,
+    AudioContext: FakeAudioContext,
+  };
+  const descriptors = new Map(
+    Object.keys(replacements).map((name) => [
+      name,
+      Object.getOwnPropertyDescriptor(globalThis, name),
+    ]),
+  );
+  for (const [name, value] of Object.entries(replacements)) {
+    Object.defineProperty(globalThis, name, { configurable: true, writable: true, value });
+  }
+
+  try {
+    bootHarnessSequence += 1;
+    await import(
+      `../../src/moco/web/static/app.js?boot-conversation-harness=${bootHarnessSequence}`
+    );
+  } catch (error) {
+    for (const [name, descriptor] of descriptors) {
+      if (descriptor) {
+        Object.defineProperty(globalThis, name, descriptor);
+      } else {
+        delete globalThis[name];
+      }
+    }
+    dom.window.close();
+    throw error;
+  }
+
+  const waitFor = async (predicate) => {
+    for (let attempt = 0; attempt < 100; attempt += 1) {
+      if (predicate()) {
+        return;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    assert.fail(
+      `timed out waiting for boot conversation state: peers=${peers.length} sent=${JSON.stringify(sent)} error=${dom.window.document.querySelector("#error-text").textContent}`,
+    );
+  };
+  const requireReplacement = () => {
+    sockets[0].receive({
+      type: "state",
+      state: "voice_reconnect_required",
+      canCancel: false,
+      hotkeys: { enabled: true, startListening: "f1", stopListening: "f2" },
+      voice: { selected: null, options: [], ready: false, readiness: "loading" },
+    });
+    dom.window.document.querySelector("#listen-start").click();
+  };
+  const close = async () => {
+    if (startIndex > 0 && sockets[0]?.readyState === FakeSocket.OPEN) {
+      sockets[0].receive({ type: "sdp_answer", sdp: "cleanup-answer" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+    }
+    for (const socket of sockets) {
+      socket.close();
+    }
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    for (const [name, descriptor] of descriptors) {
+      if (descriptor) {
+        Object.defineProperty(globalThis, name, descriptor);
+      } else {
+        delete globalThis[name];
+      }
+    }
+    dom.window.close();
+  };
+
+  dom.window.document.querySelector("#enable").click();
+  return {
+    close,
+    dom,
+    peers,
+    receive: (message) => sockets[0].receive(message),
+    requireReplacement,
+    retryListening: () => dom.window.document.querySelector("#listen-start").click(),
+    sent,
+    waitFor,
+  };
+}
+
 describe("browser connection timeouts", () => {
+  it("settles only the lost Voice turn before a manual re-offer", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0] });
+    const state = {
+      type: "state",
+      state: "voice_reconnect_required",
+      canCancel: false,
+      hotkeys: { enabled: true, startListening: "f1", stopListening: "f2" },
+      voice: { selected: null, options: [], ready: false, readiness: "loading" },
+    };
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.receive({
+        type: "activity",
+        kind: "turn",
+        source: "voice",
+        phase: "started",
+        label: "応答処理",
+        occurredAtMs: Date.now(),
+      });
+      await connection.waitFor(() =>
+        connection.dom.window.document
+          .querySelector("#progress-label")
+          .textContent.includes("Codex"),
+      );
+
+      connection.receive(state);
+      await connection.waitFor(
+        () =>
+          connection.dom.window.document.querySelector("#progress-label").textContent ===
+          "発話を待っています",
+      );
+
+      connection.receive({
+        type: "activity",
+        kind: "turn",
+        source: "voice",
+        phase: "started",
+        label: "応答処理",
+        occurredAtMs: Date.now(),
+      });
+      connection.receive({
+        type: "activity",
+        kind: "turn",
+        source: "voice",
+        phase: "completed",
+        label: "応答処理",
+        occurredAtMs: Date.now(),
+      });
+      await connection.waitFor(
+        () =>
+          connection.dom.window.document.querySelector("#progress-label").textContent ===
+          "発話を待っています",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("suppresses Voice loss from the actual watcher before initial or replacement Start", async () => {
+    const initial = await bootConversationHarness({ pendingOffers: [0] });
+    try {
+      await initial.waitFor(() => initial.peers.length === 1);
+      initial.peers[0].fail();
+      initial.peers[0].fail();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(
+        initial.sent.filter(({ type }) => type === "voice_lost"),
+        [],
+      );
+      assert.equal(initial.peers[0].closeCalls, 1);
+    } finally {
+      await initial.close();
+    }
+
+    const replacement = await bootConversationHarness({
+      answerStarts: [0],
+      pendingOffers: [1],
+    });
+    try {
+      await replacement.waitFor(() => replacement.peers[0]?.remoteDescriptions.length === 1);
+      replacement.requireReplacement();
+      await replacement.waitFor(() => replacement.peers.length === 2);
+      replacement.peers[1].fail();
+      replacement.peers[1].fail();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(
+        replacement.sent.filter(({ type }) => type === "voice_lost"),
+        [],
+      );
+      assert.equal(replacement.peers[1].closeCalls, 1);
+    } finally {
+      await replacement.close();
+    }
+  });
+
+  it("sends Voice loss once from the actual watcher for published Voice phases", async () => {
+    const established = await bootConversationHarness({ answerStarts: [0] });
+    try {
+      await established.waitFor(() => established.peers[0]?.remoteDescriptions.length === 1);
+      established.peers[0].fail();
+      established.peers[0].fail();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(
+        established.sent.filter(({ type }) => type === "voice_lost"),
+        [{ type: "voice_lost" }],
+      );
+      assert.equal(established.peers[0].closeCalls, 1);
+    } finally {
+      await established.close();
+    }
+
+    const replacement = await bootConversationHarness({ answerStarts: [0] });
+    try {
+      await replacement.waitFor(() => replacement.peers[0]?.remoteDescriptions.length === 1);
+      replacement.requireReplacement();
+      await replacement.waitFor(
+        () => replacement.sent.filter(({ type }) => type === "start").length === 2,
+      );
+      replacement.peers[1].fail();
+      replacement.peers[1].fail();
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(
+        replacement.sent.filter(({ type }) => type === "voice_lost"),
+        [{ type: "voice_lost" }],
+      );
+      assert.equal(replacement.peers[1].closeCalls, 1);
+    } finally {
+      await replacement.close();
+    }
+  });
+
+  it("rejects the failed peer handshake and ignores its delayed answer during manual retry", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0] });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.requireReplacement();
+      await connection.waitFor(
+        () => connection.sent.filter(({ type }) => type === "start").length === 2,
+      );
+
+      connection.peers[1].fail();
+      await connection.waitFor(
+        () => connection.sent.filter(({ type }) => type === "voice_lost").length === 1,
+      );
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      connection.retryListening();
+      await connection.waitFor(
+        () => connection.sent.filter(({ type }) => type === "start").length === 3,
+      );
+
+      connection.receive({ type: "sdp_answer", sdp: "delayed-old-answer" });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+      assert.deepEqual(connection.peers[2].remoteDescriptions, []);
+
+      connection.receive({ type: "sdp_answer", sdp: "current-answer" });
+      await connection.waitFor(() => connection.peers[2].remoteDescriptions.length === 1);
+      await connection.waitFor(
+        () => connection.sent.filter(({ type }) => type === "control").length === 1,
+      );
+      assert.deepEqual(connection.peers[2].remoteDescriptions, [
+        { type: "answer", sdp: "current-answer" },
+      ]);
+      assert.deepEqual(
+        connection.sent.filter(({ type }) => type === "voice_lost"),
+        [{ type: "voice_lost" }],
+      );
+      assert.deepEqual(
+        connection.sent.filter(({ type }) => type === "control"),
+        [{ type: "control", control: "listen_start" }],
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("resets transport indicators after setup fails", () => {
     const connection = { textContent: "WS ONLINE", dataset: { status: "ok" } };
     const micState = { textContent: "MIC ON", dataset: { status: "ok" } };
@@ -1330,6 +1985,105 @@ describe("browser connection timeouts", () => {
       closeSocketForFailure(undefined, error, () => {}),
       false,
     );
+  });
+
+  it("keeps the socket open after a replacement failure", () => {
+    const socket = {
+      closes: 0,
+      close() {
+        this.closes += 1;
+      },
+    };
+    const failures = [];
+    const error = new Error("failed replacement SDP");
+
+    assert.equal(
+      closeSocketForFailure(socket, error, (failure) => failures.push(failure), {
+        preserveTransport: true,
+      }),
+      false,
+    );
+    assert.equal(socket.closes, 0);
+    assert.deepEqual(failures, []);
+  });
+
+  it("closes only the current failed peer before manual reconnect", () => {
+    const stalePeer = {
+      closes: 0,
+      close() {
+        this.closes += 1;
+      },
+    };
+    const currentPeer = {
+      closes: 0,
+      close() {
+        this.closes += 1;
+      },
+    };
+    let stops = 0;
+    let reconnects = 0;
+    const cleanup = {
+      stopWatching: () => {
+        stops += 1;
+      },
+      requireReconnect: () => {
+        reconnects += 1;
+      },
+    };
+
+    assert.equal(closeCurrentPeer(stalePeer, currentPeer, cleanup), false);
+    assert.equal(closeCurrentPeer(currentPeer, currentPeer, cleanup), true);
+    assert.deepEqual(
+      { staleCloses: stalePeer.closes, currentCloses: currentPeer.closes, stops, reconnects },
+      { staleCloses: 0, currentCloses: 1, stops: 1, reconnects: 1 },
+    );
+  });
+
+  it("notifies Voice loss only for a current replacement after Start was sent", () => {
+    const run = ({ replacement, startSent, stale = false }) => {
+      const sent = [];
+      let reconnects = 0;
+      const currentPeer = {
+        closes: 0,
+        close() {
+          this.closes += 1;
+        },
+      };
+      const failedPeer = stale
+        ? {
+            closes: 0,
+            close() {
+              this.closes += 1;
+            },
+          }
+        : currentPeer;
+      const closed = closeFailedHandshakePeer(failedPeer, currentPeer, {
+        replacement,
+        startSent,
+        stopWatching: () => {},
+        requireReconnect: () => {
+          reconnects += 1;
+        },
+        send: (message) => sent.push(message),
+      });
+      return { closed, currentCloses: currentPeer.closes, reconnects, sent };
+    };
+
+    assert.deepEqual(run({ replacement: true, startSent: true }), {
+      closed: true,
+      currentCloses: 1,
+      reconnects: 1,
+      sent: [{ type: "voice_lost" }],
+    });
+    for (const input of [
+      { replacement: false, startSent: true },
+      { replacement: true, startSent: false },
+      { replacement: true, startSent: true, stale: true },
+    ]) {
+      const result = run(input);
+      assert.deepEqual(result.sent, []);
+      assert.equal(result.closed, input.stale !== true);
+    }
   });
 
   it("waits for the SDP answer and rejects every stable terminal start error", async () => {

@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
+import yaml
 from pydantic import ValidationError
 
+from moco import config as config_module
 from moco.config import (
+    AgentProfileMode,
     CodexSettings,
     ConfigError,
     IrodoriSettings,
@@ -15,6 +21,15 @@ from moco.config import (
     default_prompt_path,
     load_config,
 )
+from moco.errors import PrivateStateError
+
+
+@pytest.fixture(autouse=True)
+def _isolate_config_content_tests_from_windows_host_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    if sys.platform == "win32":
+        monkeypatch.setattr(config_module, "_current_platform", lambda: "darwin")
 
 
 def test_load_config_applies_defaults(tmp_path: Path) -> None:
@@ -30,6 +45,35 @@ def test_load_config_applies_defaults(tmp_path: Path) -> None:
     assert settings.speech.segment_max_chars == 80
 
 
+def test_windows_config_load_fails_closed_on_unsafe_access_control(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(config_module, "_current_platform", lambda: "win32")
+
+    def reject(_path: Path) -> None:
+        message = "untrusted principal"
+        raise PrivateStateError(message)
+
+    @contextmanager
+    def namespace(_path: Path, *, platform_name: str) -> Iterator[None]:
+        assert platform_name == "win32"
+        yield
+
+    monkeypatch.setattr(config_module, "_config_namespace", namespace)
+    monkeypatch.setattr(
+        config_module,
+        "_validate_windows_config_path",
+        reject,
+        raising=False,
+    )
+
+    with pytest.raises(ConfigError, match="security requirements"):
+        load_config(path)
+
+
 def test_load_config_applies_yaml_values(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
     path.write_text(
@@ -41,6 +85,39 @@ def test_load_config_applies_yaml_values(tmp_path: Path) -> None:
 
     assert settings.runtime.idle_timeout_seconds == 42
     assert str(settings.irodori.base_url) == "http://100.64.0.1:8923/"
+
+
+@pytest.mark.parametrize(
+    ("configured_host", "expected_host"),
+    [
+        ("localhost", "127.0.0.1"),
+        (" LOCALHOST ", "127.0.0.1"),
+        ("127.0.0.42", "127.0.0.42"),
+        ("::1", "::1"),
+        ("0:0:0:0:0:0:0:1", "::1"),
+    ],
+)
+def test_server_host_is_canonical_numeric_loopback(
+    configured_host: str,
+    expected_host: str,
+) -> None:
+    assert ServerSettings(host=configured_host).host == expected_host
+
+
+@pytest.mark.parametrize(
+    "configured_host",
+    [
+        "::ffff:127.0.0.1",
+        "::ffff:7f00:1",
+        "::1%lo0",
+        "::1%25lo0",
+    ],
+)
+def test_server_host_rejects_mapped_and_scoped_loopback_forms(
+    configured_host: str,
+) -> None:
+    with pytest.raises(ValidationError, match="loopback"):
+        ServerSettings(host=configured_host)
 
 
 def test_example_config_loads() -> None:
@@ -148,33 +225,87 @@ def test_hotkeys_must_be_distinct(tmp_path: Path) -> None:
         load_config(path)
 
 
-@pytest.mark.parametrize("field", ["binary", "working_directory"])
-def test_codex_paths_must_be_absolute(tmp_path: Path, field: str) -> None:
+def test_codex_working_directory_must_be_absolute(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
-    path.write_text(f"codex:\n  {field}: relative/path\n", encoding="utf-8")
+    path.write_text("codex:\n  working_directory: relative/path\n", encoding="utf-8")
 
-    with pytest.raises(ConfigError, match=f"codex.{field}"):
+    with pytest.raises(ConfigError, match=r"codex\.working_directory"):
         load_config(path)
 
 
-def test_default_prompt_path_uses_dot_moco(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("HOME", "/Users/example")
+def test_codex_command_and_working_directory_are_portable_defaults() -> None:
+    settings = CodexSettings()
 
-    assert default_prompt_path() == Path("/Users/example/.moco/prompt.md")
+    assert settings.command is None
+    assert settings.working_directory is None
+
+
+def test_codex_command_accepts_an_argv_list(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(
+        'codex:\n  command: ["codex", "--strict-config"]\n',
+        encoding="utf-8",
+    )
+
+    assert load_config(path).codex.command == ("codex", "--strict-config")
+
+
+@pytest.mark.parametrize("command", [[], [""], ["   "], ["codex", "bad\0arg"]])
+def test_codex_command_rejects_unsafe_argv(
+    tmp_path: Path,
+    command: list[str],
+) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(yaml.safe_dump({"codex": {"command": command}}), encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"codex\.command"):
+        load_config(path)
+
+
+def test_default_prompt_path_uses_dot_moco() -> None:
+    assert default_prompt_path(
+        platform_name="darwin",
+        environ={"HOME": "/Users/example"},
+    ) == Path("/Users/example/.moco/prompt.md")
 
 
 def test_codex_prompt_file_defaults_to_implicit_path() -> None:
     assert CodexSettings().prompt_file is None
 
 
-def test_codex_prompt_file_expands_home(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setenv("HOME", "/Users/example")
+def test_codex_prompt_file_expands_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    home = tmp_path / "portable-home"
+    monkeypatch.setenv("HOME", str(home))
+    monkeypatch.setenv("USERPROFILE", str(home))
 
     settings = CodexSettings(prompt_file=Path("~/.moco/character.md"))
 
-    assert settings.prompt_file == Path("/Users/example/.moco/character.md")
+    assert settings.prompt_file == home / ".moco" / "character.md"
+
+
+def test_codex_prompt_file_rejects_named_user_when_host_does_not_expand_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(Path, "expanduser", lambda path: path)
+
+    with pytest.raises(ValidationError, match="home directory"):
+        CodexSettings(prompt_file=Path("~unknown-moco-user/prompt.md"))
+
+
+def test_codex_prompt_file_rejects_named_user_even_when_host_expands_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        Path,
+        "expanduser",
+        lambda _path: Path("/Users/another-user/prompt.md"),
+    )
+
+    with pytest.raises(ValidationError, match="home directory"):
+        CodexSettings(prompt_file=Path("~another-user/prompt.md"))
 
 
 def test_codex_prompt_file_rejects_relative_path(tmp_path: Path) -> None:
@@ -206,6 +337,58 @@ def test_codex_prompt_file_rejects_unusable_path(
 
     with pytest.raises(ConfigError, match=rf"codex\.prompt_file.*{message}"):
         load_config(path)
+
+
+def test_agent_profile_modes_are_exactly_three() -> None:
+    assert [mode.value for mode in AgentProfileMode] == [
+        "read_only",
+        "workspace_write",
+        "inherit_codex",
+    ]
+
+
+def test_agent_profile_defaults_to_read_only(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("{}\n", encoding="utf-8")
+
+    assert load_config(path).agent.profile == "read_only"
+
+
+@pytest.mark.parametrize("profile", ["read_only", "workspace_write", "inherit_codex"])
+def test_agent_profile_accepts_supported_modes(tmp_path: Path, profile: str) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text(f"agent:\n  profile: {profile}\n", encoding="utf-8")
+
+    assert load_config(path).agent.profile == profile
+
+
+def test_agent_profile_rejects_unknown_mode(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    rejected_profile = "danger_full_access"
+    path.write_text(f"agent:\n  profile: {rejected_profile}\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"agent\.profile") as caught:
+        load_config(path)
+
+    assert rejected_profile not in str(caught.value)
+
+
+def test_agent_rejects_unknown_keys(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("agent:\n  mystery: true\n", encoding="utf-8")
+
+    with pytest.raises(ConfigError, match=r"agent\.mystery"):
+        load_config(path)
+
+
+def test_example_config_documents_the_agent_profile_modes() -> None:
+    path = Path(__file__).parents[1] / "config" / "moco.example.yaml"
+    example = path.read_text(encoding="utf-8")
+
+    assert "profile: read_only" in example
+    for mode in AgentProfileMode:
+        assert mode.value in example
+    assert load_config(path).agent.profile is AgentProfileMode.READ_ONLY
 
 
 def test_irodori_url_must_not_contain_credentials(tmp_path: Path) -> None:
@@ -346,11 +529,10 @@ def test_invalid_yaml_is_reported_without_values(tmp_path: Path) -> None:
     assert sensitive_value not in str(caught.value)
 
 
-def test_default_config_path_uses_macos_application_support(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    monkeypatch.setenv("HOME", "/Users/example")
-
-    assert default_config_path() == Path(
+def test_default_config_path_uses_macos_application_support() -> None:
+    assert default_config_path(
+        platform_name="darwin",
+        environ={"HOME": "/Users/example"},
+    ) == Path(
         "/Users/example/Library/Application Support/moco/moco.yaml",
     )

@@ -17,6 +17,7 @@ NonNegativeStrictInt = Annotated[int, Field(strict=True, ge=0)]
 class ClientControl(StrEnum):
     LISTEN_START = "listen_start"
     LISTEN_STOP = "listen_stop"
+    TURN_CANCEL = "turn_cancel"
 
 
 class _ClientMessage(BaseModel):
@@ -59,8 +60,17 @@ class StopMessage(_ClientMessage):
     type: Literal["stop"] = "stop"
 
 
+class VoiceLostMessage(_ClientMessage):
+    type: Literal["voice_lost"] = "voice_lost"
+
+
 ClientMessage = Annotated[
-    StartMessage | ControlMessage | PlaybackMessage | SelectVoiceMessage | StopMessage,
+    StartMessage
+    | ControlMessage
+    | PlaybackMessage
+    | SelectVoiceMessage
+    | StopMessage
+    | VoiceLostMessage,
     Field(discriminator="type"),
 ]
 _CLIENT_MESSAGE_ADAPTER: TypeAdapter[ClientMessage] = TypeAdapter(ClientMessage)

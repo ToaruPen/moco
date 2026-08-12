@@ -42,10 +42,18 @@ jobs:
       - name: Run complete quality gate
         run: just check
 
-  macos-integration:
-    name: Mocked integration / macOS
-    runs-on: macos-latest
+  python-platform:
+    name: Python platform / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+          - name: Windows
+            os: windows-latest
     steps:
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6
@@ -55,7 +63,8 @@ jobs:
         with:
           enable-cache: true
           cache-dependency-glob: uv.lock
+      - uses: extractions/setup-just@f8a3cce218d9f83db3a2ecd90e41ac3de6cdfd9b # v3
       - name: Install Python dependencies
         run: uv sync --frozen
-      - name: Run mocked media boundary
-        run: uv run pytest tests/test_integration.py -q --durations=10
+      - name: Run Python tests
+        run: just test-python

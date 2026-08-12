@@ -13,8 +13,23 @@ from typing import TYPE_CHECKING, Protocol
 from irodori_tts_infra.contracts import CapabilitiesResponse
 from pydantic import ValidationError
 
-from moco.codex.rpc import CodexRpcClient
+from moco.codex.capabilities import (
+    CapabilityDiscovery,
+    CapabilitySnapshot,
+    CapabilityState,
+    CapabilityStatus,
+    EffectivePolicy,
+)
+from moco.codex.connection import CodexConnectionSupervisor
+from moco.codex.schema import CodexSchemaProbe
 from moco.config import MocoSettings
+from moco.errors import CodexCommandError
+from moco.platform import (
+    CodexCommand,
+    hotkey_unavailable_detail,
+    resolve_codex_command,
+    service_supported,
+)
 from moco.runtime.hotkeys import GlobalHotkeyListener, HotkeyMapper
 from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 
@@ -24,7 +39,7 @@ if TYPE_CHECKING:
     from moco.codex.rpc import JsonValue
 
 
-class DoctorRpcClient(Protocol):
+class DoctorConnection(Protocol):
     async def start(self) -> None: ...
 
     async def request(
@@ -38,6 +53,10 @@ class DoctorRpcClient(Protocol):
     async def close(self) -> None: ...
 
 
+class DoctorCapabilityDiscovery(Protocol):
+    async def discover(self) -> CapabilitySnapshot: ...
+
+
 class DoctorSynthesizer(Protocol):
     async def capabilities(self) -> CapabilitiesResponse: ...
 
@@ -48,11 +67,42 @@ class DoctorSynthesizer(Protocol):
     async def close(self) -> None: ...
 
 
-type RpcFactory = Callable[[Path], DoctorRpcClient]
+type CommandResolver = Callable[[tuple[str, ...] | None], CodexCommand]
+type ConnectionFactory = Callable[[CodexCommand], DoctorConnection]
+type DiscoveryFactory = Callable[
+    [CodexCommand, DoctorConnection, Path],
+    DoctorCapabilityDiscovery,
+]
 type SynthesizerFactory = Callable[[MocoSettings], DoctorSynthesizer]
 type CloudflaredProbe = Callable[[], tuple[bool, bool]]
 logger = logging.getLogger(__name__)
 _CLOUDFLARED_SERVICE_LABEL = "dev.toarupen.moco-cloudflared"
+_CODEX_CHECK_CODES = (
+    "codex_command",
+    "codex_schema",
+    "codex_account",
+    "codex_policy",
+    "codex_agent_admission",
+    "codex_local_review",
+    "codex_realtime",
+    "codex_interrupt",
+    "codex_server_requests",
+)
+_CODEX_DETAILS_BY_STATUS: dict[CapabilityStatus, frozenset[str]] = {
+    CapabilityStatus.DISABLED: frozenset({"feature_disabled", "no_voice", "unsafe_voice_policy"}),
+    CapabilityStatus.AUTHENTICATION_REQUIRED: frozenset({"authentication_required"}),
+    CapabilityStatus.VERSION_MISMATCH: frozenset(
+        {
+            "approval_categories_unavailable",
+            "approval_family_unadaptable",
+            "agent_event_contract_unavailable",
+            "invalid_response",
+            "method_unavailable",
+            "unclassified_server_requests",
+        }
+    ),
+    CapabilityStatus.ERROR: frozenset({"probe_failed"}),
+}
 _IRODORI_SYNTHESIS_DETAILS = frozenset(
     {
         "runtime_generation_mismatch",
@@ -76,7 +126,9 @@ class DoctorCheck:
 async def run_doctor(
     settings: MocoSettings,
     *,
-    rpc_factory: RpcFactory | None = None,
+    command_resolver: CommandResolver | None = None,
+    connection_factory: ConnectionFactory | None = None,
+    discovery_factory: DiscoveryFactory | None = None,
     synthesizer_factory: SynthesizerFactory | None = None,
     hotkey_probe: Callable[[], bool] | None = None,
     cloudflared_probe: CloudflaredProbe | None = None,
@@ -92,30 +144,31 @@ async def run_doctor(
             probe=cloudflared_probe or _default_cloudflared_probe,
         ),
     )
-    binary = settings.codex.binary
-    binary_ok = binary.is_file() and os.access(binary, os.X_OK)
-    checks.append(
-        DoctorCheck(
-            "codex_binary",
-            "ok" if binary_ok else "error",
-            "available" if binary_ok else "unavailable",
-        ),
-    )
-    if binary_ok:
-        checks.extend(
-            await _probe_codex(
-                binary,
-                factory=rpc_factory or _default_rpc_factory,
-            ),
-        )
+    checks.append(DoctorCheck("codex_profile", "ok", settings.agent.profile.value))
+    resolver = command_resolver or resolve_codex_command
+    try:
+        command = resolver(settings.codex.command)
+    except CodexCommandError:
+        checks.extend(_codex_command_unavailable_checks())
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Doctor Codex command probe failed (type=%s)", type(error).__name__)
+        checks.extend(_codex_probe_failed_checks(include_command=True))
     else:
-        checks.extend(
-            [
-                DoctorCheck("codex_account", "blocked", "binary_unavailable"),
-                DoctorCheck("codex_features", "blocked", "binary_unavailable"),
-                DoctorCheck("codex_voices", "blocked", "binary_unavailable"),
-            ],
-        )
+        checks.append(DoctorCheck("codex_command", "ok", "available"))
+        try:
+            working_directory = (settings.codex.working_directory or Path.cwd()).absolute()
+        except Exception as error:  # noqa: BLE001
+            logger.warning("Doctor Codex probe failed (type=%s)", type(error).__name__)
+            checks.extend(_codex_probe_failed_checks())
+        else:
+            checks.extend(
+                await _probe_codex(
+                    command,
+                    working_directory=working_directory,
+                    connection_factory=connection_factory or _default_connection_factory,
+                    discovery_factory=discovery_factory or _default_discovery_factory,
+                ),
+            )
 
     checks.extend(
         await _probe_irodori(
@@ -144,7 +197,7 @@ async def run_doctor(
         DoctorCheck(
             "hotkeys",
             "ok" if hotkeys_ok else "error",
-            "available" if hotkeys_ok else "input_monitoring_required",
+            "available" if hotkeys_ok else hotkey_unavailable_detail(),
         ),
     )
     return checks
@@ -169,6 +222,15 @@ def _check_public_operator(
             DoctorCheck("cloudflared_binary", "error", "probe_failed"),
             DoctorCheck("cloudflared_service", "blocked", "probe_failed"),
         ]
+    if service_running:
+        service_status = "ok"
+        service_detail = "running"
+    elif binary_available:
+        service_status = "error"
+        service_detail = "not_running"
+    else:
+        service_status = "blocked"
+        service_detail = "binary_unavailable"
     return [
         DoctorCheck("operator_public_url", "ok", "configured"),
         DoctorCheck(
@@ -178,12 +240,8 @@ def _check_public_operator(
         ),
         DoctorCheck(
             "cloudflared_service",
-            "ok" if service_running else ("error" if binary_available else "blocked"),
-            (
-                "running"
-                if service_running
-                else ("not_running" if binary_available else "binary_unavailable")
-            ),
+            service_status,
+            service_detail,
         ),
     ]
 
@@ -192,6 +250,8 @@ def _default_cloudflared_probe() -> tuple[bool, bool]:
     binary_available = shutil.which("cloudflared") is not None
     if not binary_available:
         return False, False
+    if not service_supported():
+        return True, False
     completed = subprocess.run(  # noqa: S603
         [
             "/bin/launchctl",
@@ -207,86 +267,126 @@ def _default_cloudflared_probe() -> tuple[bool, bool]:
 
 
 async def _probe_codex(
-    binary: Path,
+    command: CodexCommand,
     *,
-    factory: RpcFactory,
+    working_directory: Path,
+    connection_factory: ConnectionFactory,
+    discovery_factory: DiscoveryFactory,
 ) -> list[DoctorCheck]:
-    client = factory(binary)
-    results: list[DoctorCheck] = []
     try:
-        await client.start()
-        account = await client.request("account/read", {"refreshToken": False})
-        account_ok = (
-            isinstance(account, dict)
-            and isinstance(account.get("account"), dict)
-            and bool(account["account"])
-        )
-        results.append(
-            DoctorCheck(
-                "codex_account",
-                "ok" if account_ok else "error",
-                "authenticated" if account_ok else "unavailable",
-            ),
-        )
-        features = await client.request("experimentalFeature/list", {})
-        features_ok = _realtime_feature_available(features)
-        results.append(
-            DoctorCheck(
-                "codex_features",
-                "ok" if features_ok else "error",
-                "available" if features_ok else "unavailable",
-            ),
-        )
-        voices = await client.request("thread/realtime/listVoices", {})
-        voices_ok = _realtime_voices_available(voices)
-        results.append(
-            DoctorCheck(
-                "codex_voices",
-                "ok" if voices_ok else "error",
-                "available" if voices_ok else "unavailable",
-            ),
-        )
-    except Exception:  # noqa: BLE001
-        existing = {check.code for check in results}
-        results.extend(
-            DoctorCheck(code, "error", "probe_failed")
-            for code in ("codex_account", "codex_features", "codex_voices")
-            if code not in existing
-        )
+        connection = connection_factory(command)
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Doctor Codex probe failed (type=%s)", type(error).__name__)
+        return _codex_probe_failed_checks()
+    try:
+        await connection.start()
+        discovery = discovery_factory(command, connection, working_directory)
+        snapshot: object = await discovery.discover()
+        return _project_codex_snapshot(_validated_snapshot(snapshot))
+    except Exception as error:  # noqa: BLE001
+        logger.warning("Doctor Codex probe failed (type=%s)", type(error).__name__)
+        return _codex_probe_failed_checks()
     finally:
         try:
-            await client.close()
+            await connection.close()
         except Exception as error:  # noqa: BLE001
             logger.warning("Doctor Codex cleanup failed (type=%s)", type(error).__name__)
-    return results
 
 
-def _realtime_feature_available(response: object) -> bool:
-    if not isinstance(response, dict):
-        return False
-    features = response.get("data")
-    if not isinstance(features, list):
-        return False
-    return any(
-        isinstance(feature, dict)
-        and feature.get("name") == "realtime_conversation"
-        and feature.get("enabled") is True
-        for feature in features
+def _validated_snapshot(value: object) -> CapabilitySnapshot:
+    if not isinstance(value, CapabilitySnapshot):
+        message = "Codex discovery returned an invalid snapshot"
+        raise TypeError(message)
+    return value
+
+
+def _project_codex_snapshot(snapshot: CapabilitySnapshot) -> list[DoctorCheck]:
+    return [
+        _project_schema(snapshot),
+        _project_capability("codex_account", snapshot.account, available_detail="authenticated"),
+        _project_policy(snapshot.effective_policy, snapshot.policy_state),
+        _project_capability(
+            "codex_agent_admission",
+            snapshot.agent_admission,
+            available_detail="allowed",
+        ),
+        _project_capability(
+            "codex_local_review",
+            snapshot.server_requests,
+            available_detail="available",
+        ),
+        _project_capability("codex_realtime", snapshot.realtime, available_detail="available"),
+        _project_capability("codex_interrupt", snapshot.interrupt, available_detail="available"),
+        _project_capability(
+            "codex_server_requests",
+            snapshot.server_requests,
+            available_detail="discovered",
+        ),
+    ]
+
+
+def _project_schema(snapshot: CapabilitySnapshot) -> DoctorCheck:
+    states = (
+        snapshot.account,
+        snapshot.policy_state,
+        snapshot.managed_requirements,
+        snapshot.agent_admission,
+        snapshot.realtime,
+        snapshot.interrupt,
+        snapshot.server_requests,
     )
+    if all(
+        state.status is CapabilityStatus.ERROR and state.detail == "probe_failed"
+        for state in states
+    ):
+        return DoctorCheck("codex_schema", "error", "probe_failed")
+    if all(
+        state.status is CapabilityStatus.VERSION_MISMATCH and state.detail == "invalid_response"
+        for state in states
+    ):
+        return DoctorCheck("codex_schema", "error", "version_mismatch")
+    if not isinstance(snapshot.version, str) or not snapshot.version:
+        return DoctorCheck("codex_schema", "error", "probe_failed")
+    return DoctorCheck("codex_schema", "ok", "compatible")
 
 
-def _realtime_voices_available(response: object) -> bool:
-    if not isinstance(response, dict):
-        return False
-    voices = response.get("voices")
-    if not isinstance(voices, dict):
-        return False
-    return any(
-        isinstance(options, list)
-        and any(isinstance(voice, str) and bool(voice) for voice in options)
-        for version in ("v1", "v2")
-        if (options := voices.get(version)) is not None
-    )
+def _project_policy(
+    policy: EffectivePolicy | None,
+    state: CapabilityState,
+) -> DoctorCheck:
+    if state.status is not CapabilityStatus.AVAILABLE:
+        return _project_capability("codex_policy", state, available_detail="ready")
+    if not isinstance(policy, EffectivePolicy):
+        return DoctorCheck("codex_policy", "error", "invalid_response")
+    detail = f"{policy.sandbox.value}_{policy.approval.value}".replace("-", "_")
+    return DoctorCheck("codex_policy", "ok", detail)
+
+
+def _project_capability(
+    code: str,
+    state: CapabilityState,
+    *,
+    available_detail: str,
+) -> DoctorCheck:
+    if state.status is CapabilityStatus.AVAILABLE:
+        return DoctorCheck(code, "ok", available_detail)
+    if state.status is CapabilityStatus.AUTHENTICATION_REQUIRED:
+        return DoctorCheck(code, "blocked", "authentication_required")
+    allowed = _CODEX_DETAILS_BY_STATUS.get(state.status, frozenset())
+    detail = state.detail if state.detail in allowed else "invalid_response"
+    return DoctorCheck(code, "error", detail)
+
+
+def _codex_command_unavailable_checks() -> list[DoctorCheck]:
+    return [
+        DoctorCheck("codex_command", "error", "unavailable"),
+        *(DoctorCheck(code, "blocked", "command_unavailable") for code in _CODEX_CHECK_CODES[1:]),
+    ]
+
+
+def _codex_probe_failed_checks(*, include_command: bool = False) -> list[DoctorCheck]:
+    codes = _CODEX_CHECK_CODES if include_command else _CODEX_CHECK_CODES[1:]
+    return [DoctorCheck(code, "error", "probe_failed") for code in codes]
 
 
 async def _probe_irodori(
@@ -429,8 +529,31 @@ def _irodori_capability_error_detail(error: IrodoriError) -> str:
     return "irodori_unavailable"
 
 
-def _default_rpc_factory(binary: Path) -> DoctorRpcClient:
-    return CodexRpcClient(binary)
+def _default_connection_factory(command: CodexCommand) -> DoctorConnection:
+    return CodexConnectionSupervisor(command)
+
+
+@dataclass(frozen=True, slots=True)
+class _SchemaBackedDiscovery:
+    command: CodexCommand
+    connection: DoctorConnection
+    working_directory: Path
+
+    async def discover(self) -> CapabilitySnapshot:
+        contract = await CodexSchemaProbe(self.command).probe()
+        return await CapabilityDiscovery(
+            self.connection,
+            working_directory=self.working_directory,
+            contract=contract,
+        ).discover()
+
+
+def _default_discovery_factory(
+    command: CodexCommand,
+    connection: DoctorConnection,
+    working_directory: Path,
+) -> DoctorCapabilityDiscovery:
+    return _SchemaBackedDiscovery(command, connection, working_directory)
 
 
 def _default_synthesizer_factory(settings: MocoSettings) -> DoctorSynthesizer:
