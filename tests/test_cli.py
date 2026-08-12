@@ -29,9 +29,11 @@ runner = CliRunner()
 
 
 @pytest.fixture(autouse=True)
-def _protect_windows_config_test_directory(tmp_path: Path) -> None:
+def _isolate_config_content_tests_from_windows_host_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if sys.platform == "win32":
-        config_module._protect_windows_config_path(tmp_path)  # noqa: SLF001
+        monkeypatch.setattr(config_module, "_current_platform", lambda: "darwin")
 
 
 def _patch_private_state_boundary(
@@ -293,7 +295,7 @@ def test_config_init_does_not_use_posix_fchmod_on_windows(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     path = tmp_path / "config" / "moco.yaml"
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(config_module, "_current_platform", lambda: "win32")
 
     def reject_fchmod(*_args: object) -> None:
         pytest.fail("Windows config writing must not call POSIX fchmod")
@@ -329,8 +331,12 @@ def test_config_init_does_not_use_posix_fchmod_on_windows(
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="requires real Windows DACLs")
-def test_windows_config_init_loads_through_real_acl_boundary(tmp_path: Path) -> None:
+def test_windows_config_init_loads_through_real_acl_boundary(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     path = tmp_path / "config" / "moco.yaml"
+    monkeypatch.setattr(config_module, "_current_platform", lambda: "win32")
 
     result = runner.invoke(app, ["config", "init", "--path", str(path)])
 
@@ -344,7 +350,7 @@ def test_config_init_does_not_repair_an_unsafe_windows_directory(
 ) -> None:
     path = tmp_path / "config" / "moco.yaml"
     path.parent.mkdir()
-    monkeypatch.setattr(sys, "platform", "win32")
+    monkeypatch.setattr(config_module, "_current_platform", lambda: "win32")
     protected: list[Path] = []
     monkeypatch.setattr(config_module, "_protect_windows_config_path", protected.append)
 

@@ -25,9 +25,11 @@ from moco.errors import PrivateStateError
 
 
 @pytest.fixture(autouse=True)
-def _protect_windows_config_test_directory(tmp_path: Path) -> None:
+def _isolate_config_content_tests_from_windows_host_acl(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     if sys.platform == "win32":
-        config_module._protect_windows_config_path(tmp_path)  # noqa: SLF001
+        monkeypatch.setattr(config_module, "_current_platform", lambda: "darwin")
 
 
 def test_load_config_applies_defaults(tmp_path: Path) -> None:
