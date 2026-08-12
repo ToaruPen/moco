@@ -2,8 +2,13 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import stat
+import sys
+import tempfile
+from contextlib import contextmanager
+from enum import StrEnum
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import TYPE_CHECKING, Annotated, Literal, Self
 from urllib.parse import urlsplit
 
 import yaml
@@ -18,6 +23,15 @@ from pydantic import (
     model_validator,
 )
 
+from moco import platform as _platform
+from moco.errors import PrivateStateError
+
+if TYPE_CHECKING:
+    from collections.abc import Iterator
+
+default_config_path = _platform.default_config_path
+default_prompt_path = _platform.default_prompt_path
+
 PositiveInt = Annotated[int, Field(gt=0)]
 PositiveFloat = Annotated[float, Field(gt=0.0)]
 Port = Annotated[int, Field(gt=0, le=65_535)]
@@ -25,6 +39,38 @@ VadThreshold = Annotated[float, Field(gt=0.0, le=1.0)]
 IrodoriNumSteps = Annotated[int, Field(gt=0, le=64)]
 _MIN_PUBLIC_DNS_LABELS = 2
 _MAX_DNS_LABEL_LENGTH = 63
+_IPV4_VERSION = 4
+_IPV6_VERSION = 6
+_IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
+_CONFIG_DIRECTORY_MODE = 0o700
+_CONFIG_FILE_MODE = 0o600
+_CONFIG_SECURITY_ERROR = "configuration path does not satisfy host security requirements"
+
+
+def canonical_browser_loopback_host(
+    value: str | None,
+    *,
+    allow_localhost: bool = False,
+) -> str | None:
+    """Return a canonical loopback host that a browser can represent safely."""
+    if not isinstance(value, str):
+        return None
+    if allow_localhost and value.casefold() == "localhost":
+        return "127.0.0.1"
+    try:
+        address = ipaddress.ip_address(value)
+    except ValueError:
+        return None
+    if getattr(address, "scope_id", None) is not None:
+        return None
+    if getattr(address, "ipv4_mapped", None) is not None:
+        return None
+    canonical: str | None = None
+    if address.version == _IPV4_VERSION and address.is_loopback:
+        canonical = str(address)
+    elif address.version == _IPV6_VERSION and address == _IPV6_LOOPBACK:
+        canonical = "::1"
+    return canonical
 
 
 class ConfigError(ValueError):
@@ -43,15 +89,11 @@ class ServerSettings(StrictSettings):
     @field_validator("host")
     @classmethod
     def _require_loopback(cls, value: str) -> str:
-        host = value.strip().lower()
-        if host == "localhost":
-            return host
-        try:
-            address = ipaddress.ip_address(host)
-        except ValueError as error:
-            msg = "operator server host must be a loopback address"
-            raise ValueError(msg) from error
-        if not address.is_loopback:
+        host = canonical_browser_loopback_host(
+            value.strip().casefold(),
+            allow_localhost=True,
+        )
+        if host is None:
             msg = "operator server host must be a loopback address"
             raise ValueError(msg)
         return host
@@ -127,40 +169,64 @@ class RuntimeSettings(StrictSettings):
 
 
 class CodexSettings(StrictSettings):
-    binary: Path = Path("/Applications/ChatGPT.app/Contents/Resources/codex")
-    working_directory: Path = Field(default_factory=Path.cwd)
+    command: tuple[str, ...] | None = None
+    working_directory: Path | None = None
     prompt_file: Path | None = None
+
+    @field_validator("command")
+    @classmethod
+    def _validate_command(
+        cls,
+        value: tuple[str, ...] | None,
+    ) -> tuple[str, ...] | None:
+        if value is None:
+            return None
+        if not value or any(not item.strip() or "\0" in item for item in value):
+            msg = "command must contain non-blank NUL-free argv values"
+            raise ValueError(msg)
+        return value
 
     @field_validator("prompt_file", mode="before")
     @classmethod
     def _expand_prompt_file(cls, value: object) -> object:
         if isinstance(value, (str, Path)):
+            raw_path = str(value)
+            has_named_home = (
+                raw_path.startswith("~") and len(raw_path) > 1 and raw_path[1] not in {"/", "\\"}
+            )
             try:
                 path = Path(value).expanduser()
             except RuntimeError as error:
                 msg = "prompt path uses an unknown home directory"
                 raise ValueError(msg) from error
+            if has_named_home and (sys.platform == "win32" or str(path).startswith("~")):
+                msg = "prompt path uses an unknown home directory"
+                raise ValueError(msg)
             if "\0" in str(path):
                 msg = "prompt path must not contain NUL"
                 raise ValueError(msg)
             return path
         return value
 
-    @field_validator("binary", "working_directory")
+    @field_validator("working_directory", "prompt_file")
     @classmethod
-    def _require_absolute_path(cls, value: Path) -> Path:
-        if not value.is_absolute():
-            msg = "path must be absolute"
-            raise ValueError(msg)
-        return value
-
-    @field_validator("prompt_file")
-    @classmethod
-    def _require_absolute_prompt_file(cls, value: Path | None) -> Path | None:
+    def _require_absolute_path(cls, value: Path | None) -> Path | None:
         if value is not None and not value.is_absolute():
             msg = "path must be absolute"
             raise ValueError(msg)
         return value
+
+
+class AgentProfileMode(StrEnum):
+    """The Agent capability profile moco requests, owned by local configuration."""
+
+    READ_ONLY = "read_only"
+    WORKSPACE_WRITE = "workspace_write"
+    INHERIT_CODEX = "inherit_codex"
+
+
+class AgentSettings(StrictSettings):
+    profile: AgentProfileMode = AgentProfileMode.READ_ONLY
 
 
 def _validate_http_url(value: object, *, label: str) -> object:
@@ -269,19 +335,10 @@ class MocoSettings(StrictSettings):
     hotkeys: HotkeySettings = HotkeySettings()
     runtime: RuntimeSettings = RuntimeSettings()
     codex: CodexSettings = CodexSettings()
+    agent: AgentSettings = AgentSettings()
     irodori: IrodoriSettings = IrodoriSettings()
     speech: SpeechSettings = SpeechSettings()
     telemetry: TelemetrySettings = TelemetrySettings()
-
-
-def default_config_path() -> Path:
-    home = Path(os.environ.get("HOME", str(Path.home())))
-    return home / "Library" / "Application Support" / "moco" / "moco.yaml"
-
-
-def default_prompt_path() -> Path:
-    home = Path(os.environ.get("HOME", str(Path.home())))
-    return home / ".moco" / "prompt.md"
 
 
 def _format_validation_error(error: ValidationError) -> str:
@@ -295,7 +352,7 @@ def _format_validation_error(error: ValidationError) -> str:
 def load_config(path: Path | None = None) -> MocoSettings:
     config_path = path or default_config_path()
     try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8"))
+        raw = yaml.safe_load(_read_config_text(config_path))
     except FileNotFoundError as error:
         message = f"configuration file not found: {config_path}"
         raise ConfigError(message) from error
@@ -316,3 +373,153 @@ def load_config(path: Path | None = None) -> MocoSettings:
         return MocoSettings.model_validate(raw)
     except ValidationError as error:
         raise ConfigError(_format_validation_error(error)) from error
+
+
+def write_config(path: Path, content: bytes) -> None:
+    platform_name = _current_platform()
+    try:
+        _prepare_config_directory(path.parent, platform_name=platform_name)
+        with _config_namespace(path.parent, platform_name=platform_name):
+            parent_identity = _config_path_identity(path.parent)
+            if os.path.lexists(path) and platform_name == "win32":
+                _validate_config_file(path)
+
+            descriptor, temporary_name = tempfile.mkstemp(
+                dir=path.parent,
+                prefix=f".{path.name}.",
+            )
+            temporary = Path(temporary_name)
+            descriptor_open = True
+            try:
+                _require_config_identity(path.parent, parent_identity)
+                if platform_name == "win32":
+                    _protect_windows_config_path(temporary)
+                    _validate_config_file(temporary)
+                else:
+                    os.fchmod(descriptor, _CONFIG_FILE_MODE)
+                with os.fdopen(descriptor, "wb") as stream:
+                    descriptor_open = False
+                    stream.write(content)
+                    stream.flush()
+                    os.fsync(stream.fileno())
+                temporary_identity = _config_path_identity(temporary)
+                _require_config_identity(path.parent, parent_identity)
+                temporary.replace(path)
+                if platform_name == "win32":
+                    _validate_config_file(path)
+                    _require_config_identity(path, temporary_identity)
+            finally:
+                if descriptor_open:
+                    os.close(descriptor)
+                if os.path.lexists(temporary):
+                    temporary.unlink()
+    except PrivateStateError:
+        raise ConfigError(_CONFIG_SECURITY_ERROR) from None
+
+
+def _read_config_text(path: Path, *, platform_name: str | None = None) -> str:
+    platform_value = platform_name or _current_platform()
+    if platform_value != "win32":
+        return path.read_text(encoding="utf-8")
+    try:
+        with _config_namespace(path.parent, platform_name="win32"):
+            parent_identity = _config_path_identity(path.parent)
+            _validate_config_directory(path.parent)
+            _validate_config_file(path)
+            path_identity = _config_path_identity(path)
+            descriptor = os.open(path, os.O_RDONLY)
+            try:
+                metadata = os.fstat(descriptor)
+                if (
+                    not stat.S_ISREG(metadata.st_mode)
+                    or (
+                        metadata.st_dev,
+                        metadata.st_ino,
+                    )
+                    != path_identity
+                ):
+                    raise PrivateStateError(_CONFIG_SECURITY_ERROR)
+                with os.fdopen(descriptor, "r", encoding="utf-8") as stream:
+                    descriptor = -1
+                    content = stream.read()
+            finally:
+                if descriptor >= 0:
+                    os.close(descriptor)
+            _validate_config_file(path)
+            _require_config_identity(path, path_identity)
+            _require_config_identity(path.parent, parent_identity)
+            return content
+    except PrivateStateError:
+        raise ConfigError(_CONFIG_SECURITY_ERROR) from None
+
+
+def _prepare_config_directory(path: Path, *, platform_name: str) -> None:
+    created = False
+    try:
+        os.lstat(path)
+    except FileNotFoundError:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            path.mkdir(mode=_CONFIG_DIRECTORY_MODE)
+        except FileExistsError:
+            created = False
+        else:
+            created = True
+    if platform_name == "win32":
+        if created:
+            _protect_windows_config_path(path)
+        _validate_config_directory(path)
+
+
+def _validate_config_directory(path: Path) -> None:
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISDIR(metadata.st_mode):
+        raise PrivateStateError(_CONFIG_SECURITY_ERROR)
+    _validate_windows_config_path(path)
+
+
+def _validate_config_file(path: Path) -> None:
+    metadata = os.lstat(path)
+    if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        raise PrivateStateError(_CONFIG_SECURITY_ERROR)
+    _validate_windows_config_path(path)
+
+
+def _validate_windows_config_path(path: Path) -> None:
+    from moco.runtime._windows_acl import read_windows_security  # noqa: PLC0415
+    from moco.runtime.private_state import validate_windows_security  # noqa: PLC0415
+
+    validate_windows_security(read_windows_security(path))
+
+
+def _protect_windows_config_path(path: Path) -> None:
+    from moco.runtime._windows_acl import protect_windows_dacl  # noqa: PLC0415
+
+    protect_windows_dacl(path)
+
+
+@contextmanager
+def _config_namespace(path: Path, *, platform_name: str) -> Iterator[None]:
+    if platform_name != "win32":
+        yield
+        return
+    from moco.runtime._windows_acl import (  # noqa: PLC0415
+        hold_windows_directory_namespace,
+    )
+
+    with hold_windows_directory_namespace(path):
+        yield
+
+
+def _config_path_identity(path: Path) -> tuple[int, int]:
+    metadata = os.lstat(path)
+    return metadata.st_dev, metadata.st_ino
+
+
+def _require_config_identity(path: Path, expected: tuple[int, int]) -> None:
+    if _config_path_identity(path) != expected:
+        raise PrivateStateError(_CONFIG_SECURITY_ERROR)
+
+
+def _current_platform() -> str:
+    return sys.platform

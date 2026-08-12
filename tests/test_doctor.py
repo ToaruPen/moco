@@ -8,16 +8,120 @@ from typing import cast
 import pytest
 from irodori_tts_infra.contracts import CapabilitiesResponse, Readiness, VoiceCapability
 
+from moco import doctor as doctor_module
+from moco.codex.capabilities import (
+    ApprovalMode,
+    CapabilitySnapshot,
+    CapabilityState,
+    CapabilityStatus,
+    EffectivePolicy,
+    SandboxMode,
+)
 from moco.codex.rpc import JsonValue
-from moco.config import CodexSettings, IrodoriSettings, MocoSettings
+from moco.config import (
+    AgentProfileMode,
+    AgentSettings,
+    CodexSettings,
+    IrodoriSettings,
+    MocoSettings,
+)
 from moco.doctor import (
     DoctorCheck,
-    DoctorRpcClient,
     DoctorSynthesizer,
+    _default_cloudflared_probe,
     _default_hotkey_probe,
     run_doctor,
 )
+from moco.errors import CodexCommandError
+from moco.platform import CodexCommand
 from moco.speech.irodori import IrodoriError
+
+_AVAILABLE = CapabilityState(CapabilityStatus.AVAILABLE, "ready")
+_DEFAULT_POLICY = EffectivePolicy(
+    SandboxMode.WORKSPACE_WRITE,
+    ApprovalMode.ON_REQUEST,
+)
+
+
+def make_snapshot(  # noqa: PLR0913
+    *,
+    version: str = "private-version-value",
+    account: CapabilityState = _AVAILABLE,
+    effective_policy: EffectivePolicy | None = _DEFAULT_POLICY,
+    policy_state: CapabilityState = _AVAILABLE,
+    managed_requirements: CapabilityState = _AVAILABLE,
+    agent_admission: CapabilityState = _AVAILABLE,
+    realtime: CapabilityState = _AVAILABLE,
+    interrupt: CapabilityState = _AVAILABLE,
+    steer: CapabilityState = _AVAILABLE,
+    server_requests: CapabilityState = _AVAILABLE,
+) -> CapabilitySnapshot:
+    return CapabilitySnapshot(
+        version=version,
+        account=account,
+        effective_policy=effective_policy,
+        policy_state=policy_state,
+        managed_requirements=managed_requirements,
+        agent_admission=agent_admission,
+        realtime=realtime,
+        interrupt=interrupt,
+        steer=steer,
+        server_requests=server_requests,
+        server_request_categories=frozenset(),
+        has_unclassified_server_requests=False,
+    )
+
+
+class FakeConnection:
+    def __init__(
+        self,
+        *,
+        start_error: Exception | None = None,
+        close_error: Exception | None = None,
+    ) -> None:
+        self.start_error = start_error
+        self.close_error = close_error
+        self.start_calls = 0
+        self.close_calls = 0
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.start_error is not None:
+            raise self.start_error
+
+    async def request(
+        self,
+        method: str,
+        params: Mapping[str, JsonValue] | None = None,
+        *,
+        request_timeout: float | None = None,
+    ) -> JsonValue:
+        del method, params, request_timeout
+        message = "fake discovery must own capability responses"
+        raise AssertionError(message)
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.close_error is not None:
+            raise self.close_error
+
+
+class FakeCapabilityDiscovery:
+    def __init__(
+        self,
+        snapshot: CapabilitySnapshot,
+        *,
+        error: Exception | None = None,
+    ) -> None:
+        self.snapshot = snapshot
+        self.error = error
+        self.calls = 0
+
+    async def discover(self) -> CapabilitySnapshot:
+        self.calls += 1
+        if self.error is not None:
+            raise self.error
+        return self.snapshot
 
 
 def make_capabilities(
@@ -44,57 +148,26 @@ def make_capabilities(
     )
 
 
-class FakeRpc:
-    def __init__(self) -> None:
-        self.closed = False
-
-    async def start(self) -> None:
-        return None
-
-    async def request(
-        self,
-        method: str,
-        params: Mapping[str, JsonValue] | None = None,
-        *,
-        request_timeout: float | None = None,
-    ) -> JsonValue:
-        del params, request_timeout
-        if method == "account/read":
-            return {
-                "account": {
-                    "email": "private@example.com",
-                    "accessToken": "private-token",
-                    "planType": "pro",
-                },
-            }
-        if method == "experimentalFeature/list":
-            return {
-                "data": [
-                    {
-                        "name": "realtime_conversation",
-                        "enabled": True,
-                    },
-                ],
-                "nextCursor": None,
-            }
-        if method == "thread/realtime/listVoices":
-            return {
-                "voices": {
-                    "v1": ["test-voice"],
-                    "v2": [],
-                    "defaultV1": "test-voice",
-                    "defaultV2": "test-voice",
-                },
-            }
-        message = f"unexpected method: {method}"
-        raise AssertionError(message)
-
-    async def close(self) -> None:
-        self.closed = True
-
-
 def raise_cloudflared_timeout() -> tuple[bool, bool]:
     raise subprocess.TimeoutExpired(cmd="launchctl", timeout=5)
+
+
+def test_default_cloudflared_probe_never_calls_launchctl_off_darwin(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr("moco.doctor.shutil.which", lambda _name: "/fixture/cloudflared")
+    monkeypatch.setattr(doctor_module, "service_supported", lambda: False, raising=False)
+
+    def reject_getuid() -> int:
+        pytest.fail("non-Darwin cloudflared probe must not resolve a launchd uid")
+
+    def reject_launchctl(*_args: object, **_kwargs: object) -> object:
+        pytest.fail("non-Darwin cloudflared probe must not invoke launchctl")
+
+    monkeypatch.setattr("moco.doctor.os.getuid", reject_getuid, raising=False)
+    monkeypatch.setattr("moco.doctor.subprocess.run", reject_launchctl)
+
+    assert _default_cloudflared_probe() == (True, False)
 
 
 class FakeSynthesizer:
@@ -146,22 +219,559 @@ class InputDeniedError(OSError):
     """Synthetic Input Monitoring denial."""
 
 
+async def test_doctor_projects_stage_b_codex_snapshot_without_private_values(
+    tmp_path: Path,
+) -> None:
+    snapshot = make_snapshot(
+        account=CapabilityState(CapabilityStatus.AVAILABLE, "authenticated"),
+        policy_state=CapabilityState(CapabilityStatus.AVAILABLE, "ready"),
+        agent_admission=CapabilityState(CapabilityStatus.AVAILABLE, "allowed"),
+        realtime=CapabilityState(CapabilityStatus.AVAILABLE, "available"),
+        interrupt=CapabilityState(CapabilityStatus.AVAILABLE, "available"),
+        server_requests=CapabilityState(CapabilityStatus.AVAILABLE, "discovered"),
+    )
+    connection = FakeConnection()
+    discovery = FakeCapabilityDiscovery(snapshot)
+    resolved: list[tuple[str, ...] | None] = []
+    discovery_arguments: list[tuple[CodexCommand, object, Path]] = []
+
+    def resolve(value: tuple[str, ...] | None) -> CodexCommand:
+        resolved.append(value)
+        return CodexCommand(("fixture-codex-private",))
+
+    def build_discovery(
+        command: CodexCommand,
+        rpc: object,
+        working_directory: Path,
+    ) -> FakeCapabilityDiscovery:
+        discovery_arguments.append((command, rpc, working_directory))
+        return discovery
+
+    checks = await run_doctor(
+        MocoSettings(
+            codex=CodexSettings(command=("configured-private",), working_directory=tmp_path),
+        ),
+        command_resolver=resolve,
+        discovery_factory=build_discovery,
+        connection_factory=lambda _command: connection,
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+
+    codex_checks = [check for check in checks if check.code.startswith("codex_")]
+    by_code = {check.code: check for check in codex_checks}
+    assert tuple(by_code) == (
+        "codex_profile",
+        "codex_command",
+        "codex_schema",
+        "codex_account",
+        "codex_policy",
+        "codex_agent_admission",
+        "codex_local_review",
+        "codex_realtime",
+        "codex_interrupt",
+        "codex_server_requests",
+    )
+    assert by_code["codex_profile"] == DoctorCheck("codex_profile", "ok", "read_only")
+    assert by_code["codex_command"] == DoctorCheck("codex_command", "ok", "available")
+    assert by_code["codex_schema"] == DoctorCheck("codex_schema", "ok", "compatible")
+    assert by_code["codex_account"] == DoctorCheck("codex_account", "ok", "authenticated")
+    assert by_code["codex_policy"] == DoctorCheck(
+        "codex_policy", "ok", "workspace_write_on_request"
+    )
+    assert by_code["codex_agent_admission"] == DoctorCheck("codex_agent_admission", "ok", "allowed")
+    assert by_code["codex_local_review"] == DoctorCheck("codex_local_review", "ok", "available")
+    assert by_code["codex_realtime"] == DoctorCheck("codex_realtime", "ok", "available")
+    assert by_code["codex_interrupt"] == DoctorCheck("codex_interrupt", "ok", "available")
+    assert by_code["codex_server_requests"] == DoctorCheck(
+        "codex_server_requests", "ok", "discovered"
+    )
+    assert resolved == [("configured-private",)]
+    assert discovery_arguments == [(CodexCommand(("fixture-codex-private",)), connection, tmp_path)]
+    assert connection.start_calls == 1
+    assert connection.close_calls == 1
+    assert discovery.calls == 1
+    assert "private" not in repr(checks)
+    assert "private-version-value" not in repr(checks)
+
+
+@pytest.mark.parametrize("profile", list(AgentProfileMode))
+async def test_doctor_reports_selected_profile_even_when_codex_is_missing(
+    tmp_path: Path,
+    profile: AgentProfileMode,
+) -> None:
+    private_message = "private-command-path"
+
+    def fail_resolution(_value: tuple[str, ...] | None) -> CodexCommand:
+        raise CodexCommandError(private_message)
+
+    checks = await run_doctor(
+        MocoSettings(
+            agent=AgentSettings(profile=profile),
+            codex=CodexSettings(working_directory=tmp_path),
+        ),
+        command_resolver=fail_resolution,
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+
+    assert DoctorCheck("codex_profile", "ok", profile.value) in checks
+    assert private_message not in repr(checks)
+
+
+@pytest.mark.parametrize(
+    ("state", "expected"),
+    [
+        (
+            CapabilityState(CapabilityStatus.AVAILABLE, "ready"),
+            DoctorCheck("codex_local_review", "ok", "available"),
+        ),
+        (
+            CapabilityState(
+                CapabilityStatus.VERSION_MISMATCH,
+                "approval_categories_unavailable",
+            ),
+            DoctorCheck(
+                "codex_local_review",
+                "error",
+                "approval_categories_unavailable",
+            ),
+        ),
+        (
+            CapabilityState(
+                CapabilityStatus.VERSION_MISMATCH,
+                "approval_family_unadaptable",
+            ),
+            DoctorCheck(
+                "codex_local_review",
+                "error",
+                "approval_family_unadaptable",
+            ),
+        ),
+        (
+            CapabilityState(CapabilityStatus.ERROR, "private-review-detail"),
+            DoctorCheck("codex_local_review", "error", "invalid_response"),
+        ),
+    ],
+)
+async def test_doctor_projects_local_review_readiness_with_bounded_codes(
+    tmp_path: Path,
+    state: CapabilityState,
+    expected: DoctorCheck,
+) -> None:
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(
+            make_snapshot(server_requests=state)
+        ),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+
+    assert expected in checks
+    assert "private-review-detail" not in repr(checks)
+
+
+async def test_doctor_projects_unsafe_policy_without_hiding_realtime(
+    tmp_path: Path,
+) -> None:
+    snapshot = make_snapshot(
+        effective_policy=EffectivePolicy(
+            SandboxMode.DANGER_FULL_ACCESS,
+            ApprovalMode.NEVER,
+        ),
+        agent_admission=CapabilityState(
+            CapabilityStatus.DISABLED,
+            "unsafe_voice_policy",
+        ),
+    )
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["codex_policy"] == DoctorCheck("codex_policy", "ok", "danger_full_access_never")
+    assert by_code["codex_agent_admission"] == DoctorCheck(
+        "codex_agent_admission", "error", "unsafe_voice_policy"
+    )
+    assert by_code["codex_realtime"] == DoctorCheck("codex_realtime", "ok", "available")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "expected_schema"),
+    [
+        (
+            make_snapshot(
+                version="private-probe-version",
+                account=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+                effective_policy=None,
+                policy_state=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+                managed_requirements=CapabilityState(
+                    CapabilityStatus.ERROR,
+                    "probe_failed",
+                ),
+                agent_admission=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+                realtime=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+                interrupt=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+                server_requests=CapabilityState(CapabilityStatus.ERROR, "probe_failed"),
+            ),
+            DoctorCheck("codex_schema", "error", "probe_failed"),
+        ),
+        (
+            make_snapshot(
+                version="",
+                account=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                effective_policy=None,
+                policy_state=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                managed_requirements=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                agent_admission=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                realtime=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                interrupt=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+                server_requests=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "invalid_response",
+                ),
+            ),
+            DoctorCheck("codex_schema", "error", "version_mismatch"),
+        ),
+    ],
+)
+async def test_doctor_projects_global_schema_failure_without_version_value(
+    tmp_path: Path,
+    snapshot: CapabilitySnapshot,
+    expected_schema: DoctorCheck,
+) -> None:
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["codex_schema"] == expected_schema
+    assert snapshot.version not in repr(checks) or not snapshot.version
+
+
+async def test_doctor_keeps_schema_compatible_for_one_capability_mismatch(
+    tmp_path: Path,
+) -> None:
+    snapshot = make_snapshot(
+        account=CapabilityState(CapabilityStatus.VERSION_MISMATCH, "invalid_response"),
+    )
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["codex_schema"] == DoctorCheck("codex_schema", "ok", "compatible")
+    assert by_code["codex_account"] == DoctorCheck("codex_account", "error", "invalid_response")
+
+
+@pytest.mark.parametrize(
+    ("snapshot", "code", "expected"),
+    [
+        (
+            make_snapshot(
+                account=CapabilityState(
+                    CapabilityStatus.AUTHENTICATION_REQUIRED,
+                    "authentication_required",
+                )
+            ),
+            "codex_account",
+            DoctorCheck("codex_account", "blocked", "authentication_required"),
+        ),
+        (
+            make_snapshot(realtime=CapabilityState(CapabilityStatus.DISABLED, "feature_disabled")),
+            "codex_realtime",
+            DoctorCheck("codex_realtime", "error", "feature_disabled"),
+        ),
+        (
+            make_snapshot(
+                interrupt=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "method_unavailable",
+                )
+            ),
+            "codex_interrupt",
+            DoctorCheck("codex_interrupt", "error", "method_unavailable"),
+        ),
+        (
+            make_snapshot(
+                agent_admission=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "agent_event_contract_unavailable",
+                )
+            ),
+            "codex_agent_admission",
+            DoctorCheck(
+                "codex_agent_admission",
+                "error",
+                "agent_event_contract_unavailable",
+            ),
+        ),
+        (
+            make_snapshot(account=CapabilityState(CapabilityStatus.ERROR, "private-secret-detail")),
+            "codex_account",
+            DoctorCheck("codex_account", "error", "invalid_response"),
+        ),
+    ],
+)
+async def test_doctor_projects_only_bounded_capability_states(
+    tmp_path: Path,
+    snapshot: CapabilitySnapshot,
+    code: str,
+    expected: DoctorCheck,
+) -> None:
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code[code] == expected
+    assert "private-secret-detail" not in repr(checks)
+
+
+async def test_doctor_default_codex_pipeline_builds_each_boundary_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    command = CodexCommand(("fixture-codex",))
+    contract = object()
+    connections: list[FakeConnection] = []
+    probed_commands: list[CodexCommand] = []
+    discovery_arguments: list[tuple[object, Path, object]] = []
+
+    class Supervisor(FakeConnection):
+        def __init__(self, actual: CodexCommand) -> None:
+            assert actual == command
+            super().__init__()
+            connections.append(self)
+
+    class SchemaProbe:
+        def __init__(self, actual: CodexCommand) -> None:
+            probed_commands.append(actual)
+
+        async def probe(self) -> object:
+            return contract
+
+    class RuntimeDiscovery:
+        def __init__(
+            self,
+            rpc: object,
+            *,
+            working_directory: Path,
+            contract: object,
+        ) -> None:
+            discovery_arguments.append((rpc, working_directory, contract))
+
+        async def discover(self) -> CapabilitySnapshot:
+            return make_snapshot()
+
+    monkeypatch.setattr(doctor_module, "CodexConnectionSupervisor", Supervisor)
+    monkeypatch.setattr(doctor_module, "CodexSchemaProbe", SchemaProbe)
+    monkeypatch.setattr(doctor_module, "CapabilityDiscovery", RuntimeDiscovery)
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: command,
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+
+    assert DoctorCheck("codex_schema", "ok", "compatible") in checks
+    assert len(connections) == 1
+    assert connections[0].start_calls == 1
+    assert connections[0].close_calls == 1
+    assert probed_commands == [command]
+    assert discovery_arguments == [(connections[0], tmp_path, contract)]
+
+
+async def test_doctor_blocks_all_snapshot_checks_when_command_is_missing(
+    tmp_path: Path,
+) -> None:
+    private_message = "private-command-path"
+
+    def fail_resolution(_value: tuple[str, ...] | None) -> CodexCommand:
+        raise CodexCommandError(private_message)
+
+    def reject_connection(_command: CodexCommand) -> FakeConnection:
+        pytest.fail("missing command must not create a connection")
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=fail_resolution,
+        connection_factory=reject_connection,
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    codex_checks = [check for check in checks if check.code.startswith("codex_")]
+
+    assert codex_checks[0] == DoctorCheck("codex_profile", "ok", "read_only")
+    assert codex_checks[1] == DoctorCheck("codex_command", "error", "unavailable")
+    assert all(
+        check.status == "blocked" and check.detail == "command_unavailable"
+        for check in codex_checks[2:]
+    )
+    assert private_message not in repr(checks)
+
+
+@pytest.mark.parametrize("failure_stage", ["cwd", "absolute"])
+async def test_doctor_contains_default_working_directory_failure_and_continues(
+    failure_stage: str,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_message = "private-working-directory"
+    synthesizer = FakeSynthesizer()
+    hotkey_calls: list[bool] = []
+
+    class WorkingDirectory:
+        def absolute(self) -> Path:
+            raise PrivateFailureError(private_message)
+
+    def fail_cwd() -> Path:
+        if failure_stage == "cwd":
+            raise PrivateFailureError(private_message)
+        return cast("Path", WorkingDirectory())
+
+    def reject_connection(_command: CodexCommand) -> FakeConnection:
+        pytest.fail("working-directory failure must not create a connection")
+
+    def probe_hotkey() -> bool:
+        hotkey_calls.append(True)
+        return True
+
+    class FailingPath:
+        cwd = staticmethod(fail_cwd)
+
+    monkeypatch.setattr(doctor_module, "Path", FailingPath)
+
+    checks = await run_doctor(
+        MocoSettings(),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        connection_factory=reject_connection,
+        synthesizer_factory=lambda _settings: synthesizer,
+        hotkey_probe=probe_hotkey,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["codex_command"] == DoctorCheck("codex_command", "ok", "available")
+    assert all(
+        by_code[code] == DoctorCheck(code, "error", "probe_failed")
+        for code in (
+            "codex_schema",
+            "codex_account",
+            "codex_policy",
+            "codex_agent_admission",
+            "codex_realtime",
+            "codex_interrupt",
+            "codex_server_requests",
+        )
+    )
+    assert by_code["irodori_capabilities"] == DoctorCheck("irodori_capabilities", "ok", "ready")
+    assert by_code["hotkeys"] == DoctorCheck("hotkeys", "ok", "available")
+    assert synthesizer.closed
+    assert hotkey_calls == [True]
+    assert "PrivateFailureError" in caplog.text
+    assert private_message not in caplog.text
+    assert private_message not in repr(checks)
+
+
+async def test_doctor_contains_discovery_and_cleanup_failure_by_type_only(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    private_message = "private-schema-path-and-token"
+    connection = FakeConnection(close_error=PrivateFailureError(private_message))
+    discovery = FakeCapabilityDiscovery(
+        make_snapshot(),
+        error=PrivateFailureError(private_message),
+    )
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: discovery,
+        connection_factory=lambda _command: connection,
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+    by_code = {check.code: check for check in checks}
+
+    assert by_code["codex_command"] == DoctorCheck("codex_command", "ok", "available")
+    assert all(
+        by_code[code] == DoctorCheck(code, "error", "probe_failed")
+        for code in (
+            "codex_schema",
+            "codex_account",
+            "codex_policy",
+            "codex_agent_admission",
+            "codex_realtime",
+            "codex_interrupt",
+            "codex_server_requests",
+        )
+    )
+    assert connection.close_calls == 1
+    assert "PrivateFailureError" in caplog.text
+    assert private_message not in caplog.text
+    assert private_message not in repr(checks)
+
+
 async def test_doctor_reports_stable_checks_without_sensitive_values(
     tmp_path: Path,
 ) -> None:
-    binary = tmp_path / "codex"
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
-    binary.chmod(0o700)
     settings = MocoSettings(
-        codex=CodexSettings(binary=binary, working_directory=tmp_path),
+        codex=CodexSettings(command=("private-command",), working_directory=tmp_path),
     )
-    rpc = FakeRpc()
+    connection = FakeConnection()
     capabilities = make_capabilities(3)
     synthesizer = FakeSynthesizer(capabilities)
 
     checks = await run_doctor(
         settings,
-        rpc_factory=lambda _path: cast("DoctorRpcClient", rpc),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        connection_factory=lambda _command: connection,
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(make_snapshot()),
         synthesizer_factory=lambda _settings: cast(
             "DoctorSynthesizer",
             synthesizer,
@@ -177,18 +787,24 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
         "operator_public_url",
         "cloudflared_binary",
         "cloudflared_service",
-        "codex_binary",
+        "codex_profile",
+        "codex_command",
+        "codex_schema",
         "codex_account",
-        "codex_features",
-        "codex_voices",
+        "codex_policy",
+        "codex_agent_admission",
+        "codex_local_review",
+        "codex_realtime",
+        "codex_interrupt",
+        "codex_server_requests",
         "irodori_capabilities",
         "irodori_route",
         "irodori_synthesis",
         "hotkeys",
     }
     assert all(check.status == "ok" for check in checks)
-    assert "private@example.com" not in rendered
-    assert "private-token" not in rendered
+    assert "private-command" not in rendered
+    assert "private-version-value" not in rendered
     assert str(settings.irodori.base_url) not in rendered
     assert capabilities.generation not in rendered
     assert "voice_count" not in rendered
@@ -197,7 +813,7 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
     assert all(alias not in rendered for voice in capabilities.voices for alias in voice.aliases)
     assert synthesizer.selected_voice_ids == [capabilities.voices[0].id]
     assert synthesizer.synthesized_texts == ["接続確認"]
-    assert rpc.closed
+    assert connection.close_calls == 1
     assert synthesizer.closed
 
 
@@ -206,7 +822,7 @@ async def test_doctor_reports_public_operator_boundary(tmp_path: Path) -> None:
         {
             "server": {"public_url": "https://voice.example.com"},
             "codex": {
-                "binary": str(tmp_path / "missing"),
+                "command": [str(tmp_path / "missing")],
                 "working_directory": str(tmp_path),
             },
         },
@@ -270,7 +886,7 @@ async def test_doctor_distinguishes_cloudflared_failures(
         {
             "server": {"public_url": "https://voice.example.com"},
             "codex": {
-                "binary": str(tmp_path / "missing"),
+                "command": [str(tmp_path / "missing")],
                 "working_directory": str(tmp_path),
             },
         },
@@ -295,7 +911,7 @@ async def test_doctor_reports_explicit_irodori_address_override(
     settings = MocoSettings.model_validate(
         {
             "codex": {
-                "binary": str(tmp_path / "missing"),
+                "command": [str(tmp_path / "missing")],
                 "working_directory": str(tmp_path),
             },
             "irodori": {
@@ -315,171 +931,6 @@ async def test_doctor_reports_explicit_irodori_address_override(
     )
 
     assert DoctorCheck("irodori_route", "ok", "address_override_active") in checks
-
-
-async def test_doctor_blocks_codex_checks_when_binary_is_missing(
-    tmp_path: Path,
-) -> None:
-    synthesizer = FakeSynthesizer()
-    settings = MocoSettings(
-        codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
-    )
-
-    checks = await run_doctor(
-        settings,
-        synthesizer_factory=lambda _settings: cast(
-            "DoctorSynthesizer",
-            synthesizer,
-        ),
-        hotkey_probe=lambda: False,
-    )
-    by_code = {check.code: check for check in checks}
-
-    assert by_code["codex_binary"].status == "error"
-    assert by_code["codex_account"].detail == "binary_unavailable"
-    assert by_code["codex_features"].status == "blocked"
-    assert by_code["codex_voices"].status == "blocked"
-    assert by_code["hotkeys"].detail == "input_monitoring_required"
-
-
-class FailingRpc(FakeRpc):
-    def __init__(self, failure_method: str, *, close_fails: bool = False) -> None:
-        super().__init__()
-        self.failure_method = failure_method
-        self.close_fails = close_fails
-
-    async def start(self) -> None:
-        if self.failure_method == "start":
-            raise PrivateFailureError
-
-    async def request(
-        self,
-        method: str,
-        params: Mapping[str, JsonValue] | None = None,
-        *,
-        request_timeout: float | None = None,
-    ) -> JsonValue:
-        if method == self.failure_method:
-            raise PrivateFailureError
-        return await super().request(
-            method,
-            params,
-            request_timeout=request_timeout,
-        )
-
-    async def close(self) -> None:
-        if self.close_fails:
-            raise PrivateFailureError
-        await super().close()
-
-
-class InvalidResponseRpc(FakeRpc):
-    def __init__(self, method: str, response: JsonValue) -> None:
-        super().__init__()
-        self.method = method
-        self.response = response
-
-    async def request(
-        self,
-        method: str,
-        params: Mapping[str, JsonValue] | None = None,
-        *,
-        request_timeout: float | None = None,
-    ) -> JsonValue:
-        if method == self.method:
-            return self.response
-        return await super().request(
-            method,
-            params,
-            request_timeout=request_timeout,
-        )
-
-
-@pytest.mark.parametrize(
-    ("method", "response", "failed_code"),
-    [
-        ("experimentalFeature/list", {}, "codex_features"),
-        (
-            "experimentalFeature/list",
-            {"data": [{"name": "realtime_conversation", "enabled": False}]},
-            "codex_features",
-        ),
-        ("thread/realtime/listVoices", {}, "codex_voices"),
-        (
-            "thread/realtime/listVoices",
-            {"voices": {"v1": [], "v2": []}},
-            "codex_voices",
-        ),
-    ],
-)
-async def test_doctor_rejects_unusable_codex_responses(
-    tmp_path: Path,
-    method: str,
-    response: JsonValue,
-    failed_code: str,
-) -> None:
-    binary = tmp_path / "codex"
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
-    binary.chmod(0o700)
-    rpc = InvalidResponseRpc(method, response)
-
-    checks = await run_doctor(
-        MocoSettings(
-            codex=CodexSettings(binary=binary, working_directory=tmp_path),
-        ),
-        rpc_factory=lambda _path: cast("DoctorRpcClient", rpc),
-        synthesizer_factory=lambda _settings: cast(
-            "DoctorSynthesizer",
-            FakeSynthesizer(),
-        ),
-        hotkey_probe=lambda: True,
-    )
-    by_code = {check.code: check for check in checks}
-
-    assert by_code[failed_code] == DoctorCheck(failed_code, "error", "unavailable")
-
-
-@pytest.mark.parametrize(
-    ("failure_method", "expected_ok"),
-    [
-        ("start", set()),
-        ("experimentalFeature/list", {"codex_account"}),
-        ("thread/realtime/listVoices", {"codex_account", "codex_features"}),
-    ],
-)
-async def test_doctor_maps_partial_codex_failures(
-    tmp_path: Path,
-    failure_method: str,
-    expected_ok: set[str],
-) -> None:
-    binary = tmp_path / "codex"
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
-    binary.chmod(0o700)
-    rpc = FailingRpc(failure_method)
-
-    checks = await run_doctor(
-        MocoSettings(
-            codex=CodexSettings(binary=binary, working_directory=tmp_path),
-        ),
-        rpc_factory=lambda _path: cast("DoctorRpcClient", rpc),
-        synthesizer_factory=lambda _settings: cast(
-            "DoctorSynthesizer",
-            FakeSynthesizer(),
-        ),
-        hotkey_probe=lambda: True,
-    )
-    codex_checks = {
-        check.code: check
-        for check in checks
-        if check.code in {"codex_account", "codex_features", "codex_voices"}
-    }
-
-    assert {code for code, check in codex_checks.items() if check.status == "ok"} == expected_ok
-    assert all(
-        check.detail == "probe_failed"
-        for code, check in codex_checks.items()
-        if code not in expected_ok
-    )
 
 
 @pytest.mark.parametrize(
@@ -533,7 +984,7 @@ async def test_doctor_fails_closed_for_unusable_irodori_capabilities(
         settings.model_copy(
             update={
                 "codex": CodexSettings(
-                    binary=tmp_path / "missing",
+                    command=(str(tmp_path / "missing"),),
                     working_directory=tmp_path,
                 ),
             },
@@ -578,7 +1029,10 @@ async def test_doctor_selects_a_canonical_voice_only_after_ready_validation(
 
     checks = await run_doctor(
         MocoSettings(
-            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+            codex=CodexSettings(
+                command=(str(tmp_path / "missing"),),
+                working_directory=tmp_path,
+            ),
             irodori=IrodoriSettings(speaker=selector),
         ),
         synthesizer_factory=lambda _settings: cast(
@@ -603,7 +1057,10 @@ async def test_doctor_maps_network_failure_without_rendering_private_detail(
 
     checks = await run_doctor(
         MocoSettings(
-            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+            codex=CodexSettings(
+                command=(str(tmp_path / "missing"),),
+                working_directory=tmp_path,
+            ),
         ),
         synthesizer_factory=lambda _settings: cast(
             "DoctorSynthesizer",
@@ -648,7 +1105,10 @@ async def test_doctor_preserves_known_synthesis_detail_without_fallback(
 
     checks = await run_doctor(
         MocoSettings(
-            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+            codex=CodexSettings(
+                command=(str(tmp_path / "missing"),),
+                working_directory=tmp_path,
+            ),
         ),
         synthesizer_factory=lambda _settings: cast(
             "DoctorSynthesizer",
@@ -687,7 +1147,10 @@ async def test_doctor_bounds_unknown_synthesis_error_code(
 
     checks = await run_doctor(
         MocoSettings(
-            codex=CodexSettings(binary=tmp_path / "missing", working_directory=tmp_path),
+            codex=CodexSettings(
+                command=(str(tmp_path / "missing"),),
+                working_directory=tmp_path,
+            ),
         ),
         synthesizer_factory=lambda _settings: cast(
             "DoctorSynthesizer",
@@ -713,19 +1176,17 @@ async def test_doctor_contains_probe_and_cleanup_failures(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    binary = tmp_path / "codex"
-    binary.write_text("#!/bin/sh\n", encoding="utf-8")
-    binary.chmod(0o700)
     synthesizer = FakeSynthesizer(close_error=PrivateFailureError())
+    connection = FakeConnection(
+        start_error=PrivateFailureError("private probe"),
+        close_error=PrivateFailureError("private cleanup"),
+    )
 
     checks = await run_doctor(
-        MocoSettings(
-            codex=CodexSettings(binary=binary, working_directory=tmp_path),
-        ),
-        rpc_factory=lambda _path: cast(
-            "DoctorRpcClient",
-            FailingRpc("start", close_fails=True),
-        ),
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        connection_factory=lambda _command: connection,
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(make_snapshot()),
         synthesizer_factory=lambda _settings: cast(
             "DoctorSynthesizer",
             synthesizer,
@@ -734,7 +1195,10 @@ async def test_doctor_contains_probe_and_cleanup_failures(
     )
 
     assert next(check for check in checks if check.code == "hotkeys").status == "error"
+    assert connection.close_calls == 1
     assert "cleanup failed" in caplog.text
+    assert "PrivateFailureError" in caplog.text
+    assert "private probe" not in caplog.text
     assert "private cleanup" not in caplog.text
 
 
@@ -764,3 +1228,26 @@ async def test_default_hotkey_probe_starts_and_stops_listener(
 
     assert _default_hotkey_probe(MocoSettings())
     assert listeners[0].stopped
+
+
+async def test_doctor_uses_host_specific_hotkey_detail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        doctor_module,
+        "hotkey_unavailable_detail",
+        lambda: "browser_hotkey_fallback",
+        raising=False,
+    )
+
+    checks = await run_doctor(
+        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        connection_factory=lambda _command: FakeConnection(),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(make_snapshot()),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: False,
+    )
+
+    assert checks[-1] == DoctorCheck("hotkeys", "error", "browser_hotkey_fallback")

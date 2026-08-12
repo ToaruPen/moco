@@ -1,8 +1,9 @@
 # moco
 
-moco は、Mac に話しかけて Codex に作業を頼み、その返答を Irodori の声で聞くための
-ローカル音声エージェントです。設定した開始キーを一度押すとマイク入力が続き、
-停止キーを押すまで GPT-Live と自然に会話できます。
+moco は、macOS または Windows 11 の手元のマシンに話しかけて Codex に作業を頼み、
+その最終回答を Irodori の声で聞くための macOS-first ローカル音声エージェントです。
+Realtime の Voice Thread は音声入力と文字起こしを担い、確定した依頼を通常の Codex
+Agent Thread が実行します。
 
 ただし、F1/F2 が機能そのものなのではありません。内部の契約は
 `LISTEN_START` / `LISTEN_STOP` であり、キーは YAML で変更できます。F1/F2 は
@@ -14,14 +15,17 @@ moco は、Mac に話しかけて Codex に作業を頼み、その返答を Iro
 
 ## 何が常駐するのか
 
-常駐する本体は、`launchd` から起動できる Python ランタイムです。会話の状態、
+本体は foreground で起動する Python ランタイムです。macOS では確認後に `launchd` からも
+起動できます。会話の状態、
 Codex との接続、Irodori への音声合成要求、グローバルキー、設定、テレメトリは
 このランタイムが管理します。
 
 ブラウザは常駐本体ではありません。デスクトップまたはスマートフォンのページは、
-マイク権限、WebRTC の音声入力、生成済み WAV の再生だけを担うメディア操作面です。使うときにページを開き、一度
-「接続」を押します。ページを閉じても launchd サービスは残りますが、
-マイクと再生先がなくなるため音声会話はできません。
+マイク権限、WebRTC の音声入力、生成済み WAV の再生に加え、現在の文字起こし、safe progress、
+状態の観測、turn全体の取消を担う操作面です。Agent の実行や個別 approval decision は所有しません。
+Reviewer はこの画面と認証を共有しない別の loopback-only surface です。使うときにページを開き、
+一度「接続」を押します。ページを閉じても foreground プロセスまたは macOS の `launchd`
+サービスは残りますが、マイクと再生先がなくなるため音声会話はできません。
 
 この分割は完成形ではなく、まず動作実績のある WebRTC 経路を製品として使える形にした
 ものです。将来、メニューバーアプリやネイティブ音声クライアントへ移る場合も、
@@ -29,14 +33,16 @@ Codex との接続、Irodori への音声合成要求、グローバルキー、
 
 ## 必要なもの
 
-- macOS とデスクトップ版 Chrome
+- macOS-first。macOS、または Windows 11 の対話デスクトップと Chrome
 - スマートフォンから使う場合は iOS Safari または Android Chrome
 - Python 3.13、[uv](https://docs.astral.sh/uv/)、Node.js、`just`
-- ChatGPT.app に同梱された Codex と、利用可能な ChatGPT アカウント
+- `PATH` 上、または `codex.command` に設定した公開 Codex CLI と、利用可能な ChatGPT
+  アカウント。macOS では ChatGPT.app の bundle を fallback として利用できます
 - Irodori-TTS API。通常は Windows GPU ホストで起動し、Tailscale 経由で接続します
 - 初回利用時の Chrome マイク許可
-- グローバルキーを使う場合は、moco を起動するターミナルまたは実行ファイルへの
-  macOS Input Monitoring 許可
+- グローバルキーを使う場合、macOS では moco を起動するターミナルまたは実行ファイルへの
+  macOS Input Monitoring 許可。Windows ではブラウザのフォールバック操作を利用でき、
+  ネイティブホットキーの可否は対話デスクトップ上で確認します
 - スマートフォンから使う場合は、固定ドメインを持つ Cloudflare Tunnel と
   本人だけを許可する Cloudflare Access application
 
@@ -44,6 +50,28 @@ StackChan と長期記憶は初期リリースの対象外です。長期記憶�
 削除は [Issue #1](https://github.com/ToaruPen/moco/issues/1) で追跡しています。
 Realtime セッションを明示的に破棄して新しい会話を始める操作は、
 [Issue #2](https://github.com/ToaruPen/moco/issues/2) で追跡しています。
+
+### macOS / Windows Stage B
+
+moco は macOS-first ですが、Stage B の Agent handoff とローカル approval は macOS と
+Windows 11 の各ホストで foreground 実行する同じ基本契約を対象にします。各ホストの moco は
+そのホストの Codex CLI、設定、workspace を使い、別ホストの app-server を暗黙に proxy
+しません。`codex.command: null` の場合、Windows は `PATH` 上の公開 Codex CLI だけを使い、
+Windows Store の非公開インストールパスは探索しません。設定は `APPDATA`、実行中だけ使う
+owner-private な状態は `LOCALAPPDATA` に保存します。
+
+Windows で `moco service` を実行すると `unsupported_platform` になります。正式な起動方法は
+`uv run moco run` による foreground 実行です。ブラウザのマイク許可とグローバルホットキーの
+利用可否は、対話デスクトップ上で利用者が確認してください。
+
+Agent profile は設定ファイルの `agent.profile` で選びます。既定の `read_only`、明示的な
+`workspace_write`、Codex の有効設定を上書きしない `inherit_codex` の3種類です。音声や
+公開画面から profile は変更できません。`danger-full-access` と approval policy `never` の
+組み合わせでは、音声から Agent turn を開始しません。承認が発生し得る依頼を始める前に、
+同じホストの別ターミナルで `uv run moco review` を実行してローカル Reviewer を接続します。
+Reviewer が未接続のまま承認要求を受けると fail-closed になります。公開画面は待機状態と
+turn 全体の取消だけを扱い、操作詳細の閲覧や decision はできません。音声の「はい」も承認に
+はなりません。
 
 ## 最短の起動手順
 
@@ -57,38 +85,93 @@ uv run moco doctor
 uv run moco run
 ```
 
-設定は `~/Library/Application Support/moco/moco.yaml` に作成されます。別のターミナルで
-次を実行すると、実行中プロセスだけが知る capability を使って操作ページが開きます。
-capability はターミナルへ表示されません。
+設定はmacOSでは `~/Library/Application Support/moco/moco.yaml`、Windowsでは
+`%APPDATA%\moco\moco.yaml` に作成されます。Windowsでは設定の`codex.command`が実行境界になるため、
+新規directoryとfileをcurrent user、SYSTEM、Administratorsだけのprotected DACLで作成します。既存pathの
+owner、DACL、reparse pointが安全でなければ、自動修復せず設定の作成・読み込みを拒否します。
+別のターミナルで次を実行すると、実行中
+プロセスだけが知る capability を使って操作ページが開きます。capability はターミナルへ
+表示されません。
 
 ```bash
 uv run moco open
+```
+
+以前の設定key `codex.binary` は削除されました。後方互換のaliasはなく、残っている設定は厳格な
+unknown-key validationで拒否されます。明示的なCLIを選ぶ場合は次のように置き換えてください。
+
+```yaml
+codex:
+  command: ["/absolute/path/to/codex"]
+```
+
+ホストの `PATH` と、macOSで利用可能な公式bundle fallbackから自動解決する場合は次を使います。
+
+```yaml
+codex:
+  command: null
 ```
 
 ページで「接続」を押し、Chrome にマイクを許可してください。初期設定の
 F1/F2を使う機能テストでは、次のように操作します。
 
 1. F1 を一度押して音声入力を開始する
-2. キーから手を離し、そのまま複数ターン会話する
-3. Codex の返答を Irodori の声で聞く
-4. マイク入力を止める時だけ F2 を押す
+2. 依頼を話す。Realtime の VAD が発話ごとに文字起こしを確定し、Agent Thread へ渡す
+3. マイクをONのまま、続けて複数ターン会話する
+4. 事前に接続したローカル Reviewer へ要求が届いた場合だけ、内容を確認して決定する
+5. Codex Agent の final answer を Irodori の声で聞く
+6. マイク入力を止めるときだけ F2 を押す
 
-F2 はマイク入力だけを停止します。進行中の応答、Irodori の読み上げ、Realtime の
-会話コンテキストは中止しません。
+F2 はマイク入力だけを停止します。文字起こし確定や Agent handoff の開始条件ではなく、進行中の
+Agent turn、Irodori の読み上げ、Realtime の会話コンテキストも取り消しません。F1 を押すと
+同じ会話で直ちにライブ入力を再開します。停止処理の遅い状態通知が後から届いても、その後の
+`listening` 状態を正としてマイクと表示を ON に戻します。
+
+### Agent 作業、取消、再接続
+
+確定した user transcript は同じ会話の Agent Thread へ一度だけ渡されます。作業中の進捗は
+画面にだけ表示し、作業中の中間音声は発しません。Voice assistant
+transcript も画面の task 回答や読み上げには使わず、Agent の final answer を同じ
+文章で画面に表示し、Irodori で読み上げます。失敗、interrupt、結果不明も
+外部エラー本文ではなく、画面と音声で同一の固定短文を使います。対応する user transcript の
+表示が遅い場合も、Agent final を先に表示して会話順を逆転させません。
+
+Realtime event と user transcript の未処理queueはそれぞれ64件、user transcript は1発話あたり
+64 KiB／256 partsに制限します。上限を超える不正・異常なstreamは黙って欠落させず、Voiceを
+停止して明示的な再接続待ちにします。Agent notification の購読終了は待機中でも会話lease全体へ
+伝播し、次の依頼を壊れた接続へ受け付けません。
+
+進行中に新しい発話を確定すると、利用可能なら active turn を steer し、そうでなければ1件だけ
+queue します。同時に再生中・合成中の古い speech generation を停止します。操作画面の明示的な
+取消は pending local review を撤回して Agent turn の interrupt 経路へ進みます。音声で話した
+「キャンセル」は通常の依頼であり、取消や Reviewer decision にはなりません。
+
+Voice 接続だけを失った場合は Agent Thread を維持し、画面から明示的に再接続します。自動 retry は
+しません。app-server 接続を失った場合は active turn の outcome unknown を報告し、旧依頼や queue を
+新しい接続へ自動再送しません。
 
 ### GPTの応答スタイルを変更する
 
-GPTへ渡すプロンプトは、既定では `~/.moco/prompt.md` から読み込みます。次のように
-現在の内蔵プロンプトを雛形としてコピーしてから、口調やキャラクターを編集できます。
+GPTへ渡すプロンプトの既定pathは、macOSでは `~/.moco/prompt.md`、Windowsでは
+`%APPDATA%\moco\prompt.md` です。macOSのUnix shellでは、現在の内蔵プロンプトを次のように
+コピーしてから、口調やキャラクターを編集できます。
 
 ```bash
 mkdir -p ~/.moco
 cp config/moco.prompt.example.md ~/.moco/prompt.md
 ```
 
+Windows PowerShellでは次を実行します。
+
+```powershell
+New-Item -ItemType Directory -Force "$env:APPDATA\moco"
+Copy-Item config\moco.prompt.example.md "$env:APPDATA\moco\prompt.md"
+```
+
 このファイルがなければ内蔵プロンプトを使います。別のファイルを使う場合は、
-`moco.yaml` の `codex.prompt_file` へ絶対パスまたは `~` から始まるパスを指定して
-ください。内容は会話開始ごとに読み直すため、編集後のmoco再起動は不要で、次の会話
+`moco.yaml` の `codex.prompt_file` へ対象ホストで有効な絶対pathを指定してください。
+macOSでは `~` から始まる現在userのpathも使用できます。内容は会話開始ごとに読み直すため、
+編集後のmoco再起動は不要で、次の会話
 から反映されます。空、非UTF-8、64 KiB超、または読めない明示設定ファイルは会話開始時に
 拒否されます。プロンプト本文はログやtelemetryへ出力しません。
 
@@ -97,12 +180,12 @@ cp config/moco.prompt.example.md ~/.moco/prompt.md
 会話中の変更は次の読み上げから反映されます。選択中の話者がカタログから消えた場合は、
 別の話者へ自動で切り替えず音声を停止します。
 
-操作画面の進捗帯とアクティビティ欄には、Codex のターン、コマンドやファイル操作などの
-処理種別、音声生成、再生、マイク、接続状態を表示します。経過時間と最終更新から、返答後も
-処理が続いているかを確認できます。App Server が reasoning summary を通知した場合はその
-短い要約だけを表示し、raw reasoning、コマンド本文、パス、ツール引数や結果は表示しません。
-アクティビティはメモリ内の最大200件で、再読込すると消えます。エラー帯を閉じても、安定した
-エラーコードを含む履歴はアクティビティ欄に残ります。
+操作画面の進捗帯とアクティビティ欄には、Codex turn と作業種別の固定ラベル、phase、
+音声生成、再生、マイク、接続状態だけを表示します。コマンド本文、ファイルパス、patch、
+reasoning、ツール引数や結果は表示しません。アクティビティはメモリ内の最大200件で、再読込
+すると消えます。サーバー側の進捗送信queueは64件に制限し、操作画面が停止している間の
+上限超過分は task の結果やtranscriptへ影響させず進捗だけを省略します。エラー帯を閉じても、
+安定したエラーコードを含む履歴はアクティビティ欄に残ります。
 
 配色は OS に追従する System に加え、Light 5種（Porcelain、Paper、Mist、Sage、Rose）、
 Dark 5種（Midnight、Graphite、Ocean、Forest、Aubergine）、High Contrast 2種から選択
@@ -111,10 +194,10 @@ Dark 5種（Midnight、Graphite、Ocean、Forest、Aubergine）、High Contrast 
 `localStorage` に保存し、capability、会話、音声、アクティビティは含めません。配色入力中は
 ブラウザ側のフォールバックキーを抑止します。
 
-常時入力中に新しいユーザー発話を検出すると、再生中または合成中の古い Irodori 音声を
-無効化し、Realtime 側の自然な割り込みに任せます。入力停止後に設定したアイドル時間を
-過ぎると会話だけが閉じられ、デーモンと操作ページは残ります。次の入力開始で新しい
-会話が作られ、以前の文字起こしは自動投入されません。
+新しい user transcript を確定すると、前述の steer／queue と同時に再生中または合成中の古い
+Irodori 音声を無効化します。Agent turn、Voice、speech が idle のまま設定時間を過ぎると会話
+だけが閉じられ、デーモンと操作ページは残ります。次の入力開始では新しい Agent Thread が作られ、
+以前の文字起こしや未完了依頼は自動投入されません。
 
 ## スマートフォンから使う
 
@@ -145,8 +228,9 @@ Tunnel は独立したサービスです。片方が停止しても別経路へ�
 
 設定後に moco を再起動し、Mac で `uv run moco open` を実行します。loopback の操作画面に
 「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は現在プロセスの
-capability を URL fragment にだけ含み、ファイル、通常ログ、Cloudflare の request path
-には残りません。daemon を再起動すると古い QR は無効になります。
+media capability を URL fragment に含み、Cloudflare の request path には載せません。同じ値の
+唯一のファイル保存先はowner-privateな `runtime.json` で、ローカルCLIが操作画面を開くために
+process lifetime中だけ使用し、終了時に削除します。daemon を再起動すると古い QR は無効になります。
 
 スマートフォンでは「接続」を押してマイクを許可し、「入力開始」と「入力停止」で操作します。
 入力開始は押し続ける PTT ではありません。指を離しても入力は続き、入力停止はマイクだけを
@@ -236,44 +320,79 @@ uninstall はラベルと実行ファイルが moco のものと一致する pli
 | `operator_public_url` | スマートフォン用固定 HTTPS hostname の設定状態。hostname 自体は表示しません |
 | `cloudflared_binary` | `cloudflared` の実行可否 |
 | `cloudflared_service` | moco 専用 LaunchAgent が running かどうか |
-| `codex_binary` | ChatGPT.app 同梱 Codex の実行可否 |
+| `codex_profile` | 選択した `read_only` / `workspace_write` / `inherit_codex` |
+| `codex_command` | 設定または自動解決した公開 Codex CLI の実行可否 |
+| `codex_schema` | 実行中の CLI から生成したprotocol schemaとの互換性 |
 | `codex_account` | 認証済みかどうか。メールアドレス等は表示しません |
-| `codex_features` / `codex_voices` | experimental API と Realtime voice |
+| `codex_policy` | Codexが返すeffective sandboxとapproval policyの妥当性 |
+| `codex_agent_admission` | policyとserver request categoryに基づくAgent利用可否 |
+| `codex_local_review` | command/file approvalのschemaをローカルReviewer adapterで扱えるか。接続中かどうかとは別です |
+| `codex_realtime` | Realtime voiceの利用可否 |
+| `codex_interrupt` | turn interrupt semanticの利用可否 |
+| `codex_server_requests` | approval用server request categoryの互換性 |
 | `irodori_capabilities` / `irodori_synthesis` | runtime readiness、話者選択可否、任意の条件付き合成 |
 | `irodori_route` | OS DNS または明示した接続先 override |
-| `hotkeys` | グローバルキー監視。失敗時は Input Monitoring を確認します |
+| `hotkeys` | グローバルキー監視。macOS Input Monitoring / Windows browser fallbackを確認します |
 
 `model_loading` / `model_not_loaded` / `voice_bank_invalid` は Irodori の準備状態、
 `configured_voice_unavailable` / `voice_not_found` は話者カタログの不一致、
 `runtime_generation_mismatch` は取得後に runtime が更新された状態です。これらの場合は
 音声を停止し、別話者や旧モデルへ自動で切り替えません。`codex_realtime_error` は実験 API の
 会話接続が終了した状態です。まず `uv run moco doctor` を再実行し、Irodori サービスと
-ChatGPT.app の状態を確認してください。
+Codex CLI のreadinessを確認してください。
 
 ## プライバシーと観測
 
-文字起こしは現在のブラウザ表示とプロセス内にだけ存在し、ファイルへ保存しません。
-音声、文字起こし、プロンプト、アカウント識別子、capability、将来の記憶内容は
-ログや OpenTelemetry 属性へ出しません。コンソールと任意の OTLP 出力が扱うのは、
-状態、所要時間、境界名、安定したエラーコード、trace ID です。
+文字起こし、音声、生成 speech、プロンプト、コマンド本文、ファイルパスと内容、patch本文、
+MCP arguments、approval payload、reasoning、アカウント識別子はファイルへ保存しません。
+通常の操作画面、音声、ログ、OpenTelemetry にもこれらの本文を出しません。App Server の
+`ReasoningSummary` を受信しても、その本文は表示しません。通常アクティビティが扱うのは固定した
+category／phase／label と時刻だけです。コンソールと任意の OTLP 出力は状態、所要時間、境界名、
+安定したエラーコード、trace ID に限定します。
+
+media capability とReviewerのcontrol secretだけは、process lifetime中にowner-privateな
+`runtime.json` へ保存し、プロセス終了時に削除します。media capability は同じタブのreload用に
+`sessionStorage`にも保持しますが、cookie、URL、`localStorage`などの永続領域には保存しません。
+Reviewerのcontrol secret、bootstrap、review capabilityはbrowser storageへ保存しません。
+いずれのcredentialもstdout、通常ログ、telemetryへ出しません。
+
+ローカル Reviewer は承認判断に必要なコマンド、cwd、path、change kind、move targetをboundedに
+一時表示しますが、patch本文は表示しません。patch本文はmetadataへの変換時に破棄します。
+詳細と one-shot handle はprocess memoryとReviewer DOMだけに置き、decision、取消、切断時に
+破棄します。review capability や操作詳細をbrowser history、query、`localStorage`、
+`sessionStorage`へ保存しません。
 
 操作サーバーは loopback にしか bind できません。WebSocket は同一 loopback origin、または
 設定した公開 HTTPS origin と Host の完全一致を要求します。どちらの経路でもプロセスごとの
 capability が必要で、同時に一つの操作クライアントだけを受け入れます。
+Reviewer は別のcontrol secretと短命bootstrapを使い、loopbackだけから接続できます。
 詳細は [SECURITY.md](SECURITY.md) を参照してください。
 
 ## 開発
 
 ```bash
 just format
-just test
+just test-python
+just contract-codex
 just check
 ```
+
+`just test-python` は live／slow／installed contract を除くPython testを実行します。CIでは
+macOSとWindowsのmatrixがこのrecipeを実行し、NodeとPlaywrightはUbuntuの完全gateだけに
+残します。`just contract-codex` は現在のホストで選択されるinstalled public Codex CLIから
+一時directoryへschemaを生成し、Stage Bに必要なsemanticを検証します。Codexの全field集合、
+version、method件数は固定せず、login、account、設定、permissionを変更しません。macOSと
+Windowsの各実機で明示的に実行してください。
 
 `just check` は Ruff、mypy strict、vulture、deptry、ast-grep、Biome、Python/JavaScript
 単体テスト、320/390/430px の Playwright Chromium/WebKit テスト、branch coverage、
 secretlint、配布物ビルドをまとめて実行します。通常の CI は
 実アカウント、マイク、Tailscale、GPU を必要としません。遅いステップを後から比較
 できるよう、pytest の duration 上位も記録します。
+
+これらの自動gateは実機acceptanceの代替にはなりません。macOSとWindowsで foreground 起動、
+read-only task、local approval、音声から承認できないこと、取消／interrupt、final speechを
+対話デスクトップ上で確認します。テストはlogin、OS permission、service、Tailscale Serve設定を
+自動変更しません。
 
 ライセンスは [MIT](LICENSE) です。

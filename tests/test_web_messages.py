@@ -9,6 +9,7 @@ from moco.web.messages import (
     PlaybackMessage,
     SelectVoiceMessage,
     StartMessage,
+    VoiceLostMessage,
     parse_client_message,
 )
 
@@ -23,6 +24,9 @@ def test_parses_start_control_and_playback_messages() -> None:
     assert parse_client_message(
         {"type": "control", "control": "listen_stop"},
     ) == ControlMessage(control=ClientControl.LISTEN_STOP)
+    assert parse_client_message(
+        {"type": "control", "control": "turn_cancel"},
+    ) == ControlMessage(control=ClientControl.TURN_CANCEL)
     assert parse_client_message(
         {
             "type": "playback",
@@ -65,6 +69,20 @@ def test_parses_start_control_and_playback_messages() -> None:
         generation=3,
         context_state="suspended",
     )
+    assert parse_client_message({"type": "voice_lost"}) == VoiceLostMessage()
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"type": "voice_lost", "reason": "private"},
+        {"type": "voice_lost", "generation": 1},
+        {"type": "voice_lost", "unknown": None},
+    ],
+)
+def test_voice_lost_message_has_one_strict_exact_shape(payload: object) -> None:
+    with pytest.raises(ValidationError):
+        parse_client_message(payload)
 
 
 @pytest.mark.parametrize(
@@ -99,6 +117,7 @@ def test_parses_and_normalizes_an_opaque_voice_id() -> None:
     [
         {"type": "start", "sdp": ""},
         {"type": "control", "control": "unknown"},
+        {"type": "control", "control": "turn_cancel", "reason": "private"},
         {"type": "playback"},
         {"type": "playback", "phase": "started"},
         {"type": "playback", "phase": "completed", "audio_id": 17},

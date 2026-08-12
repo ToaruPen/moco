@@ -13,6 +13,7 @@ classifiers = [
   "Development Status :: 3 - Alpha",
   "License :: OSI Approved :: MIT License",
   "Operating System :: MacOS",
+  "Operating System :: Microsoft :: Windows",
   "Programming Language :: Python :: 3.13",
   "Typing :: Typed",
 ]
@@ -25,6 +26,7 @@ dependencies = [
   "opentelemetry-sdk>=1.36,<2",
   "pydantic>=2.11,<3",
   "pynput>=1.8,<2",
+  "pywin32>=311,<400; sys_platform == 'win32'",
   "pyyaml>=6.0,<7",
   "segno>=1.6,<2",
   "typer>=0.16,<1",
@@ -57,11 +59,12 @@ addopts = [
   "--strict-config",
   "--strict-markers",
   "-m",
-  "not integration and not live and not slow",
+  "not integration and not live and not slow and not contract",
 ]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 markers = [
+  "contract: requires an installed public Codex CLI but no account mutation",
   "integration: crosses a process, HTTP, or WebSocket boundary",
   "live: requires a real Codex account or Irodori host",
   "slow: unsuitable for the default feedback loop",
@@ -70,6 +73,7 @@ markers = [
 [tool.coverage.run]
 branch = true
 source = ["moco"]
+omit = ["src/moco/runtime/_windows_acl.py"]
 
 [tool.coverage.report]
 fail_under = 90
@@ -134,6 +138,10 @@ pretty = true
 module = ["irodori_tts_infra.*", "pynput.*", "uvicorn.*", "yaml"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["ntsecuritycon", "win32api", "win32con", "win32file", "win32security"]
+ignore_missing_imports = true
+
 [tool.vulture]
 min_confidence = 80
 paths = ["src", "tests"]
@@ -142,3 +150,4 @@ exclude = [".worktrees", ".venv"]
 [tool.deptry]
 known_first_party = ["moco"]
 extend_exclude = [".worktrees"]
+package_module_name_map = { pywin32 = ["ntsecuritycon", "win32api", "win32con", "win32file", "win32security"] }

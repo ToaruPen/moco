@@ -1,4 +1,6 @@
 .worktrees/
+.codex/
+.superpowers/
 .coverage
 .DS_Store
 .mypy_cache/
@@ -13,6 +15,7 @@ htmlcov/
 moco-state/
 node_modules/
 playwright-report/
+prompt.md
 test-results/
 *.egg-info/
 coverage.xml

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import plistlib
 import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -17,6 +18,8 @@ from moco.service.launchd import (
     stop_service,
     uninstall_service,
 )
+
+pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="launchd is unsupported on Windows")
 
 
 def test_install_writes_exact_user_launch_agent(tmp_path: Path) -> None:

@@ -96,6 +96,8 @@ export class ActivityBuffer {
 export class ProgressTracker {
   constructor({ now = () => Date.now() } = {}) {
     this.now = now;
+    this.activeTurnSources = new Set();
+    this.unscopedActiveTurns = 0;
     this.turnActive = false;
     this.voiceActive = false;
     this.playbackActive = false;
@@ -107,9 +109,20 @@ export class ProgressTracker {
   consume(event) {
     const occurredAtMs = event.occurredAtMs ?? this.now();
     if (event.kind === "turn") {
-      this.turnActive = event.phase === "started";
+      if (event.source === "agent" || event.source === "voice") {
+        if (event.phase === "started") {
+          this.activeTurnSources.add(event.source);
+        } else {
+          this.activeTurnSources.delete(event.source);
+        }
+      } else if (event.phase === "started") {
+        this.unscopedActiveTurns += 1;
+      } else {
+        this.unscopedActiveTurns = Math.max(0, this.unscopedActiveTurns - 1);
+      }
+      this.turnActive = this.activeTurnSources.size > 0 || this.unscopedActiveTurns > 0;
       if (this.turnActive) {
-        this.startedAtMs = occurredAtMs;
+        this.startedAtMs ??= occurredAtMs;
         this.label = "Codex が処理を続けています";
       } else if (this.playbackActive) {
         this.label = "音声を再生しています";
@@ -164,6 +177,8 @@ export class ProgressTracker {
   }
 
   disconnect(now = this.now()) {
+    this.activeTurnSources.clear();
+    this.unscopedActiveTurns = 0;
     this.turnActive = false;
     this.voiceActive = false;
     this.playbackActive = false;
@@ -173,6 +188,8 @@ export class ProgressTracker {
   }
 
   expire(now = this.now()) {
+    this.activeTurnSources.clear();
+    this.unscopedActiveTurns = 0;
     this.turnActive = false;
     this.voiceActive = false;
     this.playbackActive = false;
@@ -182,6 +199,8 @@ export class ProgressTracker {
   }
 
   ready(now = this.now()) {
+    this.activeTurnSources.clear();
+    this.unscopedActiveTurns = 0;
     this.turnActive = false;
     this.voiceActive = false;
     this.playbackActive = false;

@@ -2,12 +2,19 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from contextlib import suppress
 from dataclasses import dataclass
+from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
+from moco.codex.capabilities import CapabilitySnapshot, CapabilityState, CapabilityStatus
 from moco.config import default_prompt_path
-from moco.errors import CodexPromptError, CodexRpcError, CodexRpcTimeoutError
+from moco.errors import (
+    CodexCapabilityError,
+    CodexPromptError,
+    CodexRpcError,
+    CodexRpcTimeoutError,
+)
+from moco.runtime._cleanup import await_cleanup
 from moco.runtime.telemetry import safe_event
 
 if TYPE_CHECKING:
@@ -53,6 +60,7 @@ _ITEM_ACTIVITY: dict[str, ActivityKind] = {
     "contextCompaction": "context_compaction",
 }
 
+_MAX_PENDING_REALTIME_EVENTS = 64
 _EVENTS_END = object()
 logger = logging.getLogger(__name__)
 
@@ -91,9 +99,7 @@ class ReasoningSummaryEvent:
 type RealtimeEvent = TranscriptEvent | RealtimeErrorEvent | ActivityEvent | ReasoningSummaryEvent
 
 
-class RpcClient(Protocol):
-    async def start(self) -> None: ...
-
+class CodexConnection(Protocol):
     async def request(
         self,
         method: str,
@@ -104,32 +110,43 @@ class RpcClient(Protocol):
 
     def notifications(self) -> AsyncIterator[RpcNotification]: ...
 
-    async def close(self) -> None: ...
-
 
 class CodexRealtimeSession:
     def __init__(
         self,
-        rpc: RpcClient,
+        connection: CodexConnection,
         *,
         settings: MocoSettings,
+        capabilities: CapabilitySnapshot,
+        working_directory: Path | None = None,
+        prompt: str | None = None,
         sdp_timeout: float = 10.0,
     ) -> None:
         if sdp_timeout <= 0:
             msg = "sdp_timeout must be positive"
             raise ValueError(msg)
-        self._rpc = rpc
+        self._connection = connection
+        self._capabilities = capabilities
         self._settings = settings
+        self._prompt = prompt
+        resolved_working_directory = (
+            working_directory or settings.codex.working_directory or Path.cwd()
+        )
+        if not resolved_working_directory.is_absolute():
+            msg = "working directory must be absolute"
+            raise ValueError(msg)
+        self._working_directory = resolved_working_directory
         self._sdp_timeout = sdp_timeout
         self._thread_id: str | None = None
         self._active_turn_id: str | None = None
         self._notification_task: asyncio.Task[None] | None = None
         self._sdp_future: asyncio.Future[str] | None = None
-        self._events: asyncio.Queue[RealtimeEvent | CodexRpcError | object] = asyncio.Queue()
+        self._events: asyncio.Queue[RealtimeEvent | CodexRpcError | object] = asyncio.Queue(
+            maxsize=_MAX_PENDING_REALTIME_EVENTS + 2,
+        )
         self._close_lock = asyncio.Lock()
         self._started = False
         self._realtime_started = False
-        self._rpc_failed = False
         self._closing = False
         self._closed = False
         self._events_ended = False
@@ -168,27 +185,28 @@ class CodexRealtimeSession:
         if self._closed:
             msg = "Codex realtime session is closed"
             raise CodexRpcError(msg)
-        prompt = _load_realtime_prompt(self._settings)
+        prompt = self._prompt if self._prompt is not None else load_realtime_prompt(self._settings)
         self._started = True
 
         try:
-            await self._rpc.start()
+            _require_voice_readiness(self._capabilities)
             self._sdp_future = asyncio.get_running_loop().create_future()
+            notifications = self._connection.notifications()
             self._notification_task = asyncio.create_task(
-                self._pump_notifications(),
+                self._pump_notifications(notifications),
                 name="codex-realtime-notifications",
             )
-            thread_result = await self._rpc.request(
+            thread_result = await self._connection.request(
                 "thread/start",
                 {
                     "ephemeral": True,
                     "sandbox": "read-only",
                     "approvalPolicy": "never",
-                    "cwd": str(self._settings.codex.working_directory),
+                    "cwd": str(self._working_directory),
                 },
             )
             self._thread_id = _thread_id_from_result(thread_result)
-            await self._rpc.request(
+            await self._connection.request(
                 "thread/realtime/start",
                 {
                     "threadId": self._thread_id,
@@ -219,8 +237,11 @@ class CodexRealtimeSession:
                     self._sdp_timeout,
                 ) from error
         except BaseException:
-            with suppress(Exception):
-                await self.close()
+            cleanup_error, cleanup_cancellation = await await_cleanup(self.close())
+            if cleanup_error is not None:
+                _log_cleanup_failure("voice_start", cleanup_error)
+            if cleanup_cancellation is not None:
+                _log_cleanup_failure("voice_start", cleanup_cancellation)
             raise
 
     async def notifications(self) -> AsyncIterator[RealtimeEvent]:
@@ -237,19 +258,25 @@ class CodexRealtimeSession:
             if self._closed:
                 return
             self._closing = True
-            stop_error: CodexRpcError | None = None
-            if self._realtime_started and not self._rpc_failed and self._thread_id is not None:
-                try:
-                    await self._rpc.request(
+            stop_error: BaseException | None = None
+            cleanup_cancellation: asyncio.CancelledError | None = None
+            if self._realtime_started and self._thread_id is not None:
+                stop_error, stop_cancellation = await await_cleanup(
+                    self._connection.request(
                         "thread/realtime/stop",
                         {"threadId": self._thread_id},
-                    )
-                except CodexRpcError as error:
-                    stop_error = error
+                    ),
+                )
+                if stop_cancellation is not None and cleanup_cancellation is None:
+                    cleanup_cancellation = stop_cancellation
                 self._realtime_started = False
 
-            await self._rpc.close()
-            await self._finish_notification_task()
+            notification_error, notification_cancellation = await await_cleanup(
+                self._finish_notification_task(),
+            )
+            if notification_cancellation is not None and cleanup_cancellation is None:
+                cleanup_cancellation = notification_cancellation
+
             self._closed = True
             self._end_events()
             safe_event(
@@ -258,26 +285,35 @@ class CodexRealtimeSession:
                 component="codex",
                 state="ready",
             )
-            if stop_error is not None:
-                raise stop_error
+            errors = tuple(
+                error
+                for error in (
+                    stop_error,
+                    notification_error,
+                )
+                if error is not None
+            )
+            if cleanup_cancellation is not None:
+                raise cleanup_cancellation
+            if errors:
+                for secondary in errors[1:]:
+                    _log_cleanup_failure("voice_close", secondary)
+                raise errors[0]
 
-    async def _pump_notifications(self) -> None:
+    async def _pump_notifications(
+        self,
+        notifications: AsyncIterator[RpcNotification],
+    ) -> None:
         try:
-            async for notification in self._rpc.notifications():
+            async for notification in notifications:
                 self._handle_notification(notification)
         except asyncio.CancelledError:
             raise
         except CodexRpcError as error:
-            await self._close_failed_rpc()
             self._fail_session(error)
         finally:
             if not self._closing:
                 self._end_events()
-
-    async def _close_failed_rpc(self) -> None:
-        self._rpc_failed = True
-        self._realtime_started = False
-        await self._rpc.close()
 
     def _handle_notification(self, notification: RpcNotification) -> None:
         if notification.method in {"turn/started", "turn/completed"}:
@@ -322,7 +358,7 @@ class CodexRealtimeSession:
                 self._sdp_future.set_result(sdp)
             return
         if notification.method == "thread/realtime/transcript/delta":
-            self._events.put_nowait(
+            self._enqueue_event(
                 TranscriptEvent(
                     kind="delta",
                     thread_id=thread_id,
@@ -332,7 +368,7 @@ class CodexRealtimeSession:
             )
             return
         if notification.method == "thread/realtime/transcript/done":
-            self._events.put_nowait(
+            self._enqueue_event(
                 TranscriptEvent(
                     kind="done",
                     thread_id=thread_id,
@@ -343,9 +379,8 @@ class CodexRealtimeSession:
             return
         if notification.method == "thread/realtime/error":
             message = _required_string(notification.params, "message", notification.method)
-            self._events.put_nowait(RealtimeErrorEvent(thread_id=thread_id, message=message))
-            if self._sdp_future is not None and not self._sdp_future.done():
-                self._sdp_future.set_exception(CodexRpcError(message))
+            self._enqueue_event(RealtimeErrorEvent(thread_id=thread_id, message=message))
+            self._set_sdp_exception(CodexRpcError(message))
 
     def _handle_turn_notification(self, notification: RpcNotification) -> None:
         thread_id = _required_string(notification.params, "threadId", notification.method)
@@ -358,12 +393,12 @@ class CodexRealtimeSession:
         turn_id = _required_string(raw_turn, "id", notification.method)
         if notification.method == "turn/started":
             self._active_turn_id = turn_id
-            self._events.put_nowait(
+            self._enqueue_event(
                 ActivityEvent("turn", "started", thread_id, turn_id, None),
             )
         elif turn_id == self._active_turn_id:
             self._active_turn_id = None
-            self._events.put_nowait(
+            self._enqueue_event(
                 ActivityEvent("turn", "completed", thread_id, turn_id, None),
             )
 
@@ -391,7 +426,7 @@ class CodexRealtimeSession:
             timestamp_field,
             notification.method,
         )
-        self._events.put_nowait(
+        self._enqueue_event(
             ActivityEvent(kind, phase, thread_id, turn_id, occurred_at_ms),
         )
 
@@ -402,7 +437,7 @@ class CodexRealtimeSession:
         turn_id = _required_string(notification.params, "turnId", notification.method)
         if turn_id != self._active_turn_id:
             return
-        self._events.put_nowait(
+        self._enqueue_event(
             ReasoningSummaryEvent(
                 thread_id=thread_id,
                 turn_id=turn_id,
@@ -419,10 +454,26 @@ class CodexRealtimeSession:
             ),
         )
 
+    def _enqueue_event(self, event: RealtimeEvent) -> None:
+        if self._events.qsize() >= _MAX_PENDING_REALTIME_EVENTS:
+            message = "Codex Realtime event backlog limit exceeded"
+            raise CodexRpcError(message)
+        self._events.put_nowait(event)
+
     def _fail_session(self, error: CodexRpcError) -> None:
-        if self._sdp_future is not None and not self._sdp_future.done():
-            self._sdp_future.set_exception(error)
+        self._set_sdp_exception(error)
         self._events.put_nowait(error)
+
+    def _set_sdp_exception(self, error: CodexRpcError) -> None:
+        future = self._sdp_future
+        if future is None:
+            return
+        if not future.done():
+            future.set_exception(error)
+        try:
+            future.exception()
+        except asyncio.CancelledError:
+            return
 
     async def _finish_notification_task(self) -> None:
         task = self._notification_task
@@ -430,8 +481,12 @@ class CodexRealtimeSession:
             return
         if not task.done():
             task.cancel()
-        with suppress(asyncio.CancelledError):
+        try:
             await task
+        except asyncio.CancelledError:
+            if task.cancelled():
+                return
+            raise
 
     def _end_events(self) -> None:
         if self._events_ended:
@@ -440,7 +495,15 @@ class CodexRealtimeSession:
         self._events.put_nowait(_EVENTS_END)
 
 
-def _load_realtime_prompt(settings: MocoSettings) -> str:
+def _log_cleanup_failure(boundary: str, error: BaseException) -> None:
+    logger.warning(
+        "Codex Voice cleanup failed (boundary=%s, error_type=%s)",
+        boundary,
+        type(error).__name__,
+    )
+
+
+def load_realtime_prompt(settings: MocoSettings) -> str:
     configured = settings.codex.prompt_file
     path = configured or default_prompt_path()
     try:
@@ -466,6 +529,26 @@ def _load_realtime_prompt(settings: MocoSettings) -> str:
         msg = "realtime prompt file must not be blank"
         raise CodexPromptError(msg)
     return prompt
+
+
+def _require_voice_readiness(snapshot: object) -> None:
+    if not isinstance(snapshot, CapabilitySnapshot):
+        message = "Codex capability snapshot is invalid"
+        raise CodexCapabilityError(message)
+    required_states = (snapshot.account, snapshot.realtime)
+    if any(
+        not isinstance(state, CapabilityState) or not isinstance(state.status, CapabilityStatus)
+        for state in required_states
+    ):
+        message = "Codex capability snapshot is invalid"
+        raise CodexCapabilityError(message)
+    if (
+        snapshot.account.status is CapabilityStatus.AVAILABLE
+        and snapshot.realtime.status is CapabilityStatus.AVAILABLE
+    ):
+        return
+    message = "Voice readiness is unavailable"
+    raise CodexCapabilityError(message)
 
 
 def _thread_id_from_result(result: JsonValue) -> str:
