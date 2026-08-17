@@ -257,6 +257,15 @@ def test_readme_documents_current_codex_requirements_and_doctor_codes() -> None:
     assert "ChatGPT.app に同梱された Codex と" not in requirements
     assert "ChatGPT.app の状態" not in doctor
 
+    stage_b = readme.split("### macOS / Windows Stage B", maxsplit=1)[1].split(
+        "## 最短の起動手順", maxsplit=1
+    )[0]
+    assert (
+        "`read_only` と `workspace_write` は global Codex policy を admission 条件にしません"
+        in stage_b
+    )
+    assert "`inherit_codex` だけが global Codex policy を継承します" in stage_b
+
     hotkeys_row = next(line for line in doctor.splitlines() if "`hotkeys`" in line)
     assert "macOS Input Monitoring" in hotkeys_row
     assert "Windows browser fallback" in hotkeys_row

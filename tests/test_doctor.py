@@ -374,22 +374,41 @@ async def test_doctor_projects_local_review_readiness_with_bounded_codes(
     assert "private-review-detail" not in repr(checks)
 
 
-async def test_doctor_projects_unsafe_policy_without_hiding_realtime(
+@pytest.mark.parametrize(
+    ("profile", "expected_admission"),
+    [
+        (
+            AgentProfileMode.READ_ONLY,
+            DoctorCheck("codex_agent_admission", "ok", "allowed"),
+        ),
+        (
+            AgentProfileMode.WORKSPACE_WRITE,
+            DoctorCheck("codex_agent_admission", "ok", "allowed"),
+        ),
+        (
+            AgentProfileMode.INHERIT_CODEX,
+            DoctorCheck("codex_agent_admission", "error", "unsafe_voice_policy"),
+        ),
+    ],
+)
+async def test_doctor_projects_unsafe_global_policy_by_selected_profile(
     tmp_path: Path,
+    profile: AgentProfileMode,
+    expected_admission: DoctorCheck,
 ) -> None:
     snapshot = make_snapshot(
         effective_policy=EffectivePolicy(
             SandboxMode.DANGER_FULL_ACCESS,
             ApprovalMode.NEVER,
         ),
-        agent_admission=CapabilityState(
-            CapabilityStatus.DISABLED,
-            "unsafe_voice_policy",
-        ),
+        agent_admission=CapabilityState(CapabilityStatus.AVAILABLE, "ready"),
     )
 
     checks = await run_doctor(
-        MocoSettings(codex=CodexSettings(working_directory=tmp_path)),
+        MocoSettings(
+            agent=AgentSettings(profile=profile),
+            codex=CodexSettings(working_directory=tmp_path),
+        ),
         command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
         discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
         connection_factory=lambda _command: FakeConnection(),
@@ -399,10 +418,30 @@ async def test_doctor_projects_unsafe_policy_without_hiding_realtime(
     by_code = {check.code: check for check in checks}
 
     assert by_code["codex_policy"] == DoctorCheck("codex_policy", "ok", "danger_full_access_never")
-    assert by_code["codex_agent_admission"] == DoctorCheck(
-        "codex_agent_admission", "error", "unsafe_voice_policy"
-    )
+    assert by_code["codex_agent_admission"] == expected_admission
     assert by_code["codex_realtime"] == DoctorCheck("codex_realtime", "ok", "available")
+
+
+async def test_doctor_rejects_unknown_policy_only_for_inherit_codex(tmp_path: Path) -> None:
+    snapshot = make_snapshot(
+        effective_policy=None,
+        policy_state=CapabilityState(CapabilityStatus.VERSION_MISMATCH, "invalid_response"),
+        agent_admission=CapabilityState(CapabilityStatus.AVAILABLE, "ready"),
+    )
+
+    checks = await run_doctor(
+        MocoSettings(
+            agent=AgentSettings(profile=AgentProfileMode.INHERIT_CODEX),
+            codex=CodexSettings(working_directory=tmp_path),
+        ),
+        command_resolver=lambda _value: CodexCommand(("fixture-codex",)),
+        discovery_factory=lambda _command, _rpc, _cwd: FakeCapabilityDiscovery(snapshot),
+        connection_factory=lambda _command: FakeConnection(),
+        synthesizer_factory=lambda _settings: FakeSynthesizer(),
+        hotkey_probe=lambda: True,
+    )
+
+    assert DoctorCheck("codex_agent_admission", "error", "invalid_response") in checks
 
 
 @pytest.mark.parametrize(

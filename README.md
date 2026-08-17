@@ -66,8 +66,10 @@ Windows で `moco service` を実行すると `unsupported_platform` になり�
 
 Agent profile は設定ファイルの `agent.profile` で選びます。既定の `read_only`、明示的な
 `workspace_write`、Codex の有効設定を上書きしない `inherit_codex` の3種類です。音声や
-公開画面から profile は変更できません。`danger-full-access` と approval policy `never` の
-組み合わせでは、音声から Agent turn を開始しません。承認が発生し得る依頼を始める前に、
+公開画面から profile は変更できません。`read_only` と `workspace_write` は global Codex policy を admission 条件にしません。
+`read_only` と `workspace_write` は sandbox と approval policy を thread 作成時に明示します。`inherit_codex` だけが global Codex policy を継承します。
+この profile で有効 policy を確認できない場合、または `danger-full-access` と approval policy
+`never` の組み合わせになる場合は、音声から Agent turn を開始しません。承認が発生し得る依頼を始める前に、
 同じホストの別ターミナルで `uv run moco review` を実行してローカル Reviewer を接続します。
 Reviewer が未接続のまま承認要求を受けると fail-closed になります。公開画面は待機状態と
 turn 全体の取消だけを扱い、操作詳細の閲覧や decision はできません。音声の「はい」も承認に

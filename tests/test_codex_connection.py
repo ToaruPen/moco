@@ -289,6 +289,21 @@ async def test_initialization_failure_closes_client(
     await supervisor.close()
 
 
+async def test_startup_timeout_is_independent_of_operation_timeout(
+    fake_codex_script: Path,
+) -> None:
+    supervisor = CodexConnectionSupervisor(
+        scenario_command(fake_codex_script, "delayed-initialize"),
+        request_timeout=0.01,
+    )
+
+    await supervisor.start()
+    try:
+        assert supervisor.initialize_info.user_agent == "fake-codex"
+    finally:
+        await supervisor.close()
+
+
 @pytest.mark.parametrize(
     "scenario",
     ["initialize-missing-user-agent", "initialize-invalid-platform"],
@@ -373,6 +388,7 @@ async def test_missing_binary_reports_process_error(tmp_path: Path) -> None:
     ("keyword", "value", "message"),
     [
         ("request_timeout", 0.0, "request_timeout must be positive"),
+        ("startup_timeout", 0.0, "startup_timeout must be positive"),
         ("shutdown_timeout", -1.0, "shutdown_timeout must be positive"),
     ],
 )

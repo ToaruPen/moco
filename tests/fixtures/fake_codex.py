@@ -168,6 +168,8 @@ for line in sys.stdin:
         if scenario == "unresponsive-initialize":
             print("initialize request received", file=sys.stderr, flush=True)
             continue
+        if scenario == "delayed-initialize":
+            time.sleep(0.05)
         if scenario == "reject-initialize" or "reject-initialize" in Path(sys.argv[0]).name:
             send(
                 {
