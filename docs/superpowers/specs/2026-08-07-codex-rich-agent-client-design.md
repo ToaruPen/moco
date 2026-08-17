@@ -234,11 +234,11 @@ profile modeの変更はローカルOperator UIの信頼済みcontrolと設定fi
 mocoはReviewerへ運び、Codexが拒否すればmocoも拒否を表示する。設定を読み直して独自に同じ判断を
 再実装しない。
 
-CapabilityDiscoveryは、選択modeとapp-serverが返すeffective sandbox、approval policy、managed
-requirementを正規化してOperator UIへ表示する。`inherit_codex`でも正規化済みeffective値を確認できない
-versionはAgent unavailableとし、推測でturnを開始しない。音声起動turnでeffective sandboxが
-`danger-full-access`かつeffective approval policyが`never`ならadmission safety ceilingで拒否する。
-拒否を`read_only`や別profileへの暗黙変換にはしない。
+Capability discovery は global effective policy を観測結果として保持するが、明示 profile の
+admission 条件には使わない。`read_only` と `workspace_write` は thread 作成時に各 profile の
+policy を明示し、`inherit_codex` だけが global effective policy を継承する。`inherit_codex` で
+effective policy を正規化できない場合、または `danger-full-access` かつ `approvalPolicy=never`
+の場合は admission safety ceiling で拒否する。
 
 ### snapshot
 
@@ -264,9 +264,10 @@ web searchなどapp-server内部で完結するtoolの全名前も複製しな�
 任意categoryの失敗はdegraded readinessとして表示する。選択model、profile、MCP、app、Realtimeが
 見つからない場合は、別のものへ黙って変更しない。
 
-段階Aで必須なのはinitialize/version、account readiness、effective policy、Realtime、interruptと、
-その段階のserver request categoryだけである。model catalog、MCP、apps、skillsの完全snapshotは、
-Agent作業または該当interactionを公開する段階B/Cで追加する。
+段階Aで必須なのはinitialize/version、account readiness、Realtime、interruptと、その段階の
+server request categoryだけである。effective policyは`inherit_codex`のadmissionに限り必須であり、
+明示profileではprobe失敗をdegraded readinessとして表示してもAgent handoffは止めない。model catalog、
+MCP、apps、skillsの完全snapshotは、Agent作業または該当interactionを公開する段階B/Cで追加する。
 
 設定、MCP、app、skill、account、modelの変更notificationを受けた場合はsnapshotをinvalidにし、
 次の会話または安全なidle境界で再取得する。実行中turnのpolicyを途中で推測し直さない。
@@ -693,8 +694,9 @@ app-server stderrはdrainするが、通常ログへそのまま転送しない�
 - Agent Threadが同一会話中の後続依頼を解決できる。
 - active Codex configで許可されたapp-server内蔵能力にmoco独自allowlistが介在しない。
 - profile mode未設定時は`read_only`になり、`inherit_codex`をローカルで選ぶとCodex設定を上書きしない。
-- effective policyを正規化できない場合と`danger-full-access`かつ`approvalPolicy=never`の場合は、音声から
-  Agent turnを開始しない。
+- `read_only`と`workspace_write`はglobal effective policyをadmission条件にせず、`inherit_codex`で
+  effective policyを正規化できない場合、または`danger-full-access`かつ`approvalPolicy=never`の場合に
+  音声からAgent turnを開始しない。
 - app-serverがpromptを要求しない操作に追加Reviewerを出さない。
 - app-serverがpromptを要求した操作はlocal Reviewer以外から承認できない。
 - authorization requestに未対応field、decision、scopeがあればReviewerを出さずfail-closedになる。

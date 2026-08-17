@@ -125,7 +125,6 @@ _UNCLASSIFIED_SERVER_REQUESTS = CapabilityState(
     CapabilityStatus.VERSION_MISMATCH,
     "unclassified_server_requests",
 )
-_UNSAFE_VOICE_POLICY = CapabilityState(CapabilityStatus.DISABLED, "unsafe_voice_policy")
 _AGENT_EVENT_CONTRACT_UNAVAILABLE = CapabilityState(
     CapabilityStatus.VERSION_MISMATCH,
     "agent_event_contract_unavailable",
@@ -277,8 +276,6 @@ class CapabilityDiscovery:
                 contract,
                 validation,
                 account,
-                effective_policy,
-                policy_state,
             )
         )
         return CapabilitySnapshot(
@@ -721,28 +718,21 @@ def _agent_admission(
     contract: CodexProtocolContract,
     validation: _ContractValidation,
     account: CapabilityState,
-    effective_policy: EffectivePolicy | None,
-    policy_state: CapabilityState,
 ) -> CapabilityState:
     readiness = _agent_execution_readiness(contract, validation)
     if readiness.status is not CapabilityStatus.AVAILABLE:
         return readiness
     if account.status is not CapabilityStatus.AVAILABLE:
         return account
-    if policy_state.status is not CapabilityStatus.AVAILABLE or effective_policy is None:
-        return policy_state
     # A prompt moco could not read would arrive mid-turn with nothing safe to answer, so an
     # unadaptable approval family stops the turn here rather than at the prompt.
     approvals = _approval_readiness(validation, validation.adaptable_categories)
     if approvals is not None:
         return approvals
-    if is_unsafe_voice_policy(effective_policy):
-        return _UNSAFE_VOICE_POLICY
     return _AVAILABLE
 
 
 def is_unsafe_voice_policy(policy: EffectivePolicy | None) -> bool:
-    """Use one canonical safety predicate at discovery and Agent's wire boundary."""
     return (
         type(policy) is EffectivePolicy
         and type(policy.sandbox) is SandboxMode

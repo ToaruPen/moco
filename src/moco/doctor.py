@@ -19,10 +19,11 @@ from moco.codex.capabilities import (
     CapabilityState,
     CapabilityStatus,
     EffectivePolicy,
+    is_unsafe_voice_policy,
 )
 from moco.codex.connection import CodexConnectionSupervisor
 from moco.codex.schema import CodexSchemaProbe
-from moco.config import MocoSettings
+from moco.config import AgentProfileMode, MocoSettings
 from moco.errors import CodexCommandError
 from moco.platform import (
     CodexCommand,
@@ -165,6 +166,7 @@ async def run_doctor(
                 await _probe_codex(
                     command,
                     working_directory=working_directory,
+                    profile=settings.agent.profile,
                     connection_factory=connection_factory or _default_connection_factory,
                     discovery_factory=discovery_factory or _default_discovery_factory,
                 ),
@@ -270,6 +272,7 @@ async def _probe_codex(
     command: CodexCommand,
     *,
     working_directory: Path,
+    profile: AgentProfileMode,
     connection_factory: ConnectionFactory,
     discovery_factory: DiscoveryFactory,
 ) -> list[DoctorCheck]:
@@ -282,7 +285,7 @@ async def _probe_codex(
         await connection.start()
         discovery = discovery_factory(command, connection, working_directory)
         snapshot: object = await discovery.discover()
-        return _project_codex_snapshot(_validated_snapshot(snapshot))
+        return _project_codex_snapshot(_validated_snapshot(snapshot), profile)
     except Exception as error:  # noqa: BLE001
         logger.warning("Doctor Codex probe failed (type=%s)", type(error).__name__)
         return _codex_probe_failed_checks()
@@ -300,14 +303,17 @@ def _validated_snapshot(value: object) -> CapabilitySnapshot:
     return value
 
 
-def _project_codex_snapshot(snapshot: CapabilitySnapshot) -> list[DoctorCheck]:
+def _project_codex_snapshot(
+    snapshot: CapabilitySnapshot,
+    profile: AgentProfileMode,
+) -> list[DoctorCheck]:
     return [
         _project_schema(snapshot),
         _project_capability("codex_account", snapshot.account, available_detail="authenticated"),
         _project_policy(snapshot.effective_policy, snapshot.policy_state),
         _project_capability(
             "codex_agent_admission",
-            snapshot.agent_admission,
+            _profile_agent_admission(snapshot, profile),
             available_detail="allowed",
         ),
         _project_capability(
@@ -323,6 +329,24 @@ def _project_codex_snapshot(snapshot: CapabilitySnapshot) -> list[DoctorCheck]:
             available_detail="discovered",
         ),
     ]
+
+
+def _profile_agent_admission(
+    snapshot: CapabilitySnapshot,
+    profile: AgentProfileMode,
+) -> CapabilityState:
+    admission = snapshot.agent_admission
+    if profile is not AgentProfileMode.INHERIT_CODEX:
+        return admission
+    if admission.status is not CapabilityStatus.AVAILABLE:
+        return admission
+    if snapshot.policy_state.status is not CapabilityStatus.AVAILABLE:
+        return snapshot.policy_state
+    if snapshot.effective_policy is None:
+        return CapabilityState(CapabilityStatus.VERSION_MISMATCH, "invalid_response")
+    if is_unsafe_voice_policy(snapshot.effective_policy):
+        return CapabilityState(CapabilityStatus.DISABLED, "unsafe_voice_policy")
+    return admission
 
 
 def _project_schema(snapshot: CapabilitySnapshot) -> DoctorCheck:

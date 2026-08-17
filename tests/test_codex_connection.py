@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import sys
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import suppress
@@ -289,6 +290,21 @@ async def test_initialization_failure_closes_client(
     await supervisor.close()
 
 
+async def test_startup_timeout_is_independent_of_operation_timeout(
+    fake_codex_script: Path,
+) -> None:
+    supervisor = CodexConnectionSupervisor(
+        scenario_command(fake_codex_script, "delayed-initialize"),
+        request_timeout=0.01,
+    )
+
+    await supervisor.start()
+    try:
+        assert supervisor.initialize_info.user_agent == "fake-codex"
+    finally:
+        await supervisor.close()
+
+
 @pytest.mark.parametrize(
     "scenario",
     ["initialize-missing-user-agent", "initialize-invalid-platform"],
@@ -373,10 +389,17 @@ async def test_missing_binary_reports_process_error(tmp_path: Path) -> None:
     ("keyword", "value", "message"),
     [
         ("request_timeout", 0.0, "request_timeout must be positive"),
+        ("request_timeout", math.nan, "request_timeout must be positive"),
+        ("request_timeout", math.inf, "request_timeout must be positive"),
+        ("startup_timeout", 0.0, "startup_timeout must be positive"),
+        ("startup_timeout", math.nan, "startup_timeout must be positive"),
+        ("startup_timeout", math.inf, "startup_timeout must be positive"),
         ("shutdown_timeout", -1.0, "shutdown_timeout must be positive"),
+        ("shutdown_timeout", math.nan, "shutdown_timeout must be positive"),
+        ("shutdown_timeout", math.inf, "shutdown_timeout must be positive"),
     ],
 )
-def test_rejects_non_positive_constructor_timeouts(
+def test_rejects_invalid_constructor_timeouts(
     fake_codex_command: CodexCommand,
     keyword: str,
     value: float,

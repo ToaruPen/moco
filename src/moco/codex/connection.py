@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
@@ -43,16 +44,20 @@ class CodexConnectionSupervisor:
         command: CodexCommand,
         *,
         request_timeout: float = 10.0,
+        startup_timeout: float = 20.0,
         shutdown_timeout: float = 1.0,
     ) -> None:
-        if request_timeout <= 0:
-            message = "request_timeout must be positive"
-            raise ValueError(message)
-        if shutdown_timeout <= 0:
-            message = "shutdown_timeout must be positive"
-            raise ValueError(message)
+        for name, timeout in (
+            ("request_timeout", request_timeout),
+            ("startup_timeout", startup_timeout),
+            ("shutdown_timeout", shutdown_timeout),
+        ):
+            if not math.isfinite(timeout) or timeout <= 0:
+                message = f"{name} must be positive"
+                raise ValueError(message)
         self._command = command
         self._request_timeout = request_timeout
+        self._startup_timeout = startup_timeout
         self._shutdown_timeout = shutdown_timeout
         self._handlers: dict[str, RpcServerRequestHandler] = {}
         self._notification_observer: Callable[[RpcNotification], None] | None = None
@@ -192,6 +197,7 @@ class CodexConnectionSupervisor:
                     "clientInfo": dict(_CLIENT_INFO),
                     "capabilities": {"experimentalApi": True},
                 },
+                request_timeout=self._startup_timeout,
             )
             self._initialize_info = _parse_initialize_info(result)
             await peer.notify("initialized")

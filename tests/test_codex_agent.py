@@ -992,7 +992,16 @@ async def test_thread_start_uses_explicit_profile_policy(
     approval: str,
 ) -> None:
     connection = FakeSharedConnection()
-    session = make_session(connection, profile=profile)
+    session = make_session(
+        connection,
+        profile=profile,
+        snapshot=capabilities(
+            effective_policy=EffectivePolicy(
+                SandboxMode.DANGER_FULL_ACCESS,
+                ApprovalMode.NEVER,
+            ),
+        ),
+    )
 
     assert await finish_turn(connection, session, "hello") == "final answer"
 

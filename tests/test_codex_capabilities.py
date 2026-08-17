@@ -533,7 +533,9 @@ async def test_all_safe_policy_combinations_admit_agent(
     assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
 
 
-async def test_only_danger_full_access_never_is_blocked(tmp_path: Path) -> None:
+async def test_global_unsafe_policy_does_not_change_profile_independent_admission(
+    tmp_path: Path,
+) -> None:
     snapshot, _ = await discover(
         tmp_path,
         actions=happy_actions(sandbox="danger-full-access", approval="never"),
@@ -544,10 +546,7 @@ async def test_only_danger_full_access_never_is_blocked(tmp_path: Path) -> None:
         ApprovalMode.NEVER,
     )
     assert snapshot.policy_state == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
-    assert snapshot.agent_admission == CapabilityState(
-        CapabilityStatus.DISABLED,
-        "unsafe_voice_policy",
-    )
+    assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
     assert snapshot.realtime.status is CapabilityStatus.AVAILABLE
 
 
@@ -584,7 +583,7 @@ async def test_malformed_granular_policy_is_version_mismatch(
         CapabilityStatus.VERSION_MISMATCH,
         "invalid_response",
     )
-    assert snapshot.agent_admission.status is CapabilityStatus.VERSION_MISMATCH
+    assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
 
 
 @pytest.mark.parametrize(
@@ -834,7 +833,7 @@ async def test_feature_page_budget_fails_closed_and_remains_bounded(tmp_path: Pa
     assert len(requester.params_for(_ALIASES[SemanticMethod.EXPERIMENTAL_FEATURE_LIST])) == 32
 
 
-async def test_optional_method_failure_or_absence_does_not_hide_voice(
+async def test_optional_method_failure_or_absence_does_not_hide_profile_readiness(
     tmp_path: Path,
 ) -> None:
     actions = happy_actions()
@@ -850,12 +849,12 @@ async def test_optional_method_failure_or_absence_does_not_hide_voice(
     assert snapshot.account.status is CapabilityStatus.AVAILABLE
     assert snapshot.policy_state == CapabilityState(CapabilityStatus.ERROR, "probe_failed")
     assert snapshot.realtime == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
-    assert snapshot.agent_admission.status is CapabilityStatus.ERROR
+    assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
     assert requester.params_for(_ALIASES[SemanticMethod.REALTIME_VOICES_LIST]) == [{}]
     assert "CONFIG_ERROR_SECRET" not in repr(snapshot)
 
 
-async def test_missing_optional_config_does_not_hide_account_or_realtime(tmp_path: Path) -> None:
+async def test_missing_optional_config_does_not_hide_profile_readiness(tmp_path: Path) -> None:
     included = frozenset(SemanticMethod) - {SemanticMethod.CONFIG_READ}
 
     snapshot, _ = await discover(tmp_path, contract=make_contract(included=included))
@@ -865,7 +864,7 @@ async def test_missing_optional_config_does_not_hide_account_or_realtime(tmp_pat
         CapabilityStatus.VERSION_MISMATCH,
         "method_unavailable",
     )
-    assert snapshot.agent_admission.status is CapabilityStatus.VERSION_MISMATCH
+    assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
     assert snapshot.realtime.status is CapabilityStatus.AVAILABLE
 
 
