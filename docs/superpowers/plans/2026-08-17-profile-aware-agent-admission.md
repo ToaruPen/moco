@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: Separate capability readiness from global policy
+## Task 1: Separate capability readiness from global policy
 
 **Files:**
 - Modify: `tests/test_codex_capabilities.py`
@@ -103,7 +103,7 @@ uv run pytest tests/test_codex_capabilities.py \
 
 Expected: all selected tests pass.
 
-### Task 2: Project admission according to the selected profile
+## Task 2: Project admission according to the selected profile
 
 **Files:**
 - Modify: `tests/test_doctor.py`
@@ -279,7 +279,7 @@ uv run pytest tests/test_doctor.py \
 
 Expected: all selected tests pass.
 
-### Task 3: Lock the Agent wire boundary and align authoritative docs
+## Task 3: Lock the Agent wire boundary and align authoritative docs
 
 **Files:**
 - Modify: `tests/test_codex_agent.py`
@@ -363,7 +363,7 @@ uv run pytest tests/test_codex_agent.py \
 
 Expected: all selected tests pass.
 
-### Task 4: Verify the complete change and deployment compatibility fix
+## Task 4: Verify the complete change and deployment compatibility fix
 
 **Files:**
 - Verify: `src/moco/codex/capabilities.py`

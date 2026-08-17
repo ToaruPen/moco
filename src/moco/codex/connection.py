@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import math
 from contextlib import suppress
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Self
@@ -46,15 +47,14 @@ class CodexConnectionSupervisor:
         startup_timeout: float = 20.0,
         shutdown_timeout: float = 1.0,
     ) -> None:
-        if request_timeout <= 0:
-            message = "request_timeout must be positive"
-            raise ValueError(message)
-        if startup_timeout <= 0:
-            message = "startup_timeout must be positive"
-            raise ValueError(message)
-        if shutdown_timeout <= 0:
-            message = "shutdown_timeout must be positive"
-            raise ValueError(message)
+        for name, timeout in (
+            ("request_timeout", request_timeout),
+            ("startup_timeout", startup_timeout),
+            ("shutdown_timeout", shutdown_timeout),
+        ):
+            if not math.isfinite(timeout) or timeout <= 0:
+                message = f"{name} must be positive"
+                raise ValueError(message)
         self._command = command
         self._request_timeout = request_timeout
         self._startup_timeout = startup_timeout

@@ -264,9 +264,10 @@ web searchなどapp-server内部で完結するtoolの全名前も複製しな�
 任意categoryの失敗はdegraded readinessとして表示する。選択model、profile、MCP、app、Realtimeが
 見つからない場合は、別のものへ黙って変更しない。
 
-段階Aで必須なのはinitialize/version、account readiness、effective policy、Realtime、interruptと、
-その段階のserver request categoryだけである。model catalog、MCP、apps、skillsの完全snapshotは、
-Agent作業または該当interactionを公開する段階B/Cで追加する。
+段階Aで必須なのはinitialize/version、account readiness、Realtime、interruptと、その段階の
+server request categoryだけである。effective policyは`inherit_codex`のadmissionに限り必須であり、
+明示profileではprobe失敗をdegraded readinessとして表示してもAgent handoffは止めない。model catalog、
+MCP、apps、skillsの完全snapshotは、Agent作業または該当interactionを公開する段階B/Cで追加する。
 
 設定、MCP、app、skill、account、modelの変更notificationを受けた場合はsnapshotをinvalidにし、
 次の会話または安全なidle境界で再取得する。実行中turnのpolicyを途中で推測し直さない。
