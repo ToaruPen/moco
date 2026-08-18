@@ -315,6 +315,43 @@ def thread_start_variant(
     )
 
 
+def thread_realtime_start_variant(
+    method: str = "alias-realtime-start",
+    *,
+    versions: tuple[str, ...] = ("v1", "v2", "v3"),
+) -> dict[str, JsonValue]:
+    return schema_variant(
+        method,
+        params_title="ThreadRealtimeStartParams",
+        params_required={"outputModality", "threadId"},
+        params_properties={
+            "includeStartupContext": {"type": ["boolean", "null"]},
+            "outputModality": {"type": "string", "enum": ["text", "audio"]},
+            "prompt": {"type": ["string", "null"]},
+            "threadId": {"type": "string"},
+            "transport": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["sdp", "type"],
+                        "properties": {
+                            "sdp": {"type": "string"},
+                            "type": {"type": "string", "enum": ["webrtc"]},
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "version": {
+                "anyOf": [
+                    {"type": "string", "enum": list(versions)},
+                    {"type": "null"},
+                ]
+            },
+        },
+    )
+
+
 def turn_start_variant(
     method: str = "alias-turn-start",
     *,
@@ -462,6 +499,45 @@ OBJECT_KEYWORDS_WITHOUT_TYPE = [
     pytest.param({"required": "future"}, id="malformed-required-without-type"),
     pytest.param({"properties": ["future"]}, id="malformed-properties-without-type"),
 ]
+
+
+def test_realtime_start_schema_selects_alias_for_the_v3_audio_webrtc_payload(
+    tmp_path: Path,
+) -> None:
+    write_schema_bundle(
+        tmp_path,
+        client_variants=[thread_realtime_start_variant("effective/realtime-start")],
+        server_variants=[],
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.require_method(SemanticMethod.THREAD_REALTIME_START) == ClientMethodContract(
+        "effective/realtime-start",
+        ParamsKind.OBJECT,
+        frozenset(
+            {
+                "includeStartupContext",
+                "outputModality",
+                "prompt",
+                "threadId",
+                "transport",
+                "version",
+            }
+        ),
+    )
+
+
+def test_realtime_start_schema_rejects_a_build_without_v3(tmp_path: Path) -> None:
+    write_schema_bundle(
+        tmp_path,
+        client_variants=[thread_realtime_start_variant(versions=("v1", "v2"))],
+        server_variants=[],
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.method(SemanticMethod.THREAD_REALTIME_START) is None
 
 
 def test_turn_steer_schema_selects_alias_from_matching_generated_titles(
@@ -890,6 +966,7 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
         thread_start_variant("alias-g"),
         turn_start_variant("alias-h"),
         turn_steer_variant("alias-i"),
+        thread_realtime_start_variant("alias-j"),
         schema_variant("account/read", params_title="UnrelatedParams"),
     ]
     write_schema_bundle(tmp_path, client_variants=client_variants, server_variants=[])
@@ -920,11 +997,18 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
         ParamsKind.OBJECT,
         frozenset({"expectedTurnId", "input", "threadId"}),
     )
+    assert contract.require_method(SemanticMethod.THREAD_REALTIME_START).name == "alias-j"
     assert contract.version == "fake 1"
     assert contract.experimental_schema is True
     assert contract.missing_methods == frozenset()
     assert (
-        frozenset({SemanticMethod.ACCOUNT_READ, SemanticMethod.REALTIME_VOICES_LIST})
+        frozenset(
+            {
+                SemanticMethod.ACCOUNT_READ,
+                SemanticMethod.REALTIME_VOICES_LIST,
+                SemanticMethod.THREAD_REALTIME_START,
+            }
+        )
         == VOICE_REQUIRED_METHODS
     )
     assert (

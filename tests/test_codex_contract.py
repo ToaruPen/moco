@@ -60,6 +60,25 @@ def test_installed_codex_advertises_parameterless_managed_requirements_read() ->
     assert requirements.semantic_fields == frozenset()
 
 
+def test_installed_codex_accepts_the_production_realtime_start_payload() -> None:
+    command = resolve_codex_command(None)
+    contract = CodexSchemaProbe(command).probe_sync()
+
+    realtime = contract.require_method(SemanticMethod.THREAD_REALTIME_START)
+    assert realtime.name
+    assert realtime.params_kind is ParamsKind.OBJECT
+    assert realtime.semantic_fields == frozenset(
+        {
+            "includeStartupContext",
+            "outputModality",
+            "prompt",
+            "threadId",
+            "transport",
+            "version",
+        }
+    )
+
+
 def test_installed_codex_advertises_agent_execution_semantics() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
