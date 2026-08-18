@@ -315,6 +315,43 @@ def thread_start_variant(
     )
 
 
+def thread_realtime_start_variant(
+    method: str = "alias-realtime-start",
+    *,
+    versions: tuple[str, ...] = ("v1", "v2", "v3"),
+) -> dict[str, JsonValue]:
+    return schema_variant(
+        method,
+        params_title="ThreadRealtimeStartParams",
+        params_required={"outputModality", "threadId"},
+        params_properties={
+            "includeStartupContext": {"type": ["boolean", "null"]},
+            "outputModality": {"type": "string", "enum": ["text", "audio"]},
+            "prompt": {"type": ["string", "null"]},
+            "threadId": {"type": "string"},
+            "transport": {
+                "anyOf": [
+                    {
+                        "type": "object",
+                        "required": ["sdp", "type"],
+                        "properties": {
+                            "sdp": {"type": "string"},
+                            "type": {"type": "string", "enum": ["webrtc"]},
+                        },
+                    },
+                    {"type": "null"},
+                ]
+            },
+            "version": {
+                "anyOf": [
+                    {"type": "string", "enum": list(versions)},
+                    {"type": "null"},
+                ]
+            },
+        },
+    )
+
+
 def turn_start_variant(
     method: str = "alias-turn-start",
     *,
@@ -462,6 +499,45 @@ OBJECT_KEYWORDS_WITHOUT_TYPE = [
     pytest.param({"required": "future"}, id="malformed-required-without-type"),
     pytest.param({"properties": ["future"]}, id="malformed-properties-without-type"),
 ]
+
+
+def test_realtime_start_schema_selects_alias_for_the_v3_audio_webrtc_payload(
+    tmp_path: Path,
+) -> None:
+    write_schema_bundle(
+        tmp_path,
+        client_variants=[thread_realtime_start_variant("effective/realtime-start")],
+        server_variants=[],
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.require_method(SemanticMethod.THREAD_REALTIME_START) == ClientMethodContract(
+        "effective/realtime-start",
+        ParamsKind.OBJECT,
+        frozenset(
+            {
+                "includeStartupContext",
+                "outputModality",
+                "prompt",
+                "threadId",
+                "transport",
+                "version",
+            }
+        ),
+    )
+
+
+def test_realtime_start_schema_rejects_a_build_without_v3(tmp_path: Path) -> None:
+    write_schema_bundle(
+        tmp_path,
+        client_variants=[thread_realtime_start_variant(versions=("v1", "v2"))],
+        server_variants=[],
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.method(SemanticMethod.THREAD_REALTIME_START) is None
 
 
 def test_turn_steer_schema_selects_alias_from_matching_generated_titles(
@@ -890,6 +966,7 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
         thread_start_variant("alias-g"),
         turn_start_variant("alias-h"),
         turn_steer_variant("alias-i"),
+        thread_realtime_start_variant("alias-j"),
         schema_variant("account/read", params_title="UnrelatedParams"),
     ]
     write_schema_bundle(tmp_path, client_variants=client_variants, server_variants=[])
@@ -920,11 +997,18 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
         ParamsKind.OBJECT,
         frozenset({"expectedTurnId", "input", "threadId"}),
     )
+    assert contract.require_method(SemanticMethod.THREAD_REALTIME_START).name == "alias-j"
     assert contract.version == "fake 1"
     assert contract.experimental_schema is True
     assert contract.missing_methods == frozenset()
     assert (
-        frozenset({SemanticMethod.ACCOUNT_READ, SemanticMethod.REALTIME_VOICES_LIST})
+        frozenset(
+            {
+                SemanticMethod.ACCOUNT_READ,
+                SemanticMethod.REALTIME_VOICES_LIST,
+                SemanticMethod.THREAD_REALTIME_START,
+            }
+        )
         == VOICE_REQUIRED_METHODS
     )
     assert (
@@ -5010,6 +5094,7 @@ def legacy_decision_schema(
     *,
     denied_object: bool = False,
     rejection: dict[str, JsonValue] | None = None,
+    mcp_policy_amendment: bool = False,
 ) -> dict[str, JsonValue]:
     """The legacy vocabulary, whose refusal changed shape between retained builds."""
     refusal: dict[str, JsonValue] = (
@@ -5033,6 +5118,7 @@ def legacy_decision_schema(
             decision_string("approved"),
             decision_object("approved_execpolicy_amendment", "proposed_execpolicy_amendment"),
             decision_string("approved_for_session"),
+            *([decision_string("approved_mcp_policy_amendment")] if mcp_policy_amendment else []),
             decision_object("network_policy_amendment", "network_policy_amendment"),
             refusal,
             decision_string("timed_out"),
@@ -5046,6 +5132,7 @@ def legacy_approval_bundle(
     *,
     denied_object: bool = False,
     rejection: dict[str, JsonValue] | None = None,
+    mcp_policy_amendment: bool = False,
     command_properties: dict[str, JsonValue] | None = None,
     command_required: frozenset[str] = frozenset(
         {"callId", "command", "conversationId", "cwd", "parsedCmd"}
@@ -5088,7 +5175,11 @@ def legacy_approval_bundle(
             "reason": {"type": ["string", "null"]},
         },
     )
-    decision = legacy_decision_schema(denied_object=denied_object, rejection=rejection)
+    decision = legacy_decision_schema(
+        denied_object=denied_object,
+        rejection=rejection,
+        mcp_policy_amendment=mcp_policy_amendment,
+    )
     approval_bundle(
         bundle,
         extra_variants=[legacy_command, legacy_file],
@@ -5612,6 +5703,24 @@ def test_a_legacy_family_is_profiled_from_its_own_params_and_response(tmp_path: 
     assert file_profile is not None
     assert file_profile.changes_member == "fileChanges"
     assert contract.adaptable_approval_categories == STAGE_B_REQUIRED_SERVER_REQUEST_CATEGORIES
+
+
+def test_legacy_mcp_policy_amendment_stays_unsent_without_withdrawing_profiles(
+    tmp_path: Path,
+) -> None:
+    legacy_approval_bundle(tmp_path, denied_object=True, mcp_policy_amendment=True)
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.adaptable_approval_categories == STAGE_B_REQUIRED_SERVER_REQUEST_CATEGORIES
+    for method in (LEGACY_COMMAND_METHOD, LEGACY_FILE_METHOD):
+        profile = contract.approval_profile(method)
+        assert profile is not None
+        assert profile.semantic_decision("approved_mcp_policy_amendment") is None
+        assert all(
+            profile.wire_decision(decision) != "approved_mcp_policy_amendment"
+            for decision in ApprovalDecision
+        )
 
 
 def test_a_build_that_cannot_state_a_move_destination_stays_unprofiled(tmp_path: Path) -> None:

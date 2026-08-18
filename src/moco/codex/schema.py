@@ -622,6 +622,7 @@ class SemanticMethod(StrEnum):
     EXPERIMENTAL_FEATURE_LIST = "experimental_feature_list"
     REALTIME_VOICES_LIST = "realtime_voices_list"
     THREAD_START = "thread_start"
+    THREAD_REALTIME_START = "thread_realtime_start"
     TURN_START = "turn_start"
     TURN_STEER = "turn_steer"
     TURN_INTERRUPT = "turn_interrupt"
@@ -645,7 +646,11 @@ class ServerRequestCategory(StrEnum):
 
 
 VOICE_REQUIRED_METHODS = frozenset(
-    {SemanticMethod.ACCOUNT_READ, SemanticMethod.REALTIME_VOICES_LIST}
+    {
+        SemanticMethod.ACCOUNT_READ,
+        SemanticMethod.REALTIME_VOICES_LIST,
+        SemanticMethod.THREAD_REALTIME_START,
+    }
 )
 AGENT_READINESS_METHODS = frozenset(
     {
@@ -1643,6 +1648,10 @@ _CLIENT_SIGNALS: dict[SemanticMethod, _SemanticSignals] = {
         frozenset({"ThreadStartParams"}),
         frozenset({"Thread/startRequest"}),
     ),
+    SemanticMethod.THREAD_REALTIME_START: _SemanticSignals(
+        frozenset({"ThreadRealtimeStartParams"}),
+        frozenset({"Thread/realtime/startRequest"}),
+    ),
     SemanticMethod.TURN_START: _SemanticSignals(
         frozenset({"TurnStartParams"}),
         frozenset({"Turn/startRequest"}),
@@ -1662,6 +1671,16 @@ _EMPTY_PARAMS = _object_value({})
 # profile omits the policy members; each explicit profile pins one supported policy pair.
 _THREAD_START_BASE: Mapping[str, _Witness] = MappingProxyType(
     {"cwd": _DYNAMIC_STRING, "ephemeral": _LiteralValue(value=True)}
+)
+_REALTIME_START = _object_value(
+    {
+        "includeStartupContext": _LiteralValue(value=False),
+        "outputModality": _LiteralValue("audio"),
+        "prompt": _DYNAMIC_STRING,
+        "threadId": _DYNAMIC_STRING,
+        "transport": _object_value({"sdp": _DYNAMIC_STRING, "type": _LiteralValue("webrtc")}),
+        "version": _LiteralValue("v3"),
+    }
 )
 
 
@@ -1700,6 +1719,10 @@ _CLIENT_INVOCATIONS: dict[SemanticMethod, _InvocationSpec] = {
             _explicit_thread_start("read-only", "never"),
             _explicit_thread_start("workspace-write", "on-request"),
         ),
+    ),
+    SemanticMethod.THREAD_REALTIME_START: _InvocationSpec(
+        ParamsKind.OBJECT,
+        (_REALTIME_START,),
     ),
     SemanticMethod.TURN_START: _InvocationSpec(
         ParamsKind.OBJECT,
@@ -1867,7 +1890,9 @@ _LEGACY_WIRE = _one_shot("approved", ("denied", {"denied": {"rejection": ""}}), 
 # all. No retained legacy bundle does, so the legacy families read the whole one-shot set;
 # a build that starts declaring it narrows the offer instead of being left unprofiled.
 _OFFER_MEMBER = "availableDecisions"
-_LEGACY_UNSENT_DECISIONS = frozenset({"approved_for_session", "timed_out"})
+_LEGACY_UNSENT_DECISIONS = frozenset(
+    {"approved_for_session", "approved_mcp_policy_amendment", "timed_out"}
+)
 _LEGACY_UNSENT_VARIANTS = frozenset({"approved_execpolicy_amendment", "network_policy_amendment"})
 _APPROVAL_CORRELATION = frozenset({"threadId", "turnId", "itemId"})
 _LEGACY_CORRELATION = frozenset({"conversationId", "callId"})

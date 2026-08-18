@@ -16,9 +16,16 @@ from moco.codex.capabilities import (
     CapabilityStatus,
 )
 from moco.codex.rpc import JsonValue, RpcNotification
+from moco.codex.schema import (
+    ClientMethodContract,
+    CodexProtocolContract,
+    ParamsKind,
+    SemanticMethod,
+)
 from moco.codex.session import (
     DEFAULT_REALTIME_PROMPT,
     ActivityEvent,
+    CodexConnection,
     CodexRealtimeSession,
     RealtimeErrorEvent,
     ReasoningSummaryEvent,
@@ -40,9 +47,17 @@ class SecondaryCloseError(RuntimeError):
 
 
 class FakeRpc:
-    def __init__(self, event_log: list[str] | None = None) -> None:
+    def __init__(
+        self,
+        event_log: list[str] | None = None,
+        *,
+        thread_start_method: str = "thread/start",
+        realtime_start_method: str = "thread/realtime/start",
+    ) -> None:
         self.requests: list[tuple[str, dict[str, JsonValue]]] = []
         self.event_log = event_log
+        self.thread_start_method = thread_start_method
+        self.realtime_start_method = realtime_start_method
         self.started = False
         self.closed = False
         self.thread_result: JsonValue = {"thread": {"id": "thr_test"}}
@@ -73,9 +88,9 @@ class FakeRpc:
         if method == self.fail_method:
             message = "forced failure"
             raise CodexRpcError(message)
-        if method == "thread/start":
+        if method == self.thread_start_method:
             return self.thread_result
-        if method == "thread/realtime/start":
+        if method == self.realtime_start_method:
             if self.emit_sdp:
                 await self.emit(
                     "thread/realtime/sdp",
@@ -252,13 +267,68 @@ def make_settings(tmp_path: Path) -> MocoSettings:
     )
 
 
+def make_voice_contract(
+    *,
+    thread_start: str = "thread/start",
+    realtime_start: str = "thread/realtime/start",
+) -> CodexProtocolContract:
+    return CodexProtocolContract(
+        version="codex-fixture",
+        methods={
+            SemanticMethod.THREAD_START: ClientMethodContract(
+                thread_start,
+                ParamsKind.OBJECT,
+                frozenset({"cwd", "ephemeral", "sandbox", "approvalPolicy"}),
+            ),
+            SemanticMethod.THREAD_REALTIME_START: ClientMethodContract(
+                realtime_start,
+                ParamsKind.OBJECT,
+                frozenset(
+                    {
+                        "includeStartupContext",
+                        "outputModality",
+                        "prompt",
+                        "threadId",
+                        "transport",
+                        "version",
+                    }
+                ),
+            ),
+        },
+        server_requests={},
+        unclassified_server_request_count=0,
+        experimental_schema=True,
+    )
+
+
+def make_session(
+    connection: CodexConnection,
+    *,
+    settings: MocoSettings,
+    capabilities: CapabilitySnapshot,
+    contract: CodexProtocolContract | None = None,
+    working_directory: Path | None = None,
+    prompt: str | None = None,
+    sdp_timeout: float = 10.0,
+) -> CodexRealtimeSession:
+    return CodexRealtimeSession(
+        connection,
+        contract=contract or make_voice_contract(),
+        settings=settings,
+        capabilities=capabilities,
+        working_directory=working_directory,
+        prompt=prompt,
+        sdp_timeout=sdp_timeout,
+    )
+
+
 async def test_discovers_once_before_notification_subscription_and_thread_start(
     tmp_path: Path,
 ) -> None:
     """The borrower subscribes before its thread requests and never starts the connection."""
     event_log: list[str] = []
     rpc = FakeRpc(event_log)
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -277,7 +347,7 @@ async def test_discovers_once_before_notification_subscription_and_thread_start(
 async def test_borrowed_connection_is_never_started_or_closed(tmp_path: Path) -> None:
     """A successful conversation leaves the borrowed connection lifecycle untouched."""
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -297,7 +367,7 @@ async def test_borrowed_connection_is_never_started_or_closed(tmp_path: Path) ->
 async def test_borrowed_session_needs_no_connection_lifecycle_methods(tmp_path: Path) -> None:
     """The session-facing connection protocol no longer requires start or close."""
     rpc = BorrowedOnlyRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -334,7 +404,7 @@ async def test_borrowed_connection_survives_startup_and_notification_failure(
     rpc = FakeRpc()
     rpc.fail_method = fail_method
     rpc.notification_error = notification_error
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -352,7 +422,7 @@ async def test_borrowed_connection_survives_startup_and_notification_failure(
 async def test_borrowed_connection_survives_close_cancellation(tmp_path: Path) -> None:
     """Cancelled cleanup finalizes the borrower without closing the connection."""
     rpc = CancellationPhaseRpc("stop")
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -376,7 +446,7 @@ async def test_borrowed_connection_survives_close_cancellation(tmp_path: Path) -
 async def test_borrowed_connection_survives_start_cancellation(tmp_path: Path) -> None:
     """Cancellation during Voice startup never starts or closes the borrowed connection."""
     rpc = StartCancellationRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -398,7 +468,7 @@ async def test_voice_allows_unsafe_agent_policy_when_realtime_is_ready(
 ) -> None:
     blocked = CapabilityState(CapabilityStatus.DISABLED, "unsafe_voice_policy")
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(agent_admission=blocked),
@@ -419,7 +489,7 @@ async def test_voice_rejects_required_readiness_failure(
     snapshot = make_snapshot(**{field: unavailable})
     event_log: list[str] = []
     rpc = FakeRpc(event_log)
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=snapshot,
@@ -454,7 +524,7 @@ async def test_invalid_discovery_snapshot_is_bounded_before_thread_start(
     """An unusable snapshot fails closed before subscription and leaves the connection open."""
     event_log: list[str] = []
     rpc = FakeRpc(event_log)
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=snapshot,
@@ -481,7 +551,7 @@ async def test_resolves_default_working_directory_once_at_construction(
     later.mkdir()
     monkeypatch.chdir(initial)
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=MocoSettings(),
         capabilities=make_snapshot(),
@@ -500,7 +570,7 @@ def test_rejects_relative_working_directory_override_before_connection_start(
     rpc = FakeRpc()
 
     with pytest.raises(ValueError, match="absolute"):
-        CodexRealtimeSession(
+        make_session(
             rpc,
             settings=make_settings(tmp_path),
             capabilities=make_snapshot(),
@@ -512,7 +582,7 @@ def test_rejects_relative_working_directory_override_before_connection_start(
 
 
 async def _started_prompt(rpc: FakeRpc, settings: MocoSettings) -> str:
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=settings,
         capabilities=make_snapshot(),
@@ -525,7 +595,7 @@ async def _started_prompt(rpc: FakeRpc, settings: MocoSettings) -> str:
 
 async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -555,6 +625,29 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
                 "version": "v3",
             },
         ),
+    ]
+    await session.close()
+
+
+async def test_uses_contract_derived_start_method_names(tmp_path: Path) -> None:
+    rpc = FakeRpc(
+        thread_start_method="effective/thread-start",
+        realtime_start_method="effective/realtime-start",
+    )
+    session = make_session(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+        contract=make_voice_contract(
+            thread_start="effective/thread-start",
+            realtime_start="effective/realtime-start",
+        ),
+    )
+
+    assert await session.start("offer-sdp") == "answer-sdp"
+    assert [method for method, _params in rpc.requests[:2]] == [
+        "effective/thread-start",
+        "effective/realtime-start",
     ]
     await session.close()
 
@@ -639,7 +732,7 @@ async def test_rejects_invalid_prompt_before_rpc_start(
     rpc = FakeRpc()
 
     with pytest.raises(CodexPromptError, match=message):
-        await CodexRealtimeSession(
+        await make_session(
             rpc,
             settings=settings,
             capabilities=make_snapshot(),
@@ -659,7 +752,7 @@ async def test_unusable_programmatic_prompt_path_is_a_prompt_error(tmp_path: Pat
     rpc = FakeRpc()
 
     with pytest.raises(CodexPromptError, match="could not be read"):
-        await CodexRealtimeSession(
+        await make_session(
             rpc,
             settings=settings,
             capabilities=make_snapshot(),
@@ -691,7 +784,7 @@ async def test_rejects_unreadable_configured_prompt_before_rpc_start(
     rpc = FakeRpc()
 
     with pytest.raises(CodexPromptError, match=message):
-        await CodexRealtimeSession(
+        await make_session(
             rpc,
             settings=settings,
             capabilities=make_snapshot(),
@@ -703,7 +796,7 @@ async def test_rejects_unreadable_configured_prompt_before_rpc_start(
 
 async def test_exposes_transcript_and_error_notifications(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -737,7 +830,7 @@ async def test_exposes_transcript_and_error_notifications(tmp_path: Path) -> Non
 
 async def test_exposes_safe_turn_and_work_activity(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -818,7 +911,7 @@ async def test_exposes_safe_turn_and_work_activity(tmp_path: Path) -> None:
 
 async def test_realtime_event_backlog_is_bounded_and_fails_closed(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -852,7 +945,7 @@ async def test_auxiliary_event_backlog_fails_session_instead_of_looking_invalid(
     tmp_path: Path,
 ) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -888,7 +981,7 @@ async def test_auxiliary_event_backlog_fails_session_instead_of_looking_invalid(
 
 async def test_exposes_reasoning_summary_but_not_raw_reasoning(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -958,7 +1051,7 @@ async def test_maps_item_types_without_forwarding_payload(
     expected_kind: str,
 ) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1003,7 +1096,7 @@ async def test_maps_item_types_without_forwarding_payload(
 
 async def test_tracks_active_turn_without_sending_control_requests(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1023,7 +1116,7 @@ async def test_tracks_active_turn_without_sending_control_requests(tmp_path: Pat
 
 async def test_ignores_completion_for_a_different_active_turn(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1048,7 +1141,7 @@ async def test_ignores_completion_for_a_different_active_turn(tmp_path: Path) ->
 async def test_sdp_timeout_stops_and_closes(tmp_path: Path) -> None:
     rpc = FakeRpc()
     rpc.emit_sdp = False
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1065,7 +1158,7 @@ async def test_sdp_timeout_stops_and_closes(tmp_path: Path) -> None:
 
 async def test_invalid_notification_surfaces_protocol_error(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1113,7 +1206,7 @@ async def test_discards_invalid_auxiliary_notifications_without_ending_conversat
 ) -> None:
     caplog.set_level(logging.INFO, logger="moco.codex.session")
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1145,7 +1238,7 @@ async def test_discards_invalid_auxiliary_notifications_without_ending_conversat
 
 async def test_close_is_idempotent(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1166,7 +1259,7 @@ def test_rejects_non_positive_sdp_timeout(
     sdp_timeout: float,
 ) -> None:
     with pytest.raises(ValueError, match="positive"):
-        CodexRealtimeSession(
+        make_session(
             FakeRpc(),
             settings=make_settings(tmp_path),
             capabilities=make_snapshot(),
@@ -1176,7 +1269,7 @@ def test_rejects_non_positive_sdp_timeout(
 
 async def test_rejects_empty_duplicate_and_closed_start(tmp_path: Path) -> None:
     empty_rpc = FakeRpc()
-    empty = CodexRealtimeSession(
+    empty = make_session(
         empty_rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1186,7 +1279,7 @@ async def test_rejects_empty_duplicate_and_closed_start(tmp_path: Path) -> None:
     assert not empty_rpc.started
 
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1196,7 +1289,7 @@ async def test_rejects_empty_duplicate_and_closed_start(tmp_path: Path) -> None:
         await session.start("second")
     await session.close()
 
-    closed = CodexRealtimeSession(
+    closed = make_session(
         FakeRpc(),
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1208,7 +1301,7 @@ async def test_rejects_empty_duplicate_and_closed_start(tmp_path: Path) -> None:
 
 async def test_context_manager_closes_unstarted_session(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    async with CodexRealtimeSession(
+    async with make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1235,7 +1328,7 @@ async def test_invalid_thread_results_close_rpc(
     """An invalid thread result closes the borrower only."""
     rpc = FakeRpc()
     rpc.thread_result = thread_result
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1250,7 +1343,7 @@ async def test_start_request_failure_closes_rpc(tmp_path: Path) -> None:
     """A failed thread request closes the borrower only."""
     rpc = FakeRpc()
     rpc.fail_method = "thread/start"
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1263,7 +1356,7 @@ async def test_start_request_failure_closes_rpc(tmp_path: Path) -> None:
 
 async def test_ignores_other_thread_and_non_realtime_events(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1297,7 +1390,7 @@ async def test_invalid_transcript_notification_closes_rpc(
 ) -> None:
     """An invalid transcript notification fails the borrower without closing the connection."""
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1313,7 +1406,7 @@ async def test_invalid_transcript_notification_closes_rpc(
 
 async def test_turn_completion_clears_active_turn(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1334,7 +1427,7 @@ async def test_turn_completion_clears_active_turn(tmp_path: Path) -> None:
 
 async def test_close_active_turn_does_not_append_a_cancel_instruction(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1354,7 +1447,7 @@ async def test_notification_stream_failure_surfaces_and_closes(tmp_path: Path) -
     """A notification stream failure closes the borrower only."""
     rpc = FakeRpc()
     rpc.notification_error = CodexRpcError("stream failed")
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1374,7 +1467,7 @@ async def test_stream_failure_remains_primary_when_notification_cleanup_fails(
     primary = CodexRpcError("stream failed first")
     rpc.notification_error = primary
     rpc.close_error = SecondaryCloseError(private_cleanup)
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1398,7 +1491,7 @@ async def test_validation_error_reaches_events_when_notification_cleanup_fails(
 ) -> None:
     private_cleanup = "private-validation-cleanup"
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1423,7 +1516,7 @@ async def test_validation_error_reaches_events_when_notification_cleanup_fails(
 
 async def test_stop_failure_still_closes_rpc(tmp_path: Path) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1441,7 +1534,7 @@ async def test_connection_close_failure_still_finalizes_session(
     tmp_path: Path,
 ) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1466,7 +1559,7 @@ async def test_stop_failure_remains_primary_when_connection_close_also_fails(
     tmp_path: Path,
 ) -> None:
     rpc = FakeRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1488,7 +1581,7 @@ async def test_start_failure_remains_primary_when_connection_close_also_fails(
     rpc = FakeRpc()
     rpc.fail_method = "thread/start"
     rpc.close_error = CodexRpcError("secondary close failure")
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1511,7 +1604,7 @@ async def test_start_failure_retrieves_secondary_sdp_future_exception(
         primary,
         CodexRpcError(private_secondary),
     )
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1545,7 +1638,7 @@ async def test_close_cancellation_still_finalizes_session(
     phase: str,
 ) -> None:
     rpc = CancellationPhaseRpc(phase)
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),
@@ -1577,7 +1670,7 @@ async def test_notification_cleanup_cancellation_still_finalizes_session(
     tmp_path: Path,
 ) -> None:
     rpc = BlockingNotificationCleanupRpc()
-    session = CodexRealtimeSession(
+    session = make_session(
         rpc,
         settings=make_settings(tmp_path),
         capabilities=make_snapshot(),

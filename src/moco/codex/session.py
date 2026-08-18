@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from moco.codex.capabilities import CapabilitySnapshot, CapabilityState, CapabilityStatus
+from moco.codex.schema import CodexProtocolContract, SemanticMethod
 from moco.config import default_prompt_path
 from moco.errors import (
     CodexCapabilityError,
@@ -120,6 +121,7 @@ class CodexRealtimeSession:
         self,
         connection: CodexConnection,
         *,
+        contract: CodexProtocolContract,
         settings: MocoSettings,
         capabilities: CapabilitySnapshot,
         working_directory: Path | None = None,
@@ -130,6 +132,10 @@ class CodexRealtimeSession:
             msg = "sdp_timeout must be positive"
             raise ValueError(msg)
         self._connection = connection
+        self._thread_start_method = contract.require_method(SemanticMethod.THREAD_START).name
+        self._realtime_start_method = contract.require_method(
+            SemanticMethod.THREAD_REALTIME_START
+        ).name
         self._capabilities = capabilities
         self._settings = settings
         self._prompt = prompt
@@ -201,7 +207,7 @@ class CodexRealtimeSession:
                 name="codex-realtime-notifications",
             )
             thread_result = await self._connection.request(
-                "thread/start",
+                self._thread_start_method,
                 {
                     "ephemeral": True,
                     "sandbox": "read-only",
@@ -211,7 +217,7 @@ class CodexRealtimeSession:
             )
             self._thread_id = _thread_id_from_result(thread_result)
             await self._connection.request(
-                "thread/realtime/start",
+                self._realtime_start_method,
                 {
                     "threadId": self._thread_id,
                     "outputModality": "audio",

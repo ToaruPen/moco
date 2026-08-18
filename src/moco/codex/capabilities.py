@@ -145,6 +145,19 @@ _EXPECTED_METHODS: dict[SemanticMethod, tuple[ParamsKind, frozenset[str]]] = {
         ParamsKind.OBJECT,
         frozenset({"cwd", "ephemeral", "sandbox", "approvalPolicy"}),
     ),
+    SemanticMethod.THREAD_REALTIME_START: (
+        ParamsKind.OBJECT,
+        frozenset(
+            {
+                "includeStartupContext",
+                "outputModality",
+                "prompt",
+                "threadId",
+                "transport",
+                "version",
+            }
+        ),
+    ),
     SemanticMethod.TURN_START: (
         ParamsKind.OBJECT,
         frozenset({"input", "threadId"}),
@@ -266,7 +279,7 @@ class CapabilityDiscovery:
             )
 
         voices, terminal = await self._probe_voices(contract, validation)
-        realtime = _realtime_state(voices, feature_result)
+        realtime = _realtime_state(contract, validation, voices, feature_result)
         interrupt = _interrupt_state(contract, validation) if not terminal else _PROBE_FAILED
         steer = _steer_state(contract, validation) if not terminal else _PROBE_FAILED
         admission = (
@@ -679,9 +692,21 @@ def _steer_state(
     return _AVAILABLE if method is not None else unavailable
 
 
-def _realtime_state(voices: CapabilityState, feature: _FeatureResult) -> CapabilityState:
+def _realtime_state(
+    contract: CodexProtocolContract,
+    validation: _ContractValidation,
+    voices: CapabilityState,
+    feature: _FeatureResult,
+) -> CapabilityState:
     if voices.status is not CapabilityStatus.AVAILABLE:
         return voices
+    method, unavailable = _method_contract(
+        contract,
+        SemanticMethod.THREAD_REALTIME_START,
+        validation,
+    )
+    if method is None:
+        return unavailable
     if feature is _FeatureResult.DISABLED:
         return _FEATURE_DISABLED
     if feature is _FeatureResult.INVALID:

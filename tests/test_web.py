@@ -38,7 +38,14 @@ from moco.codex.capabilities import (
 )
 from moco.codex.connection import CodexConnectionSupervisor
 from moco.codex.rpc import JsonValue, RpcNotification
-from moco.codex.schema import CodexSchemaProbe, ServerRequestCategory
+from moco.codex.schema import (
+    ClientMethodContract,
+    CodexProtocolContract,
+    CodexSchemaProbe,
+    ParamsKind,
+    SemanticMethod,
+    ServerRequestCategory,
+)
 from moco.codex.session import (
     ActivityEvent,
     CodexConnection,
@@ -234,6 +241,7 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
         def __init__(self, rpc: object, **kwargs: object) -> None:
             assert isinstance(rpc, Connection)
             assert kwargs["capabilities"] is snapshot
+            assert kwargs["contract"] is contract
             events.append("voice.construct")
 
         async def start(self, sdp: str) -> str:
@@ -1650,6 +1658,7 @@ async def test_owner_sdp_failure_cleans_voice_then_connection(
     def build_voice(
         connection_value: object,
         *,
+        contract: CodexProtocolContract,
         settings: MocoSettings,
         capabilities: CapabilitySnapshot,
         working_directory: Path,
@@ -1657,6 +1666,7 @@ async def test_owner_sdp_failure_cleans_voice_then_connection(
     ) -> object:
         return real_voice(
             cast("CodexConnection", connection_value),
+            contract=contract,
             settings=settings,
             capabilities=capabilities,
             working_directory=working_directory,
@@ -2715,6 +2725,36 @@ class OwnerConnectionCleanupError(RuntimeError):
     """Synthetic connection cleanup failure."""
 
 
+def make_voice_contract() -> CodexProtocolContract:
+    return CodexProtocolContract(
+        version="codex-fixture",
+        methods={
+            SemanticMethod.THREAD_START: ClientMethodContract(
+                "thread/start",
+                ParamsKind.OBJECT,
+                frozenset({"cwd", "ephemeral", "sandbox", "approvalPolicy"}),
+            ),
+            SemanticMethod.THREAD_REALTIME_START: ClientMethodContract(
+                "thread/realtime/start",
+                ParamsKind.OBJECT,
+                frozenset(
+                    {
+                        "includeStartupContext",
+                        "outputModality",
+                        "prompt",
+                        "threadId",
+                        "transport",
+                        "version",
+                    }
+                ),
+            ),
+        },
+        server_requests={},
+        unclassified_server_request_count=0,
+        experimental_schema=True,
+    )
+
+
 class _VoiceOnlyConversationOwner(web_app._CodexConversationOwner):  # noqa: SLF001
     """Minimal Voice composition for owner lifecycle tests."""
 
@@ -2732,6 +2772,7 @@ class _VoiceOnlyConversationOwner(web_app._CodexConversationOwner):  # noqa: SLF
             working_directory=working_directory,
         )
         self._test_capability_discovery = capability_discovery
+        self._test_contract = make_voice_contract()
 
     async def _start_once(self, sdp: str) -> str:
         prompt = load_realtime_prompt(self._settings)
@@ -2749,6 +2790,7 @@ class _VoiceOnlyConversationOwner(web_app._CodexConversationOwner):  # noqa: SLF
                 self._discovery_task = None
         await self._ensure_open()
         self._voice_capabilities = capabilities
+        self._voice_contract = self._test_contract
         self._voice_prompt = prompt
         voice_factory = cast(
             "Callable[..., CodexRealtimeSession]",
@@ -2756,6 +2798,7 @@ class _VoiceOnlyConversationOwner(web_app._CodexConversationOwner):  # noqa: SLF
         )
         voice = voice_factory(
             self._connection,
+            contract=self._test_contract,
             settings=self._settings,
             capabilities=capabilities,
             working_directory=self._working_directory,

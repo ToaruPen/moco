@@ -24,7 +24,7 @@ from moco.codex.capabilities import (
     CapabilityStatus,
 )
 from moco.codex.connection import CodexConnectionSupervisor
-from moco.codex.schema import CodexSchemaProbe, ServerRequestCategory
+from moco.codex.schema import CodexProtocolContract, CodexSchemaProbe, ServerRequestCategory
 from moco.codex.session import (
     ActivityEvent,
     CodexRealtimeSession,
@@ -302,6 +302,7 @@ class _CodexConversationOwner:
         self._reviewer_bound = False
         self._voice_generation_number = 0
         self._voice_active = False
+        self._voice_contract: CodexProtocolContract | None = None
         self._voice_capabilities: CapabilitySnapshot | None = None
         self._voice_prompt: str | None = None
         self._voice_operation_lock = asyncio.Lock()
@@ -497,9 +498,11 @@ class _CodexConversationOwner:
         self._coordinator = coordinator
         broker.bind_pending_count_changed(self._review_count_changed)
         self._voice_capabilities = capabilities
+        self._voice_contract = contract
         self._voice_prompt = prompt
         voice = CodexRealtimeSession(
             self._connection,
+            contract=contract,
             settings=self._settings,
             capabilities=capabilities,
             working_directory=self._working_directory,
@@ -648,13 +651,15 @@ class _CodexConversationOwner:
                     message = "Codex Voice is already active"
                     raise CodexRpcError(message)
                 capabilities = self._voice_capabilities
+                contract = self._voice_contract
                 prompt = self._voice_prompt
-                if capabilities is None or prompt is None:
+                if capabilities is None or contract is None or prompt is None:
                     message = "Codex Voice cannot be replaced"
                     raise CodexRpcError(message)
                 self._voice_generation_number += 1
                 voice = CodexRealtimeSession(
                     self._connection,
+                    contract=contract,
                     settings=self._settings,
                     capabilities=capabilities,
                     working_directory=self._working_directory,
