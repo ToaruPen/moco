@@ -18,7 +18,11 @@ from irodori_tts_infra.contracts import (
 from pydantic import ValidationError
 
 from moco.config import IrodoriSettings, MocoSettings
-from moco.speech.contracts import DeliveryCaptionCapability, IrodoriCapabilities
+from moco.speech.contracts import (
+    DeliveryCaptionCapability,
+    IrodoriCapabilities,
+    IrodoriSynthesisRequest,
+)
 from moco.speech.irodori import (
     _JSON_ENVELOPE_BYTES,
     _MAX_CAPABILITY_ALIASES_PER_VOICE,
@@ -134,6 +138,15 @@ def make_capabilities_with_voice(
     )
 
 
+def make_dynamic_capabilities(*, max_chars: int) -> IrodoriCapabilities:
+    payload = make_capabilities(2).model_dump(mode="python")
+    payload["conditioning"] = {
+        "delivery_caption": {"supported": True, "max_chars": max_chars},
+        "emoji": {"supported": True},
+    }
+    return IrodoriCapabilities.model_validate(payload, strict=True)
+
+
 class FakeIrodoriClient:
     def __init__(self, wav: bytes | None = None, *, voice_count: int = 2) -> None:
         self.wav = wav if wav is not None else valid_wav()
@@ -233,6 +246,52 @@ async def test_uses_configured_voice_generation_and_sampling_settings(
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
+
+
+async def test_sends_validated_delivery_caption() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = make_dynamic_capabilities(max_chars=300)
+    synthesizer = await prepare_synthesizer(client)
+
+    await synthesizer.synthesize("本文です。", delivery_caption=" calm ")
+
+    request = client.requests[-1]
+    assert isinstance(request, IrodoriSynthesisRequest)
+    assert request.delivery_caption == "calm"
+
+
+async def test_rejects_caption_when_capability_is_unsupported() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(client)
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("本文です。", delivery_caption="calm")
+
+    assert caught.value.code == "caption_unsupported"
+    assert client.requests == []
+
+
+async def test_rejects_caption_over_dynamic_capability_limit() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = make_dynamic_capabilities(max_chars=3)
+    synthesizer = await prepare_synthesizer(client)
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("本文です。", delivery_caption="abcd")
+
+    assert caught.value.code == "speech_caption_invalid"
+    assert client.requests == []
+
+
+async def test_captionless_synthesis_uses_extended_request_with_null_caption() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(client)
+
+    await synthesizer.synthesize("本文です。")
+
+    request = client.requests[-1]
+    assert isinstance(request, IrodoriSynthesisRequest)
+    assert request.delivery_caption is None
 
 
 async def test_alias_selection_is_normalized_to_canonical_voice_id() -> None:

@@ -5,17 +5,19 @@ from typing import TYPE_CHECKING, Protocol, Self
 import httpx
 from irodori_tts_infra.client.async_ import AsyncIrodoriClient
 from irodori_tts_infra.client.errors import ClientError
-from irodori_tts_infra.contracts import (
-    CapabilitiesResponse,
-    HealthResponse,
-    SynthesisRequest,
-    SynthesisResult,
-)
 
-from moco.speech.contracts import IrodoriCapabilities
+from moco.speech.contracts import IrodoriCapabilities, IrodoriSynthesisRequest
+from moco.speech.plan import normalize_delivery_caption
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
+
+    from irodori_tts_infra.contracts import (
+        CapabilitiesResponse,
+        HealthResponse,
+        SynthesisRequest,
+        SynthesisResult,
+    )
 
     from moco.config import MocoSettings
 
@@ -29,6 +31,8 @@ _CAPABILITIES_NOT_LOADED = "capabilities_not_loaded"
 _VOICE_CATALOG_EMPTY = "voice_catalog_empty"
 _VOICE_NOT_FOUND = "voice_not_found"
 _VOICE_SELECTION_REQUIRED = "voice_selection_required"
+_CAPTION_UNSUPPORTED = "caption_unsupported"
+_SPEECH_CAPTION_INVALID = "speech_caption_invalid"
 _READINESS_ERROR_CODES = frozenset(
     {"model_loading", "model_not_loaded", "voice_bank_invalid"},
 )
@@ -258,7 +262,12 @@ class IrodoriSynthesizer:
                 return
         raise _state_error(_VOICE_NOT_FOUND)
 
-    async def synthesize(self, text: str) -> bytes:
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        delivery_caption: str | None = None,
+    ) -> bytes:
         capabilities = self._capabilities
         if capabilities is None:
             raise _state_error(_CAPABILITIES_NOT_LOADED)
@@ -270,8 +279,13 @@ class IrodoriSynthesizer:
         if not any(voice.id == voice_id for voice in capabilities.voices):
             raise _state_error(_VOICE_NOT_FOUND)
 
+        normalized_caption = _validated_delivery_caption(
+            capabilities,
+            delivery_caption,
+        )
+
         config = self._settings.irodori
-        request = SynthesisRequest(
+        request = IrodoriSynthesisRequest(
             text=text,
             voice_id=voice_id,
             if_generation=capabilities.generation,
@@ -280,6 +294,7 @@ class IrodoriSynthesizer:
             duration_scale=config.duration_scale,
             cfg_scale_text=config.cfg_scale_text,
             cfg_scale_speaker=config.cfg_scale_speaker,
+            delivery_caption=normalized_caption,
         )
         try:
             result = await self._synthesis_client.synthesize(request)
@@ -343,6 +358,25 @@ def _invalid_response_error() -> IrodoriError:
 
 def _state_error(code: str) -> IrodoriError:
     return IrodoriError("Irodori is not ready to synthesize", code=code)
+
+
+def _validated_delivery_caption(
+    capabilities: IrodoriCapabilities,
+    value: str | None,
+) -> str | None:
+    if value is None:
+        return None
+    capability = capabilities.conditioning.delivery_caption
+    if not capability.supported or capability.max_chars is None:
+        raise _caption_error(_CAPTION_UNSUPPORTED)
+    try:
+        return normalize_delivery_caption(value, max_chars=capability.max_chars)
+    except ValueError:
+        raise _caption_error(_SPEECH_CAPTION_INVALID) from None
+
+
+def _caption_error(code: str) -> IrodoriError:
+    return IrodoriError("Irodori delivery caption cannot be used", code=code)
 
 
 def _validate_capability_bounds(capabilities: IrodoriCapabilities) -> None:
