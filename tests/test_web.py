@@ -5511,10 +5511,7 @@ async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech(
     )
     connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
     await connection._cache_capabilities(capabilities)  # noqa: SLF001
-    control_line = (
-        '{"type":"moco.speech_plan","version":1,'
-        '"delivery_caption":" calm "}'
-    )
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":" calm "}'
 
     connection.on_turn_finished(
         TurnResult(final_answer=f"{control_line}\n本文です。", error_code=None),
@@ -5562,10 +5559,7 @@ async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_capti
     )
     connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
     await connection._cache_capabilities(capabilities)  # noqa: SLF001
-    control_line = (
-        '{"type":"moco.speech_plan","version":2,'
-        '"delivery_caption":"calm"}'
-    )
+    control_line = '{"type":"moco.speech_plan","version":2,"delivery_caption":"calm"}'
 
     connection.on_turn_finished(
         TurnResult(final_answer=f"{control_line}\n本文です。", error_code=None),
@@ -5585,9 +5579,7 @@ async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_capti
     assert control_line not in repr(websocket.messages)
     assert control_line not in repr(speech.transcripts)
     event = next(
-        record.message
-        for record in caplog.records
-        if "event=speech_plan_invalid" in record.message
+        record.message for record in caplog.records if "event=speech_plan_invalid" in record.message
     )
     assert "event_code=speech_caption_invalid" in event
     assert f"plan_chars={len(control_line)}" in event

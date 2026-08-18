@@ -37,6 +37,8 @@ from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
 
+    from irodori_tts_infra.contracts import CapabilitiesResponse
+
     from moco.codex.rpc import JsonValue
 
 
@@ -59,7 +61,9 @@ class DoctorCapabilityDiscovery(Protocol):
 
 
 class DoctorSynthesizer(Protocol):
-    async def capabilities(self) -> IrodoriCapabilities: ...
+    async def capabilities(
+        self,
+    ) -> CapabilitiesResponse | IrodoriCapabilities: ...
 
     def select_voice(self, voice_id: str) -> None: ...
 

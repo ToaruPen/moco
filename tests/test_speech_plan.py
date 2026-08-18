@@ -8,10 +8,7 @@ from moco.speech.plan import SpeechPlanResult, parse_speech_plan
 
 
 def test_parses_plan_and_removes_control_line() -> None:
-    control_line = (
-        '{"type":"moco.speech_plan","version":1,'
-        '"delivery_caption":" calm "}'
-    )
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":" calm "}'
 
     result = parse_speech_plan(f"{control_line}\n本文です。", max_chars=300)
 
@@ -25,10 +22,7 @@ def test_parses_plan_and_removes_control_line() -> None:
 
 
 def test_accepts_explicit_null_caption() -> None:
-    control_line = (
-        '{"type":"moco.speech_plan","version":1,'
-        '"delivery_caption":null}'
-    )
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":null}'
 
     result = parse_speech_plan(f"{control_line}\n本文です。", max_chars=300)
 
@@ -51,31 +45,13 @@ def test_plain_body_is_preserved_unchanged() -> None:
             '{"type":"moco.speech_plan","version":1,'
             '"delivery_caption":"calm","delivery_caption":"bright"}'
         ),
-        (
-            '{"type":"moco.speech_plan","version":1,'
-            '"delivery_caption":"calm","unknown":true}'
-        ),
-        (
-            '{"type":"moco.speech_plan","version":2,'
-            '"delivery_caption":"calm"}'
-        ),
-        (
-            '{"type":"moco.speech_plan","version":true,'
-            '"delivery_caption":"calm"}'
-        ),
-        (
-            '{"type":"moco.speech_plan","version":1.0,'
-            '"delivery_caption":"calm"}'
-        ),
-        (
-            '{"type":"wrong","version":1,'
-            '"delivery_caption":"calm"}'
-        ),
+        ('{"type":"moco.speech_plan","version":1,"delivery_caption":"calm","unknown":true}'),
+        ('{"type":"moco.speech_plan","version":2,"delivery_caption":"calm"}'),
+        ('{"type":"moco.speech_plan","version":true,"delivery_caption":"calm"}'),
+        ('{"type":"moco.speech_plan","version":1.0,"delivery_caption":"calm"}'),
+        ('{"type":"wrong","version":1,"delivery_caption":"calm"}'),
         '{"type":"moco.speech_plan","version":1}',
-        (
-            '{"type":"moco.speech_plan","version":1,'
-            '"delivery_caption":3}'
-        ),
+        ('{"type":"moco.speech_plan","version":1,"delivery_caption":3}'),
     ],
     ids=[
         "malformed-json",
@@ -114,9 +90,7 @@ def test_invalid_plan_drops_only_control_line(control_line: str) -> None:
 )
 def test_rejects_invalid_caption_content(caption: str) -> None:
     control_line = (
-        '{"type":"moco.speech_plan","version":1,'
-        f'"delivery_caption":{json.dumps(caption)}'
-        "}"
+        f'{{"type":"moco.speech_plan","version":1,"delivery_caption":{json.dumps(caption)}}}'
     )
 
     result = parse_speech_plan(f"{control_line}\n本文です。", max_chars=3)
@@ -127,10 +101,7 @@ def test_rejects_invalid_caption_content(caption: str) -> None:
 
 
 def test_valid_plan_requires_nonblank_body() -> None:
-    control_line = (
-        '{"type":"moco.speech_plan","version":1,'
-        '"delivery_caption":"calm"}'
-    )
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
 
     result = parse_speech_plan(f"{control_line}\n \n", max_chars=300)
 
@@ -141,10 +112,7 @@ def test_valid_plan_requires_nonblank_body() -> None:
 
 
 def test_leading_blank_lines_do_not_hide_plan_candidate() -> None:
-    control_line = (
-        '  {"type":"moco.speech_plan","version":1,'
-        '"delivery_caption":"calm"}'
-    )
+    control_line = '  {"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
 
     result = parse_speech_plan(f"\n{control_line}\n本文です。", max_chars=300)
 

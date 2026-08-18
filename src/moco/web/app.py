@@ -72,6 +72,8 @@ from moco.web.reviewer import ReviewerBroker, serve_reviewer_socket
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
 
+    from irodori_tts_infra.contracts import CapabilitiesResponse
+
     from moco.codex.approval import ApprovalDecision
     from moco.codex.broker import ReviewerConnection
     from moco.codex.rpc import JsonValue
@@ -820,7 +822,9 @@ class _CodexConversationOwner:
 
 
 class WebSynthesizer(Protocol):
-    async def capabilities(self) -> IrodoriCapabilities: ...
+    async def capabilities(
+        self,
+    ) -> CapabilitiesResponse | IrodoriCapabilities: ...
 
     def select_voice(self, voice_id: str) -> None: ...
 
@@ -1615,7 +1619,10 @@ class _BrowserConnection:
         )
         return capabilities
 
-    async def _cache_capabilities(self, capabilities: IrodoriCapabilities) -> str | None:
+    async def _cache_capabilities(
+        self,
+        capabilities: CapabilitiesResponse | IrodoriCapabilities,
+    ) -> str | None:
         options = tuple(
             {"id": voice.id, "label": voice.label, "default": voice.default}
             for voice in capabilities.voices
@@ -1799,10 +1806,7 @@ class _BrowserConnection:
         if (
             preparation_error is None
             and self._settings.irodori.caption_mode == "auto"
-            and (
-                not self._delivery_caption_supported
-                or self._delivery_caption_max_chars is None
-            )
+            and (not self._delivery_caption_supported or self._delivery_caption_max_chars is None)
         ):
             preparation_error = "caption_unsupported"
         if preparation_error is None:
@@ -3179,7 +3183,7 @@ def _elapsed_ms(started_ns: int) -> int:
 
 
 def _resolve_voice_selection(
-    capabilities: IrodoriCapabilities,
+    capabilities: CapabilitiesResponse | IrodoriCapabilities,
     configured: str | None,
 ) -> tuple[str | None, str | None]:
     if not capabilities.voices:
@@ -3210,7 +3214,7 @@ def _readiness_for_capability_error(code: str) -> str:
 
 
 def _start_voice_error(
-    capabilities: IrodoriCapabilities,
+    capabilities: CapabilitiesResponse | IrodoriCapabilities,
     *,
     selection_error: str | None,
     selected_voice_id: str | None,
