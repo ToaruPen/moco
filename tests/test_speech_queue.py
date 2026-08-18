@@ -31,6 +31,20 @@ class FakeSynthesizer:
         return f"wav:{text}".encode()
 
 
+class CaptionAwareSynthesizer:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str | None]] = []
+
+    async def synthesize(
+        self,
+        text: str,
+        *,
+        delivery_caption: str | None = None,
+    ) -> bytes:
+        self.calls.append((text, delivery_caption))
+        return f"wav:{text}".encode()
+
+
 class DeliveryFailureError(RuntimeError):
     """Synthetic playback delivery failure."""
 
@@ -76,6 +90,49 @@ async def test_worker_synthesizes_and_delivers_fifo() -> None:
 
     assert synthesizer.calls == ["一つ。", "二つ。"]
     assert delivered == ["wav:一つ。".encode(), "wav:二つ。".encode()]
+    await queue.close()
+
+
+async def test_caption_is_sent_to_every_segment_and_not_reused() -> None:
+    synthesizer = CaptionAwareSynthesizer()
+    queue = SpeechQueue(synthesizer, deliver=ignore_audio, max_chars=80)
+    queue.start()
+
+    await queue.on_transcript(
+        role="assistant",
+        delta="一つ。二つ。",
+        done=True,
+        delivery_caption="calm",
+    )
+    await queue.join()
+    await queue.on_transcript(role="assistant", delta="次。", done=True)
+    await queue.join()
+
+    assert synthesizer.calls == [
+        ("一つ。", "calm"),
+        ("二つ。", "calm"),
+        ("次。", None),
+    ]
+    await queue.close()
+
+
+async def test_invalidation_drops_caption_before_next_user_turn() -> None:
+    synthesizer = CaptionAwareSynthesizer()
+    queue = SpeechQueue(synthesizer, deliver=ignore_audio, max_chars=80)
+
+    await queue.on_transcript(
+        role="assistant",
+        delta="破棄。",
+        done=True,
+        delivery_caption="calm",
+    )
+    await queue.invalidate()
+    await queue.on_transcript(role="user", delta="次の質問", done=True)
+    await queue.on_transcript(role="assistant", delta="新しい返事。", done=True)
+    queue.start()
+    await queue.join()
+
+    assert synthesizer.calls == [("新しい返事。", None)]
     await queue.close()
 
 
