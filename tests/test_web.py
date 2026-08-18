@@ -5495,10 +5495,13 @@ async def test_agent_final_is_same_authoritative_text_in_browser_and_speech() ->
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech() -> None:
+async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     websocket = CapturingWebSocket()
     speech = CaptionRecordingSpeech()
     capabilities = make_dynamic_capabilities(max_chars=300)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
     connection = web_app._BrowserConnection(  # noqa: SLF001
         cast("WebSocket", websocket),
         settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
@@ -5530,13 +5533,26 @@ async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech() -> No
     }
     assert control_line not in repr(websocket.messages)
     assert control_line not in repr(speech.transcripts)
+    event = next(
+        record.message
+        for record in caplog.records
+        if "event=speech_plan_received" in record.message
+    )
+    assert "caption_present=True" in event
+    assert "contract_version=1" in event
+    assert f"plan_chars={len(control_line)}" in event
+    assert "calm" not in caplog.text
+    assert "本文です" not in caplog.text
 
 
 @pytest.mark.asyncio
-async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_caption() -> None:
+async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_caption(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
     websocket = CapturingWebSocket()
     speech = CaptionRecordingSpeech()
     capabilities = make_dynamic_capabilities(max_chars=300)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
     connection = web_app._BrowserConnection(  # noqa: SLF001
         cast("WebSocket", websocket),
         settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
@@ -5568,6 +5584,15 @@ async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_capti
     assert transcript["text"] == "本文です。"
     assert control_line not in repr(websocket.messages)
     assert control_line not in repr(speech.transcripts)
+    event = next(
+        record.message
+        for record in caplog.records
+        if "event=speech_plan_invalid" in record.message
+    )
+    assert "event_code=speech_caption_invalid" in event
+    assert f"plan_chars={len(control_line)}" in event
+    assert "calm" not in caplog.text
+    assert "本文です" not in caplog.text
 
 
 def test_unknown_agent_failure_code_has_generic_non_leaking_summary() -> None:

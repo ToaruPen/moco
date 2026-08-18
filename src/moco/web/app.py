@@ -1046,9 +1046,25 @@ class _BrowserConnection:
             text = plan.body
             delivery_caption = plan.delivery_caption
             if plan.error_code is not None:
+                safe_event(
+                    logger,
+                    "speech_plan_invalid",
+                    component="web",
+                    event_code=plan.error_code,
+                    plan_chars=plan.plan_chars,
+                )
                 self._spawn_effect(
                     self._send_error(plan.error_code),
                     name="moco-speech-plan-error",
+                )
+            elif plan.plan_present:
+                safe_event(
+                    logger,
+                    "speech_plan_received",
+                    caption_present=plan.delivery_caption is not None,
+                    component="web",
+                    contract_version=1,
+                    plan_chars=plan.plan_chars,
                 )
         authoritative_text = strip_control_emojis(text)
         if not authoritative_text.strip():
@@ -1769,6 +1785,12 @@ class _BrowserConnection:
         )
 
     async def _prepare_start_synthesizer(self, synthesizer: WebSynthesizer) -> str | None:
+        safe_event(
+            logger,
+            "caption_mode_selected",
+            caption_mode=self._settings.irodori.caption_mode,
+            component="web",
+        )
         try:
             capabilities = await self._fetch_capabilities(synthesizer)
         except _CapabilityError as error:

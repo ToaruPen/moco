@@ -71,6 +71,42 @@ def test_allows_only_bounded_irodori_capability_metadata() -> None:
             sanitize_attributes({forbidden: "fixture-sensitive"}, strict=True)
 
 
+def test_caption_telemetry_accepts_metadata_without_content() -> None:
+    assert sanitize_attributes(
+        {
+            "caption_present": True,
+            "plan_chars": 120,
+            "caption_mode": "auto",
+            "delivery_caption": "private caption",
+            "body": "private transcript",
+        },
+        strict=False,
+    ) == {
+        "caption_present": True,
+        "plan_chars": 120,
+        "caption_mode": "auto",
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "value"),
+    [
+        ("caption_present", 1),
+        ("caption_present", "true"),
+        ("plan_chars", True),
+        ("plan_chars", -1),
+        ("plan_chars", 1.0),
+        ("caption_mode", "dynamic"),
+    ],
+)
+def test_caption_telemetry_rejects_wrong_types_and_unknown_modes(
+    key: str,
+    value: object,
+) -> None:
+    with pytest.raises(TelemetryAttributeError, match=key):
+        sanitize_attributes({key: value}, strict=True)
+
+
 @pytest.mark.parametrize(
     ("key", "value"),
     [
