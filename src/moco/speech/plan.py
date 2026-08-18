@@ -92,7 +92,7 @@ def parse_speech_plan(text: str, *, max_chars: int) -> SpeechPlanResult:
             if plan.delivery_caption is not None
             else None
         )
-    except (json.JSONDecodeError, TypeError, ValueError, ValidationError):
+    except (json.JSONDecodeError, RecursionError, TypeError, ValueError, ValidationError):
         return invalid
 
     return SpeechPlanResult(

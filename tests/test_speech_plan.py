@@ -77,6 +77,26 @@ def test_invalid_plan_drops_only_control_line(control_line: str) -> None:
     )
 
 
+def test_deeply_nested_plan_is_reported_as_invalid() -> None:
+    control_line = (
+        '{"type":"moco.speech_plan","version":1,"delivery_caption":'
+        + "[" * 10_000
+        + "null"
+        + "]" * 10_000
+        + "}"
+    )
+
+    result = parse_speech_plan(f"{control_line}\n本文です。", max_chars=300)
+
+    assert result == SpeechPlanResult(
+        body="本文です。",
+        delivery_caption=None,
+        error_code="speech_caption_invalid",
+        plan_chars=len(control_line),
+        plan_present=True,
+    )
+
+
 @pytest.mark.parametrize(
     "caption",
     [
