@@ -1674,13 +1674,11 @@ _THREAD_START_BASE: Mapping[str, _Witness] = MappingProxyType(
 )
 _REALTIME_START = _object_value(
     {
-        "includeStartupContext": _LiteralValue(False),
+        "includeStartupContext": _LiteralValue(value=False),
         "outputModality": _LiteralValue("audio"),
         "prompt": _DYNAMIC_STRING,
         "threadId": _DYNAMIC_STRING,
-        "transport": _object_value(
-            {"sdp": _DYNAMIC_STRING, "type": _LiteralValue("webrtc")}
-        ),
+        "transport": _object_value({"sdp": _DYNAMIC_STRING, "type": _LiteralValue("webrtc")}),
         "version": _LiteralValue("v3"),
     }
 )

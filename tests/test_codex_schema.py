@@ -5118,11 +5118,7 @@ def legacy_decision_schema(
             decision_string("approved"),
             decision_object("approved_execpolicy_amendment", "proposed_execpolicy_amendment"),
             decision_string("approved_for_session"),
-            *(
-                [decision_string("approved_mcp_policy_amendment")]
-                if mcp_policy_amendment
-                else []
-            ),
+            *([decision_string("approved_mcp_policy_amendment")] if mcp_policy_amendment else []),
             decision_object("network_policy_amendment", "network_policy_amendment"),
             refusal,
             decision_string("timed_out"),
