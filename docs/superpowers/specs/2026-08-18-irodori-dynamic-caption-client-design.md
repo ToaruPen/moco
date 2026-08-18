@@ -224,12 +224,24 @@ Irodori サービス層は caption の有無にかかわらず一つの `Samplin
    - doctor の caption なし probe を維持する。
    - 全 unit/integration/static check を実行する。
    - 実配備後に Windows Irodori へ caption 付き合成を一度実行し、完全な WAV を確認する。
+7. live startup
+   - merge 後の main と実ユーザー設定で `moco service` を再起動する。
+   - launchd が起動した実プロセスと service status を確認する。
+   - operator HTTP endpoint が応答することを確認する。
+   - 実サービスの新規 stderr に起動失敗や Input Monitoring 警告がないことを確認する。
+   - Tailscale 経由の capability、caption 付き synthesis、WAV 検証を実行する。
+   - `moco doctor --synthesize` を実設定で実行し、全必須 check が成功することを確認する。
 
 ## 配備と rollback
 
 PR merge 後、main を更新して moco service を再配備する。ユーザー設定の
 `irodori.caption_mode` を `auto` へ変更し、Tailscale の hostname と connect IP は現在の値を
 維持する。
+
+配備完了は、コードとテストの成功だけでは判定しない。merge 後の main から launchd service
+を実際に再起動し、operator endpoint、service status、新規ログ、Tailscale 経由の live Irodori
+probe を確認して初めて完了とする。macOS が Input Monitoring または Accessibility の認証を
+要求した場合は、ユーザーがローカルで認証した後、同じ実サービス PID で再検証する。
 
 rollback は設定を `caption_mode=off` へ戻して service を再起動する。Windows Irodori と
 Tailscale Serve は変更しないため、音声経路自体の rollback は不要である。
