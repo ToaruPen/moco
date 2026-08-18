@@ -12,6 +12,8 @@ from irodori_tts_infra.contracts import (
     SynthesisResult,
 )
 
+from moco.speech.contracts import IrodoriCapabilities
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator
 
@@ -41,6 +43,12 @@ class IrodoriClient(Protocol):
     async def capabilities(self) -> CapabilitiesResponse: ...
 
     async def synthesize(self, request: SynthesisRequest) -> SynthesisResult: ...
+
+    async def aclose(self) -> None: ...
+
+
+class CapabilityClient(Protocol):
+    async def capabilities(self) -> IrodoriCapabilities: ...
 
     async def aclose(self) -> None: ...
 
@@ -127,6 +135,29 @@ class _AddressOverrideTransport(httpx.AsyncBaseTransport):
         await self._transport.aclose()
 
 
+class _HttpCapabilityClient:
+    def __init__(
+        self,
+        *,
+        base_url: str,
+        timeout: float,
+        transport: httpx.AsyncBaseTransport,
+    ) -> None:
+        self._client = httpx.AsyncClient(
+            base_url=base_url,
+            timeout=timeout,
+            transport=transport,
+        )
+
+    async def capabilities(self) -> IrodoriCapabilities:
+        response = await self._client.get("/capabilities")
+        response.raise_for_status()
+        return IrodoriCapabilities.model_validate_json(response.content, strict=True)
+
+    async def aclose(self) -> None:
+        await self._client.aclose()
+
+
 class IrodoriError(RuntimeError):
     def __init__(self, message: str, *, code: str) -> None:
         super().__init__(message)
@@ -140,11 +171,13 @@ class IrodoriSynthesizer:
         *,
         settings: MocoSettings,
         synthesis_client: IrodoriClient | None = None,
+        capability_client: CapabilityClient | None = None,
     ) -> None:
         self._health_client = client
         self._synthesis_client = synthesis_client or client
+        self._capability_client = capability_client or client
         self._settings = settings
-        self._capabilities: CapabilitiesResponse | None = None
+        self._capabilities: IrodoriCapabilities | None = None
         self._voice_id: str | None = None
 
     @classmethod
@@ -170,6 +203,14 @@ class IrodoriSynthesizer:
                     max_bytes=max_response_bytes,
                 ),
             ),
+            capability_client=_HttpCapabilityClient(
+                base_url=base_url,
+                timeout=settings.irodori.timeout_seconds,
+                transport=_build_transport(
+                    settings,
+                    max_bytes=_MAX_CAPABILITY_RESPONSE_BYTES,
+                ),
+            ),
         )
 
     async def health(self) -> HealthResponse:
@@ -183,16 +224,21 @@ class IrodoriSynthesizer:
             return response
         raise mapped_error
 
-    async def capabilities(self) -> CapabilitiesResponse:
+    async def capabilities(self) -> IrodoriCapabilities:
         try:
-            response = await self._health_client.capabilities()
-            capabilities = CapabilitiesResponse.model_validate(
+            response = await self._capability_client.capabilities()
+            capabilities = IrodoriCapabilities.model_validate(
                 response.model_dump(mode="python"),
                 strict=True,
             )
             _validate_capability_bounds(capabilities)
         except ClientError as error:
             mapped_error = _availability_error(error)
+        except httpx.HTTPError:
+            mapped_error = IrodoriError(
+                "Irodori capability endpoint is unavailable",
+                code="irodori_unavailable",
+            )
         except (AttributeError, KeyError, TypeError, ValueError):
             mapped_error = _invalid_response_error()
         else:
@@ -256,8 +302,15 @@ class IrodoriSynthesizer:
         try:
             await self._health_client.aclose()
         finally:
-            if self._synthesis_client is not self._health_client:
-                await self._synthesis_client.aclose()
+            try:
+                if self._synthesis_client is not self._health_client:
+                    await self._synthesis_client.aclose()
+            finally:
+                if (
+                    self._capability_client is not self._health_client
+                    and self._capability_client is not self._synthesis_client
+                ):
+                    await self._capability_client.aclose()
 
 
 def _build_transport(
@@ -292,7 +345,7 @@ def _state_error(code: str) -> IrodoriError:
     return IrodoriError("Irodori is not ready to synthesize", code=code)
 
 
-def _validate_capability_bounds(capabilities: CapabilitiesResponse) -> None:
+def _validate_capability_bounds(capabilities: IrodoriCapabilities) -> None:
     if len(capabilities.generation) > _MAX_CAPABILITY_TEXT_CHARS:
         msg = "Irodori capability generation exceeded the size limit"
         raise ValueError(msg)

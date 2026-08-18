@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Literal, cast
 
@@ -14,8 +15,10 @@ from irodori_tts_infra.contracts import (
     SynthesisResult,
     VoiceCapability,
 )
+from pydantic import ValidationError
 
 from moco.config import IrodoriSettings, MocoSettings
+from moco.speech.contracts import DeliveryCaptionCapability, IrodoriCapabilities
 from moco.speech.irodori import (
     _JSON_ENVELOPE_BYTES,
     _MAX_CAPABILITY_ALIASES_PER_VOICE,
@@ -26,10 +29,58 @@ from moco.speech.irodori import (
     IrodoriError,
     IrodoriSynthesizer,
     _AddressOverrideTransport,
+    _HttpCapabilityClient,
     _is_complete_wav,
     _LimitedResponseStream,
     _LimitedResponseTransport,
 )
+
+
+def dynamic_capabilities_payload() -> dict[str, object]:
+    return {
+        "contract_version": 1,
+        "generation": "fixture-generation",
+        "ready": True,
+        "readiness": "ready",
+        "voices": [
+            {
+                "id": "narrator",
+                "label": "Narrator",
+                "aliases": [],
+                "default": True,
+            },
+        ],
+        "conditioning": {
+            "delivery_caption": {"supported": True, "max_chars": 300},
+            "emoji": {"supported": True},
+        },
+    }
+
+
+def test_dynamic_delivery_caption_capability_is_accepted() -> None:
+    capabilities = IrodoriCapabilities.model_validate_json(
+        json.dumps(dynamic_capabilities_payload()),
+        strict=True,
+    )
+
+    assert capabilities.conditioning.delivery_caption == DeliveryCaptionCapability(
+        supported=True,
+        max_chars=300,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"supported": True, "max_chars": None},
+        {"supported": False, "max_chars": 300},
+    ],
+)
+def test_delivery_caption_capability_requires_matching_limit(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        DeliveryCaptionCapability.model_validate(payload, strict=True)
 
 
 def valid_wav(payload: bytes = b"") -> bytes:
@@ -143,7 +194,9 @@ async def test_capabilities_fetches_from_bounded_client_and_caches_response() ->
 
     capabilities = await synthesizer.capabilities()
 
-    assert capabilities == make_capabilities(3)
+    assert capabilities.model_dump(mode="python") == make_capabilities(3).model_dump(
+        mode="python",
+    )
     assert client.capabilities_calls == 1
     synthesizer.select_voice("fixture-id-2")
 
@@ -481,7 +534,9 @@ async def test_capability_structural_limits_accept_boundary_values(
         settings=MocoSettings(),
     )
 
-    assert await synthesizer.capabilities() == capabilities
+    actual = await synthesizer.capabilities()
+
+    assert actual.model_dump(mode="python") == capabilities.model_dump(mode="python")
 
 
 @pytest.mark.parametrize(
@@ -580,6 +635,22 @@ async def test_address_override_preserves_host_sni_and_tls_identity() -> None:
         "sni_hostname": "voice-host.example.ts.net",
     }
     await transport.aclose()
+
+
+async def test_http_capability_client_accepts_dynamic_delivery_caption() -> None:
+    client = _HttpCapabilityClient(
+        base_url="https://voice-host.example.ts.net/",
+        timeout=5.0,
+        transport=httpx.MockTransport(
+            lambda _request: httpx.Response(200, json=dynamic_capabilities_payload()),
+        ),
+    )
+
+    capabilities = await client.capabilities()
+
+    assert capabilities.conditioning.delivery_caption.supported is True
+    assert capabilities.conditioning.delivery_caption.max_chars == 300
+    await client.aclose()
 
 
 async def test_close_delegates_to_client() -> None:
