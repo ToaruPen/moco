@@ -1037,6 +1037,7 @@ class _BrowserConnection:
         text = result.final_answer
         if text is None:
             text = _turn_failure_speech(result.error_code)
+        authoritative_text = strip_control_emojis(text)
         delivery_caption: str | None = None
         if (
             result.final_answer is not None
@@ -1044,10 +1045,10 @@ class _BrowserConnection:
             and self._delivery_caption_max_chars is not None
         ):
             plan = parse_speech_plan(
-                text,
+                authoritative_text,
                 max_chars=self._delivery_caption_max_chars,
             )
-            text = plan.body
+            authoritative_text = plan.body
             delivery_caption = plan.delivery_caption
             if plan.error_code is not None:
                 safe_event(
@@ -1070,7 +1071,6 @@ class _BrowserConnection:
                     contract_version=1,
                     plan_chars=plan.plan_chars,
                 )
-        authoritative_text = strip_control_emojis(text)
         if not authoritative_text.strip():
             return
         self._spawn_effect(

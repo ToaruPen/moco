@@ -1,11 +1,15 @@
 from __future__ import annotations
 
 import json
+import re
 import unicodedata
 from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+
+_PHYSICAL_LINE_BOUNDARY = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
+_FORBIDDEN_CAPTION_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,7 +52,7 @@ def normalize_delivery_caption(value: str, *, max_chars: int) -> str:
     if not normalized or len(normalized) > max_chars:
         message = "delivery caption length is invalid"
         raise ValueError(message)
-    if any(unicodedata.category(char) == "Cc" for char in normalized):
+    if any(unicodedata.category(char) in _FORBIDDEN_CAPTION_CATEGORIES for char in normalized):
         message = "delivery caption contains a control character"
         raise ValueError(message)
     if "<" in normalized or ">" in normalized:
@@ -58,7 +62,7 @@ def normalize_delivery_caption(value: str, *, max_chars: int) -> str:
 
 
 def parse_speech_plan(text: str, *, max_chars: int) -> SpeechPlanResult:
-    lines = text.splitlines(keepends=True)
+    lines = _PHYSICAL_LINE_BOUNDARY.split(text)
     candidate_index = next(
         (index for index, line in enumerate(lines) if line.strip()),
         None,

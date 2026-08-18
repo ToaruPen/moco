@@ -5587,6 +5587,33 @@ async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_capti
     assert "本文です" not in caplog.text
 
 
+@pytest.mark.asyncio
+async def test_auto_mode_rejects_plan_with_control_emoji_only_body() -> None:
+    websocket = CapturingWebSocket()
+    speech = CaptionRecordingSpeech()
+    capabilities = make_dynamic_capabilities(max_chars=300)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    await connection._cache_capabilities(capabilities)  # noqa: SLF001
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
+
+    connection.on_turn_finished(
+        TurnResult(final_answer=f"{control_line}\n🤔", error_code=None),
+    )
+    await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
+
+    assert websocket.messages == [
+        {"type": "error", "code": "speech_caption_invalid"},
+    ]
+    assert speech.transcripts == []
+
+
 def test_unknown_agent_failure_code_has_generic_non_leaking_summary() -> None:
     private_code = "private-path-and-command"
 

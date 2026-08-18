@@ -82,11 +82,21 @@ def test_invalid_plan_drops_only_control_line(control_line: str) -> None:
     [
         "abcd",
         "   ",
-        "calm\u0000voice",
-        "calm\u007fvoice",
-        "<calm>",
+        "a\u0000b",
+        "a\u007fb",
+        "a\u2028b",
+        "a\u2029b",
+        "<a>",
     ],
-    ids=["over-limit", "blank", "nul", "delete", "angle-brackets"],
+    ids=[
+        "over-limit",
+        "blank",
+        "nul",
+        "delete",
+        "line-separator",
+        "paragraph-separator",
+        "angle-brackets",
+    ],
 )
 def test_rejects_invalid_caption_content(caption: str) -> None:
     control_line = (
@@ -98,6 +108,23 @@ def test_rejects_invalid_caption_content(caption: str) -> None:
     assert result.delivery_caption is None
     assert result.error_code == "speech_caption_invalid"
     assert result.body == "本文です。"
+
+
+@pytest.mark.parametrize("separator", ["\u2028", "\u2029"])
+def test_literal_unicode_separator_does_not_leak_control_line_fragment(
+    separator: str,
+) -> None:
+    control_line = f'{{"type":"moco.speech_plan","version":1,"delivery_caption":"a{separator}b"}}'
+
+    result = parse_speech_plan(f"{control_line}\n本文です。", max_chars=300)
+
+    assert result == SpeechPlanResult(
+        body="本文です。",
+        delivery_caption=None,
+        error_code="speech_caption_invalid",
+        plan_chars=len(control_line),
+        plan_present=True,
+    )
 
 
 def test_valid_plan_requires_nonblank_body() -> None:

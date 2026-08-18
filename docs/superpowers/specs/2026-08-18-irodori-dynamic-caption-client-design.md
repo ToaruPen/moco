@@ -1,8 +1,10 @@
 # Irodori 動的 delivery caption クライアント設計
 
-**日付:** 2026-08-18  
-**状態:** 承認済み  
-**対象:** moco の Irodori capability、speech plan、音声合成要求  
+**日付:** 2026-08-18
+
+**状態:** 承認済み
+
+**対象:** moco の Irodori capability、speech plan、音声合成要求
 **非対象:** Windows 上の Irodori ランタイム、モデル、Tailscale Serve
 
 ## 背景
