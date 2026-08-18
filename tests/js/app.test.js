@@ -1194,10 +1194,16 @@ describe("operator status", () => {
     });
 
     status.showError("caption_unsupported");
-    assert.doesNotMatch(status.errorText.textContent, /不明なエラー/);
+    assert.equal(
+      status.errorText.textContent,
+      "caption_unsupported — Irodori が話し方指定に対応していません",
+    );
 
     status.showError("speech_caption_invalid");
-    assert.doesNotMatch(status.errorText.textContent, /不明なエラー/);
+    assert.equal(
+      status.errorText.textContent,
+      "speech_caption_invalid — 話し方指定を検証できなかったため標準表現で読み上げます",
+    );
   });
 });
 

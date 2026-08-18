@@ -29,6 +29,7 @@ from moco.speech.irodori import (
     _MAX_CAPABILITY_RESPONSE_BYTES,
     _MAX_CAPABILITY_TEXT_CHARS,
     _MAX_CAPABILITY_VOICES,
+    CapabilityClient,
     IrodoriClient,
     IrodoriError,
     IrodoriSynthesizer,
@@ -697,18 +698,23 @@ async def test_address_override_preserves_host_sni_and_tls_identity() -> None:
 
 
 async def test_http_capability_client_accepts_dynamic_delivery_caption() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json=dynamic_capabilities_payload())
+
     client = _HttpCapabilityClient(
         base_url="https://voice-host.example.ts.net/",
         timeout=5.0,
-        transport=httpx.MockTransport(
-            lambda _request: httpx.Response(200, json=dynamic_capabilities_payload()),
-        ),
+        transport=httpx.MockTransport(handler),
     )
 
     capabilities = await client.capabilities()
 
     assert capabilities.conditioning.delivery_caption.supported is True
     assert capabilities.conditioning.delivery_caption.max_chars == 300
+    assert requests == [("GET", "/capabilities")]
     await client.aclose()
 
 
@@ -724,13 +730,15 @@ async def test_close_delegates_to_client() -> None:
     assert client.closed
 
 
-async def test_health_and_synthesis_use_separate_clients() -> None:
+async def test_health_synthesis_and_capability_use_separate_clients() -> None:
     health_client = FakeIrodoriClient()
     synthesis_client = FakeIrodoriClient()
+    capability_client = FakeIrodoriClient()
     synthesizer = IrodoriSynthesizer(
         cast("IrodoriClient", health_client),
         settings=MocoSettings(),
         synthesis_client=cast("IrodoriClient", synthesis_client),
+        capability_client=cast("CapabilityClient", capability_client),
     )
 
     await synthesizer.health()
@@ -740,11 +748,13 @@ async def test_health_and_synthesis_use_separate_clients() -> None:
     await synthesizer.close()
 
     assert health_client.requests == []
-    assert health_client.capabilities_calls == 1
+    assert health_client.capabilities_calls == 0
     assert synthesis_client.capabilities_calls == 0
+    assert capability_client.capabilities_calls == 1
     assert len(synthesis_client.requests) == 1
     assert health_client.closed
     assert synthesis_client.closed
+    assert capability_client.closed
 
 
 async def test_synthesis_client_closes_when_health_client_close_fails() -> None:
