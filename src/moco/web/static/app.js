@@ -19,6 +19,8 @@ const ERROR_COPY = Object.freeze({
   already_started: "Realtime 会話はすでに開始しています",
   irodori_unavailable: "Irodori に接続できません",
   capability_mismatch: "Irodori の機能契約に互換性がありません",
+  caption_unsupported: "Irodori が話し方指定に対応していません",
+  speech_caption_invalid: "話し方指定を検証できなかったため標準表現で読み上げます",
   configured_voice_unavailable: "設定した音声モデルを利用できません",
   voice_catalog_empty: "利用可能な音声モデルがありません",
   voice_selection_required: "音声モデルを選択してください",
@@ -56,6 +58,7 @@ const ERROR_COPY = Object.freeze({
 const CONVERSATION_START_ERRORS = new Set([
   "already_started",
   "capability_mismatch",
+  "caption_unsupported",
   "configured_voice_unavailable",
   "conversation_start_failed",
   "irodori_unavailable",

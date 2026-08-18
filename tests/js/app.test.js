@@ -1179,6 +1179,26 @@ describe("operator status", () => {
 
     assert.equal(status.errorText.textContent, "interaction_busy — 別の処理を受け付けています");
   });
+
+  it("renders stable delivery caption errors with user-facing copy", () => {
+    const dom = new JSDOM(`
+      <section id="error" hidden><span id="error-text"></span></section>
+    `);
+    const status = new OperatorStatus({
+      activityBuffer: new ActivityBuffer(),
+      activityView: { render: () => {} },
+      error: dom.window.document.querySelector("#error"),
+      errorText: dom.window.document.querySelector("#error-text"),
+      progress: new ProgressTracker(),
+      progressView: { render: () => {} },
+    });
+
+    status.showError("caption_unsupported");
+    assert.doesNotMatch(status.errorText.textContent, /不明なエラー/);
+
+    status.showError("speech_caption_invalid");
+    assert.doesNotMatch(status.errorText.textContent, /不明なエラー/);
+  });
 });
 
 describe("operator console DOM", () => {
@@ -2104,6 +2124,7 @@ describe("browser connection timeouts", () => {
       "model_not_loaded",
       "voice_bank_invalid",
       "capability_mismatch",
+      "caption_unsupported",
       "irodori_unavailable",
       "runtime_generation_mismatch",
       "voice_not_found",

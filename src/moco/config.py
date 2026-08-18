@@ -246,7 +246,7 @@ class IrodoriSettings(StrictSettings):
     base_url: HttpUrl = HttpUrl("http://127.0.0.1:8923")
     connect_ip: IPvAnyAddress | None = None
     speaker: str | None = None
-    caption_mode: Literal["off"] = "off"
+    caption_mode: Literal["off", "auto"] = "off"
     num_steps: IrodoriNumSteps = 12
     t_schedule_mode: Literal["linear", "sway"] = "sway"
     duration_scale: PositiveFloat = 1.0

@@ -77,6 +77,7 @@ from moco.runtime.coordinator import (
 )
 from moco.runtime.hotkeys import Control
 from moco.runtime.lifecycle import IdleLeaseTimer, LifecycleState
+from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import (
     _MAX_CAPABILITY_VOICES,
     IrodoriClient,
@@ -2392,6 +2393,15 @@ def make_capabilities(
     )
 
 
+def make_dynamic_capabilities(*, max_chars: int = 300) -> IrodoriCapabilities:
+    payload = make_capabilities(2).model_dump(mode="python")
+    payload["conditioning"] = {
+        "delivery_caption": {"supported": True, "max_chars": max_chars},
+        "emoji": {"supported": True},
+    }
+    return IrodoriCapabilities.model_validate(payload, strict=True)
+
+
 def browser_voice(capabilities: CapabilitiesResponse, selected: str | None) -> dict[str, object]:
     return {
         "selected": selected,
@@ -3005,6 +3015,24 @@ class RecordingSpeechComposition:
         self.is_busy = False
 
 
+class CaptionRecordingSpeech:
+    def __init__(self) -> None:
+        self.transcripts: list[tuple[str, str, bool, str | None]] = []
+
+    async def on_transcript(
+        self,
+        *,
+        role: str,
+        delta: str,
+        done: bool,
+        delivery_caption: str | None = None,
+    ) -> None:
+        self.transcripts.append((role, delta, done, delivery_caption))
+
+    async def join(self) -> None:
+        return None
+
+
 def mark_audio_delivered(
     connection: web_app._BrowserConnection,
     audio_id: int,
@@ -3395,6 +3423,30 @@ def test_connection_projects_only_safe_runtime_voice_capabilities(
     assert all(voice.id not in capability_log for voice in capabilities.voices)
 
 
+def test_auto_mode_projects_dynamic_caption_capability() -> None:
+    capabilities = make_dynamic_capabilities(max_chars=300)
+    app = create_app(
+        MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+        synthesizer_factory=lambda: cast(
+            "WebSynthesizer",
+            FakeSynthesizer(capabilities),
+        ),
+        capability_token=CAPABILITY,
+    )
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        state = receive_ready_catalog(socket)
+
+    assert state["conditioning"] == {
+        "captionMode": "auto",
+        "deliveryCaptionSupported": True,
+        "emojiSupported": True,
+    }
+
+
 def test_oversized_runtime_catalog_is_rejected_before_browser_projection() -> None:
     capabilities = make_capabilities(_MAX_CAPABILITY_VOICES + 1)
     boundary_client = CapabilityBoundaryClient(capabilities)
@@ -3590,6 +3642,11 @@ def test_connection_resolves_configured_id_unique_alias_or_catalog_default(
             make_capabilities(2).model_copy(update={"contract_version": 2}),
             MocoSettings(),
             "capability_mismatch",
+        ),
+        (
+            make_capabilities(2),
+            MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+            "caption_unsupported",
         ),
         (OSError("fixture network failure"), MocoSettings(), "irodori_unavailable"),
     ],
@@ -5435,6 +5492,82 @@ async def test_agent_final_is_same_authoritative_text_in_browser_and_speech() ->
             "done": True,
         }
     ]
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech() -> None:
+    websocket = CapturingWebSocket()
+    speech = CaptionRecordingSpeech()
+    capabilities = make_dynamic_capabilities(max_chars=300)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    await connection._cache_capabilities(capabilities)  # noqa: SLF001
+    control_line = (
+        '{"type":"moco.speech_plan","version":1,'
+        '"delivery_caption":" calm "}'
+    )
+
+    connection.on_turn_finished(
+        TurnResult(final_answer=f"{control_line}\n本文です。", error_code=None),
+    )
+    await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
+
+    assert speech.transcripts == [("assistant", "本文です。", True, "calm")]
+    transcript = next(
+        message for message in websocket.messages if message.get("type") == "transcript"
+    )
+    assert transcript == {
+        "type": "transcript",
+        "role": "assistant",
+        "text": "本文です。",
+        "done": True,
+    }
+    assert control_line not in repr(websocket.messages)
+    assert control_line not in repr(speech.transcripts)
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_caption() -> None:
+    websocket = CapturingWebSocket()
+    speech = CaptionRecordingSpeech()
+    capabilities = make_dynamic_capabilities(max_chars=300)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    await connection._cache_capabilities(capabilities)  # noqa: SLF001
+    control_line = (
+        '{"type":"moco.speech_plan","version":2,'
+        '"delivery_caption":"calm"}'
+    )
+
+    connection.on_turn_finished(
+        TurnResult(final_answer=f"{control_line}\n本文です。", error_code=None),
+    )
+    await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
+
+    assert speech.transcripts == [("assistant", "本文です。", True, None)]
+    assert [
+        message
+        for message in websocket.messages
+        if message == {"type": "error", "code": "speech_caption_invalid"}
+    ] == [{"type": "error", "code": "speech_caption_invalid"}]
+    transcript = next(
+        message for message in websocket.messages if message.get("type") == "transcript"
+    )
+    assert transcript["text"] == "本文です。"
+    assert control_line not in repr(websocket.messages)
+    assert control_line not in repr(speech.transcripts)
 
 
 def test_unknown_agent_failure_code_has_generic_non_leaking_summary() -> None:
