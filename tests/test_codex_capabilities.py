@@ -116,6 +116,7 @@ _ALIASES = {
     SemanticMethod.EXPERIMENTAL_FEATURE_LIST: "alias/features",
     SemanticMethod.REALTIME_VOICES_LIST: "alias/voices",
     SemanticMethod.THREAD_START: "alias/thread-start",
+    SemanticMethod.THREAD_REALTIME_START: "alias/realtime-start",
     SemanticMethod.TURN_START: "alias/turn-start",
     SemanticMethod.TURN_STEER: "alias/steer",
     SemanticMethod.TURN_INTERRUPT: "alias/interrupt",
@@ -127,6 +128,16 @@ _FIELDS = {
     SemanticMethod.EXPERIMENTAL_FEATURE_LIST: frozenset({"cursor"}),
     SemanticMethod.REALTIME_VOICES_LIST: frozenset(),
     SemanticMethod.THREAD_START: frozenset({"cwd", "ephemeral", "sandbox", "approvalPolicy"}),
+    SemanticMethod.THREAD_REALTIME_START: frozenset(
+        {
+            "includeStartupContext",
+            "outputModality",
+            "prompt",
+            "threadId",
+            "transport",
+            "version",
+        }
+    ),
     SemanticMethod.TURN_START: frozenset({"input", "threadId"}),
     SemanticMethod.TURN_STEER: frozenset({"expectedTurnId", "input", "threadId"}),
     SemanticMethod.TURN_INTERRUPT: frozenset({"threadId", "turnId"}),
@@ -1099,6 +1110,11 @@ async def test_nonterminal_errors_continue_remaining_requests(tmp_path: Path) ->
             CapabilityStatus.AVAILABLE,
             CapabilityStatus.VERSION_MISMATCH,
         ),
+        (
+            SemanticMethod.THREAD_REALTIME_START,
+            CapabilityStatus.AVAILABLE,
+            CapabilityStatus.VERSION_MISMATCH,
+        ),
     ],
 )
 async def test_missing_voice_required_semantics_are_independent(
@@ -1113,6 +1129,20 @@ async def test_missing_voice_required_semantics_are_independent(
 
     assert snapshot.account.status is account_status
     assert snapshot.realtime.status is realtime_status
+
+
+async def test_missing_realtime_start_contract_blocks_voice_before_runtime(
+    tmp_path: Path,
+) -> None:
+    included = frozenset(SemanticMethod) - {SemanticMethod.THREAD_REALTIME_START}
+
+    snapshot, requester = await discover(tmp_path, contract=make_contract(included=included))
+
+    assert snapshot.realtime == CapabilityState(
+        CapabilityStatus.VERSION_MISMATCH,
+        "method_unavailable",
+    )
+    assert requester.params_for(_ALIASES[SemanticMethod.THREAD_REALTIME_START]) == []
 
 
 @pytest.mark.parametrize("semantic", list(SemanticMethod))
@@ -1148,6 +1178,7 @@ async def test_inconsistent_manual_method_contract_is_not_invoked(
         SemanticMethod.EXPERIMENTAL_FEATURE_LIST: snapshot.realtime,
         SemanticMethod.REALTIME_VOICES_LIST: snapshot.realtime,
         SemanticMethod.THREAD_START: snapshot.agent_admission,
+        SemanticMethod.THREAD_REALTIME_START: snapshot.realtime,
         SemanticMethod.TURN_START: snapshot.agent_admission,
         SemanticMethod.TURN_STEER: snapshot.steer,
         SemanticMethod.TURN_INTERRUPT: snapshot.interrupt,

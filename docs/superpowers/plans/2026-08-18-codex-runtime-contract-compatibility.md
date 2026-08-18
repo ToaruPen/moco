@@ -378,7 +378,8 @@ Run:
 ```bash
 uv run pytest \
   tests/test_codex_capabilities.py::test_missing_realtime_start_contract_blocks_voice_before_runtime \
-  tests/test_doctor.py -k "codex_realtime" -q
+  -q
+uv run pytest tests/test_doctor.py -k "codex_realtime" -q
 ```
 
 Expected: capability test FAIL because voice readiness currently ignores the method.

@@ -561,6 +561,16 @@ async def test_doctor_keeps_schema_compatible_for_one_capability_mismatch(
         ),
         (
             make_snapshot(
+                realtime=CapabilityState(
+                    CapabilityStatus.VERSION_MISMATCH,
+                    "method_unavailable",
+                )
+            ),
+            "codex_realtime",
+            DoctorCheck("codex_realtime", "error", "method_unavailable"),
+        ),
+        (
+            make_snapshot(
                 interrupt=CapabilityState(
                     CapabilityStatus.VERSION_MISMATCH,
                     "method_unavailable",
