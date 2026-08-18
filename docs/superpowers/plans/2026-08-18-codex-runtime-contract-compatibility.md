@@ -101,15 +101,11 @@ Expected: FAIL because both legacy profiles remain unadaptable when the addition
 
 - [ ] **Step 3: Add the minimal unsent variant**
 
-Extend the existing set only:
+Extend the existing string-decision set only:
 
 ```python
-_LEGACY_UNSENT_VARIANTS = frozenset(
-    {
-        "approved_execpolicy_amendment",
-        "approved_mcp_policy_amendment",
-        "network_policy_amendment",
-    }
+_LEGACY_UNSENT_DECISIONS = frozenset(
+    {"approved_for_session", "approved_mcp_policy_amendment", "timed_out"}
 )
 ```
 

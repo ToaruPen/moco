@@ -1867,7 +1867,9 @@ _LEGACY_WIRE = _one_shot("approved", ("denied", {"denied": {"rejection": ""}}), 
 # all. No retained legacy bundle does, so the legacy families read the whole one-shot set;
 # a build that starts declaring it narrows the offer instead of being left unprofiled.
 _OFFER_MEMBER = "availableDecisions"
-_LEGACY_UNSENT_DECISIONS = frozenset({"approved_for_session", "timed_out"})
+_LEGACY_UNSENT_DECISIONS = frozenset(
+    {"approved_for_session", "approved_mcp_policy_amendment", "timed_out"}
+)
 _LEGACY_UNSENT_VARIANTS = frozenset({"approved_execpolicy_amendment", "network_policy_amendment"})
 _APPROVAL_CORRELATION = frozenset({"threadId", "turnId", "itemId"})
 _LEGACY_CORRELATION = frozenset({"conversationId", "callId"})
