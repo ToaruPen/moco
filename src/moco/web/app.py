@@ -14,7 +14,6 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
-from irodori_tts_infra.contracts import CapabilitiesResponse
 from pydantic import ValidationError
 
 from moco.codex.agent import AgentActivityEvent, AgentSession
@@ -51,7 +50,9 @@ from moco.runtime.coordinator import (
 )
 from moco.runtime.lifecycle import IdleLeaseTimer, LifecycleState
 from moco.runtime.telemetry import safe_event
+from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
+from moco.speech.plan import parse_speech_plan
 from moco.speech.queue import SpeechQueue
 from moco.speech.text import strip_control_emojis
 from moco.web.messages import (
@@ -70,6 +71,8 @@ from moco.web.reviewer import ReviewerBroker, serve_reviewer_socket
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+
+    from irodori_tts_infra.contracts import CapabilitiesResponse
 
     from moco.codex.approval import ApprovalDecision
     from moco.codex.broker import ReviewerConnection
@@ -819,7 +822,9 @@ class _CodexConversationOwner:
 
 
 class WebSynthesizer(Protocol):
-    async def capabilities(self) -> CapabilitiesResponse: ...
+    async def capabilities(
+        self,
+    ) -> CapabilitiesResponse | IrodoriCapabilities: ...
 
     def select_voice(self, voice_id: str) -> None: ...
 
@@ -891,18 +896,12 @@ class _BrowserConnection:
         self._first_playback_audio_id: int | None = None
         self._first_playback_generation: int | None = None
         self._transcripts: dict[str, str] = {}
-        self._voice_options: tuple[dict[str, object], ...] = ()
-        self._voice_ready = False
-        self._voice_readiness = "loading"
-        self._emoji_supported = False
-        self._voice_generation: str | None = None
-        self._selected_voice_id: str | None = None
-        self._voice_selection_error: str | None = None
-        self._voice_selected_explicitly = False
+        self._init_voice_capability_state()
         self._init_transcript_pipeline()
         self._idle_timer = IdleLeaseTimer(
             idle_timeout_seconds=settings.runtime.idle_timeout_seconds,
         )
+
         self._snapshot = InteractionSnapshot(
             connection=ConnectionState.STARTING,
             voice=VoiceState.IDLE,
@@ -925,6 +924,18 @@ class _BrowserConnection:
         self._turn_result_claimed = False
         self._terminal_speech_delivery: tuple[SpeechQueue, asyncio.Task[None]] | None = None
         self._connection_loss_task: asyncio.Task[None] | None = None
+
+    def _init_voice_capability_state(self) -> None:
+        self._voice_options: tuple[dict[str, object], ...] = ()
+        self._voice_ready = False
+        self._voice_readiness = "loading"
+        self._delivery_caption_supported = False
+        self._delivery_caption_max_chars: int | None = None
+        self._emoji_supported = False
+        self._voice_generation: str | None = None
+        self._selected_voice_id: str | None = None
+        self._voice_selection_error: str | None = None
+        self._voice_selected_explicitly = False
 
     def _init_transcript_pipeline(self) -> None:
         self._user_utterance_active = False
@@ -1027,6 +1038,39 @@ class _BrowserConnection:
         if text is None:
             text = _turn_failure_speech(result.error_code)
         authoritative_text = strip_control_emojis(text)
+        delivery_caption: str | None = None
+        if (
+            result.final_answer is not None
+            and self._settings.irodori.caption_mode == "auto"
+            and self._delivery_caption_max_chars is not None
+        ):
+            plan = parse_speech_plan(
+                authoritative_text,
+                max_chars=self._delivery_caption_max_chars,
+            )
+            authoritative_text = plan.body
+            delivery_caption = plan.delivery_caption
+            if plan.error_code is not None:
+                safe_event(
+                    logger,
+                    "speech_plan_invalid",
+                    component="web",
+                    event_code=plan.error_code,
+                    plan_chars=plan.plan_chars,
+                )
+                self._spawn_effect(
+                    self._send_error(plan.error_code),
+                    name="moco-speech-plan-error",
+                )
+            elif plan.plan_present:
+                safe_event(
+                    logger,
+                    "speech_plan_received",
+                    caption_present=plan.delivery_caption is not None,
+                    component="web",
+                    contract_version=1,
+                    plan_chars=plan.plan_chars,
+                )
         if not authoritative_text.strip():
             return
         self._spawn_effect(
@@ -1036,7 +1080,10 @@ class _BrowserConnection:
             ),
             name="moco-turn-result-transcript",
         )
-        self._queue_terminal_speech_text(authoritative_text)
+        self._queue_terminal_speech_text(
+            authoritative_text,
+            delivery_caption=delivery_caption,
+        )
 
     async def _send_turn_result_transcript(
         self,
@@ -1149,7 +1196,13 @@ class _BrowserConnection:
         task.add_done_callback(self._finish_effect_task)
         return task
 
-    def _queue_speech_text(self, text: str, *, name: str) -> asyncio.Task[None] | None:
+    def _queue_speech_text(
+        self,
+        text: str,
+        *,
+        name: str,
+        delivery_caption: str | None = None,
+    ) -> asyncio.Task[None] | None:
         generation = self._speech_effect_generation
 
         async def speak() -> None:
@@ -1160,13 +1213,30 @@ class _BrowserConnection:
                 return
             if self._first_playback_started_ns is None:
                 self._first_playback_started_ns = time.monotonic_ns()
-            await speech.on_transcript(role="assistant", delta=text, done=True)
+            if delivery_caption is None:
+                await speech.on_transcript(role="assistant", delta=text, done=True)
+            else:
+                await speech.on_transcript(
+                    role="assistant",
+                    delta=text,
+                    done=True,
+                    delivery_caption=delivery_caption,
+                )
 
         return self._queue_speech_effect(speak, name=name)
 
-    def _queue_terminal_speech_text(self, text: str) -> None:
+    def _queue_terminal_speech_text(
+        self,
+        text: str,
+        *,
+        delivery_caption: str | None = None,
+    ) -> None:
         speech = self._speech
-        effect = self._queue_speech_text(text, name="moco-turn-result-speech")
+        effect = self._queue_speech_text(
+            text,
+            name="moco-turn-result-speech",
+            delivery_caption=delivery_caption,
+        )
         if speech is None or effect is None:
             return
 
@@ -1522,10 +1592,10 @@ class _BrowserConnection:
     async def _fetch_capabilities(
         self,
         synthesizer: WebSynthesizer,
-    ) -> CapabilitiesResponse:
+    ) -> IrodoriCapabilities:
         try:
             response = await synthesizer.capabilities()
-            capabilities = CapabilitiesResponse.model_validate(
+            capabilities = IrodoriCapabilities.model_validate(
                 response.model_dump(mode="python"),
                 strict=True,
             )
@@ -1549,13 +1619,19 @@ class _BrowserConnection:
         )
         return capabilities
 
-    async def _cache_capabilities(self, capabilities: CapabilitiesResponse) -> str | None:
+    async def _cache_capabilities(
+        self,
+        capabilities: CapabilitiesResponse | IrodoriCapabilities,
+    ) -> str | None:
         options = tuple(
             {"id": voice.id, "label": voice.label, "default": voice.default}
             for voice in capabilities.voices
         )
         voice_ids = {voice.id for voice in capabilities.voices}
         async with self._capability_lock:
+            caption = capabilities.conditioning.delivery_caption
+            self._delivery_caption_supported = caption.supported
+            self._delivery_caption_max_chars = caption.max_chars
             self._emoji_supported = capabilities.conditioning.emoji.supported
             cached_generation = self._voice_generation
             if cached_generation is not None and cached_generation != capabilities.generation:
@@ -1716,11 +1792,23 @@ class _BrowserConnection:
         )
 
     async def _prepare_start_synthesizer(self, synthesizer: WebSynthesizer) -> str | None:
+        safe_event(
+            logger,
+            "caption_mode_selected",
+            caption_mode=self._settings.irodori.caption_mode,
+            component="web",
+        )
         try:
             capabilities = await self._fetch_capabilities(synthesizer)
         except _CapabilityError as error:
             return error.code
         preparation_error = await self._cache_capabilities(capabilities)
+        if (
+            preparation_error is None
+            and self._settings.irodori.caption_mode == "auto"
+            and (not self._delivery_caption_supported or self._delivery_caption_max_chars is None)
+        ):
+            preparation_error = "caption_unsupported"
         if preparation_error is None:
             preparation_error = _start_voice_error(
                 capabilities,
@@ -2729,8 +2817,8 @@ class _BrowserConnection:
                     "readiness": self._voice_readiness,
                 },
                 "conditioning": {
-                    "captionMode": "off",
-                    "deliveryCaptionSupported": False,
+                    "captionMode": self._settings.irodori.caption_mode,
+                    "deliveryCaptionSupported": self._delivery_caption_supported,
                     "emojiSupported": self._emoji_supported,
                 },
             },
@@ -3095,7 +3183,7 @@ def _elapsed_ms(started_ns: int) -> int:
 
 
 def _resolve_voice_selection(
-    capabilities: CapabilitiesResponse,
+    capabilities: CapabilitiesResponse | IrodoriCapabilities,
     configured: str | None,
 ) -> tuple[str | None, str | None]:
     if not capabilities.voices:
@@ -3126,7 +3214,7 @@ def _readiness_for_capability_error(code: str) -> str:
 
 
 def _start_voice_error(
-    capabilities: CapabilitiesResponse,
+    capabilities: CapabilitiesResponse | IrodoriCapabilities,
     *,
     selection_error: str | None,
     selected_voice_id: str | None,

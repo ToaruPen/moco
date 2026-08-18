@@ -14,6 +14,7 @@ import pytest
 from irodori_tts_infra.contracts import CapabilitiesResponse
 
 from moco.config import MocoSettings, load_config
+from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 from moco.speech.text import TranscriptSegmenter
 
@@ -206,7 +207,7 @@ def _empty_summary() -> dict[str, int | float | bool | None]:
 
 def _select_voice(
     synthesizer: IrodoriSynthesizer,
-    capabilities: CapabilitiesResponse,
+    capabilities: CapabilitiesResponse | IrodoriCapabilities,
     configured_selector: str | None,
 ) -> None:
     selector = configured_selector

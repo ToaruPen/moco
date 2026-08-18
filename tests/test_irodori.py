@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from collections.abc import AsyncIterator, Iterator
 from typing import Literal, cast
 
@@ -14,22 +15,77 @@ from irodori_tts_infra.contracts import (
     SynthesisResult,
     VoiceCapability,
 )
+from pydantic import ValidationError
 
 from moco.config import IrodoriSettings, MocoSettings
+from moco.speech.contracts import (
+    DeliveryCaptionCapability,
+    IrodoriCapabilities,
+    IrodoriSynthesisRequest,
+)
 from moco.speech.irodori import (
     _JSON_ENVELOPE_BYTES,
     _MAX_CAPABILITY_ALIASES_PER_VOICE,
     _MAX_CAPABILITY_RESPONSE_BYTES,
     _MAX_CAPABILITY_TEXT_CHARS,
     _MAX_CAPABILITY_VOICES,
+    CapabilityClient,
     IrodoriClient,
     IrodoriError,
     IrodoriSynthesizer,
     _AddressOverrideTransport,
+    _HttpCapabilityClient,
     _is_complete_wav,
     _LimitedResponseStream,
     _LimitedResponseTransport,
 )
+
+
+def dynamic_capabilities_payload() -> dict[str, object]:
+    return {
+        "contract_version": 1,
+        "generation": "fixture-generation",
+        "ready": True,
+        "readiness": "ready",
+        "voices": [
+            {
+                "id": "narrator",
+                "label": "Narrator",
+                "aliases": [],
+                "default": True,
+            },
+        ],
+        "conditioning": {
+            "delivery_caption": {"supported": True, "max_chars": 300},
+            "emoji": {"supported": True},
+        },
+    }
+
+
+def test_dynamic_delivery_caption_capability_is_accepted() -> None:
+    capabilities = IrodoriCapabilities.model_validate_json(
+        json.dumps(dynamic_capabilities_payload()),
+        strict=True,
+    )
+
+    assert capabilities.conditioning.delivery_caption == DeliveryCaptionCapability(
+        supported=True,
+        max_chars=300,
+    )
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"supported": True, "max_chars": None},
+        {"supported": False, "max_chars": 300},
+    ],
+)
+def test_delivery_caption_capability_requires_matching_limit(
+    payload: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError):
+        DeliveryCaptionCapability.model_validate(payload, strict=True)
 
 
 def valid_wav(payload: bytes = b"") -> bytes:
@@ -81,6 +137,15 @@ def make_capabilities_with_voice(
             ),
         ),
     )
+
+
+def make_dynamic_capabilities(*, max_chars: int) -> IrodoriCapabilities:
+    payload = make_capabilities(2).model_dump(mode="python")
+    payload["conditioning"] = {
+        "delivery_caption": {"supported": True, "max_chars": max_chars},
+        "emoji": {"supported": True},
+    }
+    return IrodoriCapabilities.model_validate(payload, strict=True)
 
 
 class FakeIrodoriClient:
@@ -143,7 +208,9 @@ async def test_capabilities_fetches_from_bounded_client_and_caches_response() ->
 
     capabilities = await synthesizer.capabilities()
 
-    assert capabilities == make_capabilities(3)
+    assert capabilities.model_dump(mode="python") == make_capabilities(3).model_dump(
+        mode="python",
+    )
     assert client.capabilities_calls == 1
     synthesizer.select_voice("fixture-id-2")
 
@@ -180,6 +247,52 @@ async def test_uses_configured_voice_generation_and_sampling_settings(
     assert request.duration_scale == 1.2
     assert request.cfg_scale_text == 2.5
     assert request.cfg_scale_speaker == 4.5
+
+
+async def test_sends_validated_delivery_caption() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = make_dynamic_capabilities(max_chars=300)
+    synthesizer = await prepare_synthesizer(client)
+
+    await synthesizer.synthesize("本文です。", delivery_caption=" calm ")
+
+    request = client.requests[-1]
+    assert isinstance(request, IrodoriSynthesisRequest)
+    assert request.delivery_caption == "calm"
+
+
+async def test_rejects_caption_when_capability_is_unsupported() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(client)
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("本文です。", delivery_caption="calm")
+
+    assert caught.value.code == "caption_unsupported"
+    assert client.requests == []
+
+
+async def test_rejects_caption_over_dynamic_capability_limit() -> None:
+    client = FakeIrodoriClient()
+    client.capabilities_response = make_dynamic_capabilities(max_chars=3)
+    synthesizer = await prepare_synthesizer(client)
+
+    with pytest.raises(IrodoriError) as caught:
+        await synthesizer.synthesize("本文です。", delivery_caption="abcd")
+
+    assert caught.value.code == "speech_caption_invalid"
+    assert client.requests == []
+
+
+async def test_captionless_synthesis_uses_extended_request_with_null_caption() -> None:
+    client = FakeIrodoriClient()
+    synthesizer = await prepare_synthesizer(client)
+
+    await synthesizer.synthesize("本文です。")
+
+    request = client.requests[-1]
+    assert isinstance(request, IrodoriSynthesisRequest)
+    assert request.delivery_caption is None
 
 
 async def test_alias_selection_is_normalized_to_canonical_voice_id() -> None:
@@ -481,7 +594,9 @@ async def test_capability_structural_limits_accept_boundary_values(
         settings=MocoSettings(),
     )
 
-    assert await synthesizer.capabilities() == capabilities
+    actual = await synthesizer.capabilities()
+
+    assert actual.model_dump(mode="python") == capabilities.model_dump(mode="python")
 
 
 @pytest.mark.parametrize(
@@ -582,6 +697,27 @@ async def test_address_override_preserves_host_sni_and_tls_identity() -> None:
     await transport.aclose()
 
 
+async def test_http_capability_client_accepts_dynamic_delivery_caption() -> None:
+    requests: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append((request.method, request.url.path))
+        return httpx.Response(200, json=dynamic_capabilities_payload())
+
+    client = _HttpCapabilityClient(
+        base_url="https://voice-host.example.ts.net/",
+        timeout=5.0,
+        transport=httpx.MockTransport(handler),
+    )
+
+    capabilities = await client.capabilities()
+
+    assert capabilities.conditioning.delivery_caption.supported is True
+    assert capabilities.conditioning.delivery_caption.max_chars == 300
+    assert requests == [("GET", "/capabilities")]
+    await client.aclose()
+
+
 async def test_close_delegates_to_client() -> None:
     client = FakeIrodoriClient()
     synthesizer = IrodoriSynthesizer(
@@ -594,13 +730,15 @@ async def test_close_delegates_to_client() -> None:
     assert client.closed
 
 
-async def test_health_and_synthesis_use_separate_clients() -> None:
+async def test_health_synthesis_and_capability_use_separate_clients() -> None:
     health_client = FakeIrodoriClient()
     synthesis_client = FakeIrodoriClient()
+    capability_client = FakeIrodoriClient()
     synthesizer = IrodoriSynthesizer(
         cast("IrodoriClient", health_client),
         settings=MocoSettings(),
         synthesis_client=cast("IrodoriClient", synthesis_client),
+        capability_client=cast("CapabilityClient", capability_client),
     )
 
     await synthesizer.health()
@@ -610,11 +748,13 @@ async def test_health_and_synthesis_use_separate_clients() -> None:
     await synthesizer.close()
 
     assert health_client.requests == []
-    assert health_client.capabilities_calls == 1
+    assert health_client.capabilities_calls == 0
     assert synthesis_client.capabilities_calls == 0
+    assert capability_client.capabilities_calls == 1
     assert len(synthesis_client.requests) == 1
     assert health_client.closed
     assert synthesis_client.closed
+    assert capability_client.closed
 
 
 async def test_synthesis_client_closes_when_health_client_close_fails() -> None:

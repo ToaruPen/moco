@@ -252,7 +252,7 @@ irodori:
   connect_ip: null
   # 実行時カタログの preferred canonical ID。移行時は一意な alias も解決します。
   speaker: null
-  caption_mode: "off"
+  caption_mode: "auto"
 ```
 
 `speaker` は起動時に優先する canonical voice ID です。旧名を移行するための alias は、
@@ -260,11 +260,25 @@ irodori:
 使い、default がなければ明示選択まで会話開始を拒否します。候補を列挙する旧 `speakers`
 キーは削除してください。残っていると厳格な設定検証が失敗します。
 
-初期 v4 移行では `caption_mode` は `off` だけです。moco は自由記述 caption や
-`calm` / `cheerful` / `clear` のような独自プリセットを送らず、Irodori の neutral な既定条件と
-本文中の emoji を使います。checkpoint、tokenizer、generation、alias、embedding パスは
-Irodori 内に留まり、ブラウザへ公開しません。URL にユーザー名やパスワードを埋め込む設定は
-拒否されます。
+`caption_mode` の既定値は `off` です。`auto` にすると、Irodori が delivery caption 対応と
+正の `max_chars` を広告している場合だけ会話を開始します。非対応時は
+`caption_unsupported` で停止し、別の条件へ自動で切り替えません。caption の上限は実行時の
+`max_chars` に従い、読み上げ本文の文字数には適用されません。
+
+`auto` では、Codex の確定回答の先頭の非空行に次の一行 JSON を置けます。二行目以降だけが
+画面表示と読み上げ本文になり、検証済みの caption は同じ回答から分割された全音声へ送られます。
+
+```json
+{"type":"moco.speech_plan","version":1,"delivery_caption":"落ち着いて、親しみを込めて話す。"}
+```
+
+標準表現を明示する場合は `delivery_caption` を `null` にします。不正な plan は制御行だけを
+除去し、本文を caption なしで継続して `speech_caption_invalid` を通知します。caption や本文は
+通常ログと telemetry へ記録しません。いつこの一行を出すか、どのような話し方を指定するかは、
+必要になった時点でリポジトリの `AGENTS.md` などに指示を追加できます。
+
+checkpoint、tokenizer、generation、alias、embedding パスは Irodori 内に留まり、ブラウザへ
+公開しません。URL にユーザー名やパスワードを埋め込む設定は拒否されます。
 
 `timeout_seconds` は capability/readiness 確認だけに使われます。音声合成には期限を設けず、
 新しいユーザー発話または会話終了時に古い結果を無効化します。各合成要求は取得済みの

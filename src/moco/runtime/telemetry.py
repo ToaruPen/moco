@@ -31,6 +31,8 @@ _ALLOWED_ATTRIBUTES = frozenset(
     {
         "boundary",
         "audio_id",
+        "caption_mode",
+        "caption_present",
         "component",
         "context_state",
         "contract_version",
@@ -39,6 +41,7 @@ _ALLOWED_ATTRIBUTES = frozenset(
         "event_code",
         "generation",
         "phase",
+        "plan_chars",
         "queue_depth",
         "ready",
         "readiness",
@@ -62,6 +65,18 @@ _SAFE_AUDIO_CONTEXT_STATES = frozenset(
 )
 _SAFE_SEGMENT_REASONS = frozenset(
     {"sentence_end", "first_soft_break", "max_chars", "turn_flush"},
+)
+_SAFE_CAPTION_MODES = frozenset({"off", "auto"})
+_BOUNDED_METADATA_ATTRIBUTES = frozenset(
+    {
+        "caption_mode",
+        "caption_present",
+        "contract_version",
+        "plan_chars",
+        "ready",
+        "readiness",
+        "voice_count",
+    }
 )
 _MAX_CONSOLE_LINE_CHARS = 1024
 _SAFE_READINESS = frozenset(
@@ -214,8 +229,8 @@ def configure_telemetry(settings: TelemetrySettings) -> TelemetryRuntime:
 
 
 def _is_safe_value(key: str, value: object) -> bool:
-    if key in {"contract_version", "ready", "readiness", "voice_count"}:
-        return _is_safe_capability_value(key, value)
+    if key in _BOUNDED_METADATA_ATTRIBUTES:
+        return _is_safe_bounded_metadata(key, value)
     if key == "segment_index":
         return type(value) is int and value > 0
     if key == "segment_reason":
@@ -243,11 +258,13 @@ def _is_safe_value(key: str, value: object) -> bool:
     return valid
 
 
-def _is_safe_capability_value(key: str, value: object) -> bool:
-    if key in {"contract_version", "voice_count"}:
+def _is_safe_bounded_metadata(key: str, value: object) -> bool:
+    if key in {"contract_version", "plan_chars", "voice_count"}:
         return type(value) is int and value >= 0
-    if key == "ready":
+    if key in {"caption_present", "ready"}:
         return type(value) is bool
+    if key == "caption_mode":
+        return isinstance(value, str) and value in _SAFE_CAPTION_MODES
     return key == "readiness" and isinstance(value, str) and value in _SAFE_READINESS
 
 

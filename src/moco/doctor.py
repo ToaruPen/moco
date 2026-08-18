@@ -10,7 +10,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol
 
-from irodori_tts_infra.contracts import CapabilitiesResponse
 from pydantic import ValidationError
 
 from moco.codex.capabilities import (
@@ -32,10 +31,13 @@ from moco.platform import (
     service_supported,
 )
 from moco.runtime.hotkeys import GlobalHotkeyListener, HotkeyMapper
+from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Mapping
+
+    from irodori_tts_infra.contracts import CapabilitiesResponse
 
     from moco.codex.rpc import JsonValue
 
@@ -59,7 +61,9 @@ class DoctorCapabilityDiscovery(Protocol):
 
 
 class DoctorSynthesizer(Protocol):
-    async def capabilities(self) -> CapabilitiesResponse: ...
+    async def capabilities(
+        self,
+    ) -> CapabilitiesResponse | IrodoriCapabilities: ...
 
     def select_voice(self, voice_id: str) -> None: ...
 
@@ -513,16 +517,16 @@ async def _check_irodori_synthesis(
 
 async def _load_irodori_capabilities(
     synthesizer: DoctorSynthesizer,
-) -> CapabilitiesResponse:
+) -> IrodoriCapabilities:
     response = await synthesizer.capabilities()
-    return CapabilitiesResponse.model_validate(
+    return IrodoriCapabilities.model_validate(
         response.model_dump(mode="python"),
         strict=True,
     )
 
 
 def _resolve_irodori_voice(
-    capabilities: CapabilitiesResponse,
+    capabilities: IrodoriCapabilities,
     *,
     configured: str | None,
 ) -> tuple[str | None, str | None]:

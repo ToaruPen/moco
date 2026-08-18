@@ -423,9 +423,16 @@ def test_irodori_caption_mode_defaults_to_off() -> None:
     assert IrodoriSettings().caption_mode == "off"
 
 
-def test_irodori_caption_mode_rejects_non_off(tmp_path: Path) -> None:
+def test_irodori_caption_mode_accepts_auto(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
     path.write_text("irodori:\n  caption_mode: auto\n", encoding="utf-8")
+
+    assert load_config(path).irodori.caption_mode == "auto"
+
+
+def test_irodori_caption_mode_rejects_unknown_value(tmp_path: Path) -> None:
+    path = tmp_path / "moco.yaml"
+    path.write_text("irodori:\n  caption_mode: dynamic\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match=r"irodori\.caption_mode"):
         load_config(path)

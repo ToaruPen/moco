@@ -33,6 +33,8 @@ _PUBLIC_IRODORI_ERROR_CODES = frozenset(
         "audio_too_large",
         "invalid_audio",
         "synthesis_failed",
+        "caption_unsupported",
+        "speech_caption_invalid",
     },
 )
 
@@ -41,9 +43,14 @@ class Synthesizer(Protocol):
     async def synthesize(self, text: str) -> bytes: ...
 
 
+class CaptionSynthesizer(Protocol):
+    async def synthesize(self, text: str, *, delivery_caption: str) -> bytes: ...
+
+
 @dataclass(frozen=True, slots=True)
 class _SpeechItem:
     text: str
+    delivery_caption: str | None
     audio_id: int
     generation: int
     reason: SegmentReason
@@ -80,6 +87,8 @@ class SpeechQueue:
         self._generation = initial_generation
         self._suppressed = False
         self._turn_started_ns: int | None = None
+        self._turn_delivery_caption: str | None = None
+        self._turn_caption_set = False
         self._next_segment_index = 1
         self._worker: asyncio.Task[None] | None = None
         self._active: asyncio.Task[None] | None = None
@@ -114,6 +123,7 @@ class SpeechQueue:
         role: TranscriptRole,
         delta: str,
         done: bool,
+        delivery_caption: str | None = None,
     ) -> None:
         if role == "user":
             if done:
@@ -124,12 +134,18 @@ class SpeechQueue:
         if self._suppressed or self._closed:
             return
 
+        if not self._turn_caption_set:
+            self._turn_delivery_caption = delivery_caption
+            self._turn_caption_set = True
         if delta and self._turn_started_ns is None:
             self._turn_started_ns = time.monotonic_ns()
         segments = self._segmenter.push(delta)
         if done:
             segments.extend(self._segmenter.flush())
-        await self._enqueue(segments)
+        await self._enqueue(
+            segments,
+            delivery_caption=self._turn_delivery_caption,
+        )
         if done:
             self._reset_turn_state()
 
@@ -174,7 +190,12 @@ class SpeechQueue:
             with suppress(asyncio.CancelledError):
                 await worker
 
-    async def _enqueue(self, segments: list[TranscriptSegment]) -> None:
+    async def _enqueue(
+        self,
+        segments: list[TranscriptSegment],
+        *,
+        delivery_caption: str | None,
+    ) -> None:
         if not segments:
             return
         enqueued_ns = time.monotonic_ns()
@@ -186,6 +207,7 @@ class SpeechQueue:
                 items.append(
                     _SpeechItem(
                         text=segment.text,
+                        delivery_caption=delivery_caption,
                         audio_id=self._reserve_audio_id(),
                         generation=self._generation,
                         reason=segment.reason,
@@ -218,6 +240,8 @@ class SpeechQueue:
 
     def _reset_turn_state(self) -> None:
         self._turn_started_ns = None
+        self._turn_delivery_caption = None
+        self._turn_caption_set = False
         self._next_segment_index = 1
 
     def _reserve_local_audio_id(self) -> int:
@@ -263,7 +287,14 @@ class SpeechQueue:
             text_chars=len(item.text),
         )
         try:
-            wav = await self._synthesizer.synthesize(item.text)
+            if item.delivery_caption is None:
+                wav = await self._synthesizer.synthesize(item.text)
+            else:
+                synthesizer = cast("CaptionSynthesizer", self._synthesizer)
+                wav = await synthesizer.synthesize(
+                    item.text,
+                    delivery_caption=item.delivery_caption,
+                )
         except asyncio.CancelledError:
             safe_event(
                 logger,
