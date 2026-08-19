@@ -109,17 +109,19 @@ function createController({
   context = {},
   currentStream,
   devices = [],
+  dom = new JSDOM(`
+    <select id="audio-input" disabled></select>
+    <select id="audio-output" disabled></select>
+  `),
+  getAudioSender,
+  getCurrentStream,
+  mediaDevices = new FakeMediaDevices(devices),
   onError,
   onReplaceCurrentStream,
   sender,
   storage = new FakeStorage(),
 } = {}) {
-  const dom = new JSDOM(`
-    <select id="audio-input" disabled></select>
-    <select id="audio-output" disabled></select>
-  `);
   const document = dom.window.document;
-  const mediaDevices = new FakeMediaDevices(devices);
   const inputSelect = document.querySelector("#audio-input");
   const outputSelect = document.querySelector("#audio-output");
   let ownedStream = currentStream;
@@ -130,8 +132,8 @@ function createController({
     context,
     mediaDevices,
     storage,
-    getCurrentStream: () => ownedStream,
-    getAudioSender: () => sender,
+    getCurrentStream: getCurrentStream ?? (() => ownedStream),
+    getAudioSender: getAudioSender ?? (() => sender),
     replaceCurrentStream: (nextStream) => {
       streamReplacements.push(nextStream);
       ownedStream = nextStream;
@@ -1723,6 +1725,336 @@ describe("AudioDeviceController", () => {
     ]);
     assert.equal(setup.inputSelect.value, "mic-unlisted");
     assert.equal(setup.outputSelect.value, "speaker-unlisted");
+  });
+
+  it("uses the latest MIC ON state when replaceTrack resolves", async () => {
+    const replacement = deferred();
+    const oldTrack = createTrack({ enabled: false });
+    const nextTrack = createTrack({ enabled: false });
+    const sender = {
+      async replaceTrack() {
+        await replacement.promise;
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(createStream([nextTrack]));
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(nextTrack.enabled, false);
+    oldTrack.enabled = true;
+    replacement.resolve();
+
+    assert.equal(await switching, true);
+    assert.equal(nextTrack.enabled, true);
+  });
+
+  it("uses the latest MIC OFF state when replaceTrack resolves", async () => {
+    const replacement = deferred();
+    const oldTrack = createTrack({ enabled: true });
+    const nextTrack = createTrack({ enabled: true });
+    const sender = {
+      async replaceTrack() {
+        await replacement.promise;
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(createStream([nextTrack]));
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(nextTrack.enabled, true);
+    oldTrack.enabled = false;
+    replacement.resolve();
+
+    assert.equal(await switching, true);
+    assert.equal(nextTrack.enabled, false);
+  });
+
+  it("cancels an input commit when current stream identity changes during replaceTrack", async () => {
+    const replacement = deferred();
+    const errors = [];
+    const oldTrack = createTrack();
+    const nextTrack = createTrack();
+    const replacementTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const nextStream = createStream([nextTrack]);
+    const replacementStream = createStream([replacementTrack]);
+    let authoritativeStream = oldStream;
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await replacement.promise;
+        }
+      },
+    };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      getCurrentStream: () => authoritativeStream,
+      onError: (code) => errors.push(code),
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    authoritativeStream = replacementStream;
+    replacement.resolve();
+
+    assert.equal(await switching, false);
+    assert.deepEqual(sender.replacements, [nextTrack, replacementTrack]);
+    assert.equal(nextTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.equal(replacementTrack.stopCalls, 0);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(authoritativeStream, replacementStream);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.deepEqual(errors, []);
+  });
+
+  it("cancels an input commit when audio sender identity changes during replaceTrack", async () => {
+    const replacement = deferred();
+    const errors = [];
+    const oldTrack = createTrack();
+    const nextTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const nextStream = createStream([nextTrack]);
+    const oldSender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await replacement.promise;
+        }
+      },
+    };
+    const newSender = { async replaceTrack() {} };
+    let authoritativeSender = oldSender;
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      getAudioSender: () => authoritativeSender,
+      onError: (code) => errors.push(code),
+      sender: oldSender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    authoritativeSender = newSender;
+    replacement.resolve();
+
+    assert.equal(await switching, false);
+    assert.deepEqual(oldSender.replacements, [nextTrack, oldTrack]);
+    assert.equal(nextTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.deepEqual(errors, []);
+  });
+
+  it("does not let a closed controller render after its delayed enumeration rejects", async () => {
+    const dom = new JSDOM(`
+      <select id="audio-input" disabled></select>
+      <select id="audio-output" disabled></select>
+    `);
+    const pending = deferred();
+    const oldMediaDevices = new FakeMediaDevices();
+    oldMediaDevices.enumerationResults.push(pending.promise);
+    const oldSetup = createController({
+      context: { async setSinkId() {} },
+      dom,
+      mediaDevices: oldMediaDevices,
+    });
+
+    const oldStarting = oldSetup.controller.start();
+    oldSetup.controller.close();
+    const newSetup = createController({
+      context: { async setSinkId() {} },
+      devices: [
+        { kind: "audioinput", deviceId: "mic-new", label: "New microphone" },
+        { kind: "audiooutput", deviceId: "speaker-new", label: "New speaker" },
+      ],
+      dom,
+    });
+    await newSetup.controller.start();
+    pending.reject(new Error("old enumeration failed"));
+    await oldStarting;
+
+    assert.deepEqual(options(newSetup.inputSelect), [
+      ["", "システム既定"],
+      ["mic-new", "New microphone"],
+    ]);
+    assert.deepEqual(options(newSetup.outputSelect), [
+      ["", "システム既定"],
+      ["speaker-new", "New speaker"],
+    ]);
+    assert.equal(newSetup.inputSelect.disabled, false);
+    assert.equal(newSetup.outputSelect.disabled, false);
+  });
+
+  it("does not let a closed controller render from delayed input switch cleanup", async () => {
+    const dom = new JSDOM(`
+      <select id="audio-input" disabled></select>
+      <select id="audio-output" disabled></select>
+    `);
+    const acquisition = deferred();
+    const oldTrack = createTrack();
+    const candidateTrack = createTrack();
+    const oldSetup = createController({
+      context: { async setSinkId() {} },
+      currentStream: createStream([oldTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-old", label: "Old microphone" }],
+      dom,
+      sender: { async replaceTrack() {} },
+    });
+    oldSetup.mediaDevices.getUserMediaResults.push(acquisition.promise);
+    await oldSetup.controller.start();
+    const switching = oldSetup.controller.selectInput("mic-old");
+    await new Promise((resolve) => setImmediate(resolve));
+    oldSetup.controller.close();
+    const newSetup = createController({
+      context: { async setSinkId() {} },
+      devices: [{ kind: "audioinput", deviceId: "mic-new", label: "New microphone" }],
+      dom,
+    });
+    await newSetup.controller.start();
+    acquisition.resolve(createStream([candidateTrack]));
+    assert.equal(await switching, false);
+
+    assert.deepEqual(options(newSetup.inputSelect), [
+      ["", "システム既定"],
+      ["mic-new", "New microphone"],
+    ]);
+    assert.equal(newSetup.inputSelect.disabled, false);
+    assert.equal(candidateTrack.stopCalls, 1);
+  });
+
+  it("does not let a closed controller render from delayed output switch cleanup", async () => {
+    const dom = new JSDOM(`
+      <select id="audio-input" disabled></select>
+      <select id="audio-output" disabled></select>
+    `);
+    const sinkSwitch = deferred();
+    const oldSetup = createController({
+      context: {
+        async setSinkId() {
+          await sinkSwitch.promise;
+        },
+      },
+      devices: [{ kind: "audiooutput", deviceId: "speaker-old", label: "Old speaker" }],
+      dom,
+    });
+    await oldSetup.controller.start();
+    const switching = oldSetup.controller.selectOutput("speaker-old");
+    await new Promise((resolve) => setImmediate(resolve));
+    oldSetup.controller.close();
+    const newSetup = createController({
+      context: { async setSinkId() {} },
+      devices: [{ kind: "audiooutput", deviceId: "speaker-new", label: "New speaker" }],
+      dom,
+    });
+    await newSetup.controller.start();
+    sinkSwitch.resolve();
+    assert.equal(await switching, false);
+
+    assert.deepEqual(options(newSetup.outputSelect), [
+      ["", "システム既定"],
+      ["speaker-new", "New speaker"],
+    ]);
+    assert.equal(newSetup.outputSelect.disabled, false);
+  });
+
+  it("deduplicates an input fallback across repeated identical missing catalogs", async () => {
+    const replacement = deferred();
+    const oldTrack = createTrack();
+    const firstDefaultTrack = createTrack();
+    const secondDefaultTrack = createTrack();
+    const firstDefaultStream = createStream([firstDefaultTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await replacement.promise;
+        }
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(
+      firstDefaultStream,
+      createStream([secondDefaultTrack]),
+    );
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    setup.mediaDevices.devices = [];
+
+    const firstRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    const secondRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    replacement.resolve();
+    await Promise.all([firstRefresh, secondRefresh]);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [{ audio: true }]);
+    assert.deepEqual(sender.replacements, [firstDefaultTrack]);
+    assert.equal(setup.currentStream(), firstDefaultStream);
+    assert.equal(firstDefaultTrack.stopCalls, 0);
+    assert.equal(secondDefaultTrack.stopCalls, 0);
+    assert.equal(setup.controller.inputId, "");
+  });
+
+  it("deduplicates an output fallback across repeated identical missing catalogs", async () => {
+    const sinkSwitch = deferred();
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+        if (this.calls.length === 1) {
+          await sinkSwitch.promise;
+        }
+      },
+    };
+    const setup = createController({
+      context,
+      devices: [{ kind: "audiooutput", deviceId: "speaker-1", label: "Speaker 1" }],
+    });
+    await setup.controller.start();
+    setup.controller.outputId = "speaker-1";
+    setup.outputSelect.value = "speaker-1";
+    setup.mediaDevices.devices = [];
+
+    const firstRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    const secondRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    sinkSwitch.resolve();
+    await Promise.all([firstRefresh, secondRefresh]);
+
+    assert.deepEqual(context.calls, [""]);
+    assert.equal(setup.controller.outputId, "");
   });
 
   it("queues a disconnected-input fallback behind an active microphone switch", async () => {

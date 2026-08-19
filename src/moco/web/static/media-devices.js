@@ -66,8 +66,9 @@ export class AudioDeviceController {
     this.outputPending = 0;
     this.inputQueue = Promise.resolve();
     this.outputQueue = Promise.resolve();
+    this.inputFallback = null;
+    this.outputFallback = null;
     this.refreshGeneration = 0;
-    this.catalogGeneration = 0;
     this.switchGeneration = 0;
     this.handleDeviceChange = () => {
       void this.refresh();
@@ -105,7 +106,6 @@ export class AudioDeviceController {
     }
 
     this.devices = devices;
-    this.catalogGeneration += 1;
     this.hasSuccessfulCatalog = true;
     this.#renderCatalog();
     if (this.started && !this.restorationStarted) {
@@ -127,20 +127,23 @@ export class AudioDeviceController {
     );
     const fallbacks = [];
     if (this.inputId && !inputIds.has(this.inputId)) {
-      fallbacks.push(this.#selectInputFallback(this.inputId, this.catalogGeneration));
+      fallbacks.push(this.#selectInputFallback(this.inputId));
     }
     if (
       this.outputId &&
       typeof this.context.setSinkId === "function" &&
       !outputIds.has(this.outputId)
     ) {
-      fallbacks.push(this.#selectOutputFallback(this.outputId, this.catalogGeneration));
+      fallbacks.push(this.#selectOutputFallback(this.outputId));
     }
     await Promise.all(fallbacks);
     return true;
   }
 
   #renderCatalog() {
+    if (this.closed) {
+      return;
+    }
     const supportsOutputSelection = typeof this.context.setSinkId === "function";
     const inputDevices = this.#devicesWithRetainedSelection(
       this.inputSelect,
@@ -212,8 +215,21 @@ export class AudioDeviceController {
     return await this.#enqueueInput(deviceId, null, pendingSelection);
   }
 
-  async #selectInputFallback(expectedId, catalogGeneration) {
-    return await this.#enqueueInput("", { catalogGeneration, expectedId });
+  #selectInputFallback(expectedId) {
+    if (this.inputFallback) {
+      return this.inputFallback.promise;
+    }
+    const fallback = { expectedId };
+    const promise = this.#enqueueInput("", fallback);
+    const pending = { promise };
+    this.inputFallback = pending;
+    const clear = () => {
+      if (this.inputFallback === pending) {
+        this.inputFallback = null;
+      }
+    };
+    promise.then(clear, clear);
+    return promise;
   }
 
   async #enqueueInput(deviceId, fallback = null, pendingSelection = null) {
@@ -272,6 +288,20 @@ export class AudioDeviceController {
         this.#stopStream(candidate);
         return false;
       }
+      const authoritativeCurrent = this.getCurrentStream();
+      const authoritativeTrack = authoritativeCurrent?.getAudioTracks()[0];
+      const authoritativeSender = this.getAudioSender();
+      if (
+        authoritativeCurrent !== current ||
+        authoritativeTrack !== currentTrack ||
+        authoritativeSender !== sender
+      ) {
+        const rollbackTrack =
+          authoritativeSender === sender && authoritativeTrack ? authoritativeTrack : currentTrack;
+        await this.#rollbackInputFallback(sender, rollbackTrack);
+        this.#stopStream(candidate);
+        return false;
+      }
       if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
         const rolledBack = await this.#rollbackInputFallback(sender, currentTrack);
         if (this.closed || generation !== this.switchGeneration) {
@@ -289,6 +319,7 @@ export class AudioDeviceController {
         return false;
       }
 
+      nextTrack.enabled = authoritativeTrack.enabled;
       this.replaceCurrentStream(candidate);
       this.#stopStream(current);
       this.inputId = deviceId;
@@ -319,8 +350,21 @@ export class AudioDeviceController {
     return await this.#enqueueOutput(deviceId, null, pendingSelection);
   }
 
-  async #selectOutputFallback(expectedId, catalogGeneration) {
-    return await this.#enqueueOutput("", { catalogGeneration, expectedId });
+  #selectOutputFallback(expectedId) {
+    if (this.outputFallback) {
+      return this.outputFallback.promise;
+    }
+    const fallback = { expectedId };
+    const promise = this.#enqueueOutput("", fallback);
+    const pending = { promise };
+    this.outputFallback = pending;
+    const clear = () => {
+      if (this.outputFallback === pending) {
+        this.outputFallback = null;
+      }
+    };
+    promise.then(clear, clear);
+    return promise;
   }
 
   async #enqueueOutput(deviceId, fallback = null, pendingSelection = null) {
@@ -447,7 +491,6 @@ export class AudioDeviceController {
     }
     return (
       !this.closed &&
-      fallback.catalogGeneration === this.catalogGeneration &&
       fallback.expectedId === currentId &&
       !candidates(this.devices, kind).some((device) => device.deviceId === fallback.expectedId)
     );
@@ -459,13 +502,13 @@ export class AudioDeviceController {
     }
     if (
       this.closed ||
-      fallback.catalogGeneration !== this.catalogGeneration ||
       !currentId ||
       candidates(this.devices, kind).some((device) => device.deviceId === currentId)
     ) {
       return false;
     }
-    return { ...fallback, expectedId: currentId };
+    fallback.expectedId = currentId;
+    return fallback;
   }
 
   async #rollbackInputFallback(sender, currentTrack) {
