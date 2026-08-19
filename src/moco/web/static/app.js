@@ -456,7 +456,7 @@ export class MocoController {
 
   async applyControl(control) {
     const epoch = ++this.controlEpoch;
-    const track = this.stream.getAudioTracks()[0];
+    let track = this.stream.getAudioTracks()[0];
     if (!track) {
       return false;
     }
@@ -479,6 +479,10 @@ export class MocoController {
         this.idleExpired = false;
         this.reconnectRequired = false;
         if (epoch !== this.controlEpoch) {
+          return false;
+        }
+        track = this.stream.getAudioTracks()[0];
+        if (!track) {
           return false;
         }
       }

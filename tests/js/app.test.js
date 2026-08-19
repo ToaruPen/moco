@@ -887,6 +887,46 @@ describe("MocoController", () => {
     assert.deepEqual(messages, [{ type: "control", control: "listen_start" }]);
   });
 
+  it("enables the current microphone when it changes during Voice reconnect", async () => {
+    const { controller, messages, track: oldTrack } = harness();
+    const currentTrack = { enabled: false };
+    let finishReconnect;
+    controller.reconnect = () =>
+      new Promise((resolve) => {
+        finishReconnect = resolve;
+      });
+    controller.requireReconnect();
+
+    const starting = controller.applyControl("listen_start");
+    await Promise.resolve();
+    controller.stream = { getAudioTracks: () => [currentTrack] };
+    finishReconnect();
+
+    assert.equal(await starting, true);
+    assert.equal(oldTrack.enabled, false);
+    assert.equal(currentTrack.enabled, true);
+    assert.deepEqual(messages, [{ type: "control", control: "listen_start" }]);
+  });
+
+  it("does not send listening success when the current track disappears during reconnect", async () => {
+    const { controller, messages, track: oldTrack } = harness();
+    let finishReconnect;
+    controller.reconnect = () =>
+      new Promise((resolve) => {
+        finishReconnect = resolve;
+      });
+    controller.requireReconnect();
+
+    const starting = controller.applyControl("listen_start");
+    await Promise.resolve();
+    controller.stream = { getAudioTracks: () => [] };
+    finishReconnect();
+
+    assert.equal(await starting, false);
+    assert.equal(oldTrack.enabled, false);
+    assert.deepEqual(messages, []);
+  });
+
   it("allows an explicit retry after a shared reconnect failure", async () => {
     const { controller, messages } = harness();
     const reconnectError = new Error("synthetic reconnect failure");
@@ -2041,6 +2081,49 @@ describe("audio device switching", () => {
       assert.equal(connection.peers[1].addedTracks[0].stream, connection.streams[1]);
       assert.equal(initialTrack.stopCalls, 1);
       assert.notEqual(connection.peers[1].addedTracks[0].track, initialTrack);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("enables a microphone switched while Voice reconnect is pending", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0] });
+    try {
+      await connection.waitFor(
+        () =>
+          connection.peers[0]?.remoteDescriptions.length === 1 &&
+          connection.dom.window.document.querySelector("#audio-input").disabled === false,
+      );
+      const oldTrack = connection.tracks[0];
+
+      connection.requireReplacement();
+      await connection.waitFor(
+        () =>
+          connection.peers.length === 2 &&
+          connection.sent.filter(({ type }) => type === "start").length === 2,
+      );
+
+      const input = connection.dom.window.document.querySelector("#audio-input");
+      input.value = "mic-2";
+      input.dispatchEvent(new connection.dom.window.Event("change"));
+      await connection.waitFor(() => connection.peers[1].sender.replacements.length === 1);
+      const currentTrack = connection.peers[1].sender.track;
+
+      connection.receive({ type: "sdp_answer", sdp: "replacement-answer" });
+      await connection.waitFor(
+        () => connection.sent.filter(({ type }) => type === "control").length === 1,
+      );
+
+      assert.equal(currentTrack.deviceId, "mic-2");
+      assert.equal(currentTrack.enabled, true);
+      assert.equal(oldTrack.enabled, false);
+      assert.equal(oldTrack.stopCalls, 1);
+      assert.deepEqual(
+        connection.sent.filter(({ type }) => type === "control"),
+        [{ type: "control", control: "listen_start" }],
+      );
+      assert.equal(connection.sent.filter(({ type }) => type === "start").length, 2);
+      assert.equal(connection.peers.length, 2);
     } finally {
       await connection.close();
     }
