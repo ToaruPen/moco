@@ -16,6 +16,18 @@
       <span id="mic-state" class="status-chip" data-status="muted">MIC OFF</span>
       <span id="connection" class="status-chip" data-status="muted">WS OFFLINE</span>
       <div class="operator-actions">
+        <label class="device-control" for="audio-input">
+          <span>INPUT</span>
+          <select id="audio-input" aria-label="入力マイク" disabled>
+            <option value="">接続待ち</option>
+          </select>
+        </label>
+        <label class="device-control" for="audio-output">
+          <span>OUTPUT</span>
+          <select id="audio-output" aria-label="音声出力先" disabled>
+            <option value="">接続待ち</option>
+          </select>
+        </label>
         <label class="voice-control" for="voice">
           <span>VOICE</span>
           <select id="voice" aria-label="音声モデル" disabled>

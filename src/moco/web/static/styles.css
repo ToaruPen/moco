@@ -174,6 +174,7 @@ select:disabled {
   color: var(--c-text-muted);
 }
 
+.device-control,
 .voice-control {
   display: flex;
   align-items: center;
@@ -183,10 +184,18 @@ select:disabled {
   letter-spacing: 0.08em;
 }
 
+.device-control select,
 .voice-control select {
-  width: min(22vw, 200px);
   height: 30px;
   padding: 3px 26px 3px 8px;
+}
+
+.device-control select {
+  width: min(18vw, 180px);
+}
+
+.voice-control select {
+  width: min(22vw, 200px);
 }
 
 .connection-row,
@@ -567,13 +576,18 @@ h2 {
   .operator-actions {
     width: 100%;
     margin-left: 0;
+    flex-wrap: wrap;
   }
 
+  .device-control,
   .voice-control {
-    flex: 1;
+    min-width: 0;
+    flex: 1 1 160px;
   }
 
+  .device-control select,
   .voice-control select {
+    min-width: 0;
     width: 100%;
   }
 
@@ -611,10 +625,12 @@ h2 {
   }
 
   .connection-row p,
+  .device-control > span,
   .voice-control > span {
     display: none;
   }
 
+  .device-control,
   .voice-control {
     min-width: 0;
   }

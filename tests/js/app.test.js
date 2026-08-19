@@ -1252,6 +1252,8 @@ describe("operator console DOM", () => {
       "state",
       "connection",
       "mic-state",
+      "audio-input",
+      "audio-output",
       "voice",
       "listen-start",
       "listen-stop",
@@ -1307,6 +1309,15 @@ describe("operator console DOM", () => {
       "実行中の処理を取り消す",
     );
     assert.equal(document.querySelector("#voice").getAttribute("aria-label"), "音声モデル");
+    for (const [id, label] of [
+      ["audio-input", "入力マイク"],
+      ["audio-output", "音声出力先"],
+    ]) {
+      const select = document.querySelector(`#${id}`);
+      assert.ok(select, id);
+      assert.equal(select.getAttribute("aria-label"), label);
+      assert.equal(select.disabled, true);
+    }
     assert.equal(document.querySelector("#pairing-panel").getAttribute("role"), "dialog");
   });
 
