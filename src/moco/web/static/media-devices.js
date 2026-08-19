@@ -224,19 +224,22 @@ export class AudioDeviceController {
   }
 
   #selectInputFallback(expectedId, missingEpoch) {
-    if (
-      this.inputFallback?.expectedId === expectedId &&
-      this.inputFallback.missingEpoch === missingEpoch
-    ) {
-      return this.inputFallback.promise;
+    return this.#selectFallback("inputFallback", expectedId, missingEpoch, (fallback) =>
+      this.#enqueueInput("", fallback),
+    );
+  }
+
+  #selectFallback(property, expectedId, missingEpoch, enqueue) {
+    if (this[property]?.expectedId === expectedId && this[property].missingEpoch === missingEpoch) {
+      return this[property].promise;
     }
     const fallback = { expectedId };
-    const promise = this.#enqueueInput("", fallback);
+    const promise = enqueue(fallback);
     const pending = { expectedId, missingEpoch, promise };
-    this.inputFallback = pending;
+    this[property] = pending;
     const clear = () => {
-      if (this.inputFallback === pending) {
-        this.inputFallback = null;
+      if (this[property] === pending) {
+        this[property] = null;
       }
     };
     promise.then(clear, clear);
@@ -401,23 +404,9 @@ export class AudioDeviceController {
   }
 
   #selectOutputFallback(expectedId, missingEpoch) {
-    if (
-      this.outputFallback?.expectedId === expectedId &&
-      this.outputFallback.missingEpoch === missingEpoch
-    ) {
-      return this.outputFallback.promise;
-    }
-    const fallback = { expectedId };
-    const promise = this.#enqueueOutput("", fallback);
-    const pending = { expectedId, missingEpoch, promise };
-    this.outputFallback = pending;
-    const clear = () => {
-      if (this.outputFallback === pending) {
-        this.outputFallback = null;
-      }
-    };
-    promise.then(clear, clear);
-    return promise;
+    return this.#selectFallback("outputFallback", expectedId, missingEpoch, (fallback) =>
+      this.#enqueueOutput("", fallback),
+    );
   }
 
   async #enqueueOutput(deviceId, fallback = null, pendingSelection = null) {

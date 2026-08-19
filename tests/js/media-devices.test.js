@@ -160,6 +160,18 @@ function options(select) {
   return [...select.options].map((option) => [option.value, option.textContent]);
 }
 
+function setCurrentInput(setup, deviceId) {
+  setup.controller.inputId = deviceId;
+  setup.inputSelect.value = deviceId;
+  setup.storage.setItem("moco.audio.inputDeviceId", deviceId);
+}
+
+function setCurrentOutput(setup, deviceId) {
+  setup.controller.outputId = deviceId;
+  setup.outputSelect.value = deviceId;
+  setup.storage.setItem("moco.audio.outputDeviceId", deviceId);
+}
+
 describe("AudioDeviceController", () => {
   it("atomically switches to an explicit microphone while preserving MIC ON", async () => {
     const events = [];
@@ -319,9 +331,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(new Error("private device detail"));
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     const switched = await setup.controller.selectInput("mic-2");
 
@@ -360,9 +370,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(nextStream);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     const switched = await setup.controller.selectInput("mic-2");
 
@@ -446,9 +454,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(pending.promise);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     const switching = setup.controller.selectInput("mic-2");
     await new Promise((resolve) => setImmediate(resolve));
@@ -511,9 +517,7 @@ describe("AudioDeviceController", () => {
       devices: [{ kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" }],
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-2";
-    setup.outputSelect.value = "speaker-2";
-    setup.storage.setItem("moco.audio.outputDeviceId", "speaker-2");
+    setCurrentOutput(setup, "speaker-2");
 
     const switched = await setup.controller.selectOutput("");
 
@@ -542,9 +546,7 @@ describe("AudioDeviceController", () => {
       onError: (code) => errors.push(code),
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    setup.storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
 
     const switched = await setup.controller.selectOutput("speaker-2");
 
@@ -983,9 +985,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(directAcquisition.promise);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     const switching = setup.controller.selectInput("mic-2");
     await new Promise((resolve) => setImmediate(resolve));
@@ -1028,9 +1028,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(fallbackAcquisition.promise);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1071,9 +1069,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(fallbackAcquisition.promise);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     endedTrack.readyState = "ended";
     setup.mediaDevices.devices = [];
 
@@ -1118,9 +1114,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(createStream([candidateTrack]));
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1164,9 +1158,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(candidateStream);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     endedTrack.readyState = "ended";
     setup.mediaDevices.devices = [];
 
@@ -1206,9 +1198,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(candidateStream);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     endedTrack.readyState = "ended";
 
     assert.equal(await setup.controller.selectInput("mic-1"), true);
@@ -1253,9 +1243,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(candidateStream);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1296,9 +1284,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
 
     const switching = setup.controller.selectOutput("speaker-2");
     await new Promise((resolve) => setImmediate(resolve));
@@ -1337,9 +1323,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1381,9 +1365,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1421,9 +1403,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(new Error("default input unavailable"));
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     assert.equal(await setup.controller.refresh(), true);
@@ -1457,9 +1437,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
     setup.mediaDevices.devices = [];
 
     assert.equal(await setup.controller.refresh(), true);
@@ -1499,9 +1477,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(createStream([candidateTrack]));
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1545,9 +1521,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1590,9 +1564,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(acquisition.promise);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1625,9 +1597,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
     setup.mediaDevices.devices = [];
 
     const missingRefresh = setup.controller.refresh();
@@ -1671,9 +1641,7 @@ describe("AudioDeviceController", () => {
       new Error("default input unavailable"),
     );
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     const switching = setup.controller.selectInput("mic-2");
     await new Promise((resolve) => setImmediate(resolve));
@@ -1719,9 +1687,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
 
     const switching = setup.controller.selectOutput("speaker-2");
     await new Promise((resolve) => setImmediate(resolve));
@@ -2395,9 +2361,7 @@ describe("AudioDeviceController", () => {
     });
     setup.mediaDevices.getUserMediaResults.push(firstDefaultStream, secondDefaultStream);
     await setup.controller.start();
-    setup.controller.inputId = "mic-1";
-    setup.inputSelect.value = "mic-1";
-    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    setCurrentInput(setup, "mic-1");
 
     setup.mediaDevices.devices = [];
     const firstMissing = setup.controller.refresh();
@@ -2448,9 +2412,7 @@ describe("AudioDeviceController", () => {
       storage,
     });
     await setup.controller.start();
-    setup.controller.outputId = "speaker-1";
-    setup.outputSelect.value = "speaker-1";
-    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+    setCurrentOutput(setup, "speaker-1");
 
     setup.mediaDevices.devices = [];
     const firstMissing = setup.controller.refresh();
