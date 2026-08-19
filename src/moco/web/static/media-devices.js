@@ -67,6 +67,7 @@ export class AudioDeviceController {
     this.inputQueue = Promise.resolve();
     this.outputQueue = Promise.resolve();
     this.refreshGeneration = 0;
+    this.catalogGeneration = 0;
     this.switchGeneration = 0;
     this.handleDeviceChange = () => {
       void this.refresh();
@@ -104,6 +105,7 @@ export class AudioDeviceController {
     }
 
     this.devices = devices;
+    this.catalogGeneration += 1;
     this.hasSuccessfulCatalog = true;
     this.#renderCatalog();
     if (this.started && !this.restorationStarted) {
@@ -125,14 +127,14 @@ export class AudioDeviceController {
     );
     const fallbacks = [];
     if (this.inputId && !inputIds.has(this.inputId)) {
-      fallbacks.push(this.#selectInputFallback(this.inputId, generation));
+      fallbacks.push(this.#selectInputFallback(this.inputId, this.catalogGeneration));
     }
     if (
       this.outputId &&
       typeof this.context.setSinkId === "function" &&
       !outputIds.has(this.outputId)
     ) {
-      fallbacks.push(this.#selectOutputFallback(this.outputId, generation));
+      fallbacks.push(this.#selectOutputFallback(this.outputId, this.catalogGeneration));
     }
     await Promise.all(fallbacks);
     return true;
@@ -202,20 +204,27 @@ export class AudioDeviceController {
   }
 
   async selectInput(deviceId) {
-    return await this.#enqueueInput(deviceId);
+    const pendingSelection = this.#capturePendingSelection(
+      this.inputSelect,
+      deviceId,
+      "選択中のマイク",
+    );
+    return await this.#enqueueInput(deviceId, null, pendingSelection);
   }
 
-  async #selectInputFallback(expectedId, refreshGeneration) {
-    return await this.#enqueueInput("", { expectedId, refreshGeneration });
+  async #selectInputFallback(expectedId, catalogGeneration) {
+    return await this.#enqueueInput("", { catalogGeneration, expectedId });
   }
 
-  async #enqueueInput(deviceId, fallback = null) {
+  async #enqueueInput(deviceId, fallback = null, pendingSelection = null) {
     if (this.closed) {
       return false;
     }
     this.inputPending += 1;
     this.#renderSelectionAndAvailability();
-    const operation = this.inputQueue.then(() => this.#switchInput(deviceId, fallback));
+    const operation = this.inputQueue.then(() =>
+      this.#switchInput(deviceId, fallback, pendingSelection),
+    );
     this.inputQueue = operation.catch(() => false);
     try {
       return await operation;
@@ -225,7 +234,7 @@ export class AudioDeviceController {
     }
   }
 
-  async #switchInput(deviceId, fallback) {
+  async #switchInput(deviceId, fallback, pendingSelection) {
     fallback = this.#prepareFallback(fallback, "audioinput", this.inputId);
     if (this.closed || deviceId === this.inputId || fallback === false) {
       return false;
@@ -265,6 +274,10 @@ export class AudioDeviceController {
       }
       if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
         const rolledBack = await this.#rollbackInputFallback(sender, currentTrack);
+        if (this.closed || generation !== this.switchGeneration) {
+          this.#stopStream(candidate);
+          return false;
+        }
         if (!rolledBack) {
           this.replaceCurrentStream(candidate);
           this.#stopStream(current);
@@ -279,6 +292,9 @@ export class AudioDeviceController {
       this.replaceCurrentStream(candidate);
       this.#stopStream(current);
       this.inputId = deviceId;
+      if (pendingSelection?.deviceId === deviceId) {
+        this.retainedInput = pendingSelection;
+      }
       this.#storeDeviceId(INPUT_STORAGE_KEY, deviceId);
       return true;
     } catch {
@@ -295,20 +311,27 @@ export class AudioDeviceController {
   }
 
   async selectOutput(deviceId) {
-    return await this.#enqueueOutput(deviceId);
+    const pendingSelection = this.#capturePendingSelection(
+      this.outputSelect,
+      deviceId,
+      "選択中の出力",
+    );
+    return await this.#enqueueOutput(deviceId, null, pendingSelection);
   }
 
-  async #selectOutputFallback(expectedId, refreshGeneration) {
-    return await this.#enqueueOutput("", { expectedId, refreshGeneration });
+  async #selectOutputFallback(expectedId, catalogGeneration) {
+    return await this.#enqueueOutput("", { catalogGeneration, expectedId });
   }
 
-  async #enqueueOutput(deviceId, fallback = null) {
+  async #enqueueOutput(deviceId, fallback = null, pendingSelection = null) {
     if (this.closed || typeof this.context.setSinkId !== "function") {
       return false;
     }
     this.outputPending += 1;
     this.#renderSelectionAndAvailability();
-    const operation = this.outputQueue.then(() => this.#switchOutput(deviceId, fallback));
+    const operation = this.outputQueue.then(() =>
+      this.#switchOutput(deviceId, fallback, pendingSelection),
+    );
     this.outputQueue = operation.catch(() => false);
     try {
       return await operation;
@@ -318,7 +341,7 @@ export class AudioDeviceController {
     }
   }
 
-  async #switchOutput(deviceId, fallback) {
+  async #switchOutput(deviceId, fallback, pendingSelection) {
     fallback = this.#prepareFallback(fallback, "audiooutput", this.outputId);
     if (this.closed || deviceId === this.outputId || fallback === false) {
       return false;
@@ -335,6 +358,9 @@ export class AudioDeviceController {
       }
       if (!this.#fallbackIsCurrent(fallback, "audiooutput", this.outputId)) {
         const rolledBack = await this.#rollbackOutputFallback(previousId);
+        if (this.closed || generation !== this.switchGeneration) {
+          return false;
+        }
         if (!rolledBack) {
           this.outputId = "";
           this.#storeDeviceId(OUTPUT_STORAGE_KEY, "");
@@ -343,6 +369,9 @@ export class AudioDeviceController {
         return false;
       }
       this.outputId = deviceId;
+      if (pendingSelection?.deviceId === deviceId) {
+        this.retainedOutput = pendingSelection;
+      }
       this.#storeDeviceId(OUTPUT_STORAGE_KEY, deviceId);
       return true;
     } catch {
@@ -404,13 +433,21 @@ export class AudioDeviceController {
     }
   }
 
+  #capturePendingSelection(select, deviceId, fallbackLabel) {
+    if (!deviceId) {
+      return null;
+    }
+    const option = [...select.options].find((candidate) => candidate.value === deviceId);
+    return { deviceId, label: option?.textContent || fallbackLabel };
+  }
+
   #fallbackIsCurrent(fallback, kind, currentId) {
     if (!fallback) {
       return true;
     }
     return (
       !this.closed &&
-      fallback.refreshGeneration === this.refreshGeneration &&
+      fallback.catalogGeneration === this.catalogGeneration &&
       fallback.expectedId === currentId &&
       !candidates(this.devices, kind).some((device) => device.deviceId === fallback.expectedId)
     );
@@ -422,7 +459,7 @@ export class AudioDeviceController {
     }
     if (
       this.closed ||
-      fallback.refreshGeneration !== this.refreshGeneration ||
+      fallback.catalogGeneration !== this.catalogGeneration ||
       !currentId ||
       candidates(this.devices, kind).some((device) => device.deviceId === currentId)
     ) {
