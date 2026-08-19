@@ -1,4 +1,5 @@
 import { ActivityBuffer, ActivityView, ProgressTracker, ProgressView } from "./activity.js";
+import { AudioDeviceController } from "./media-devices.js";
 import {
   EDITABLE_TOKENS,
   isEditableTarget,
@@ -50,6 +51,8 @@ const ERROR_COPY = Object.freeze({
   microphone_permission_denied: "マイクの使用が許可されませんでした",
   microphone_unavailable: "利用可能なマイクが見つかりませんでした",
   microphone_failed: "マイクを開始できませんでした",
+  microphone_switch_failed: "入力マイクを切り替えられませんでした",
+  audio_output_switch_failed: "音声出力先を切り替えられませんでした",
   synthesis_failed: "音声生成中に予期しないエラーが発生しました",
   pairing_failed: "スマートフォン接続用QRを取得できませんでした",
   enable_failed: "音声セッションを開始できませんでした",
@@ -453,7 +456,7 @@ export class MocoController {
 
   async applyControl(control) {
     const epoch = ++this.controlEpoch;
-    const track = this.stream.getAudioTracks()[0];
+    let track = this.stream.getAudioTracks()[0];
     if (!track) {
       return false;
     }
@@ -476,6 +479,10 @@ export class MocoController {
         this.idleExpired = false;
         this.reconnectRequired = false;
         if (epoch !== this.controlEpoch) {
+          return false;
+        }
+        track = this.stream.getAudioTracks()[0];
+        if (!track) {
           return false;
         }
       }
@@ -798,7 +805,15 @@ export async function closeAudioContext(context) {
   }
 }
 
-export async function closeDisconnectedMedia({ context, controller, controls, peer, stream }) {
+export async function closeDisconnectedMedia({
+  context,
+  controller,
+  controls,
+  deviceController,
+  peer,
+  stream,
+}) {
+  deviceController?.close();
   for (const control of controls) {
     control.disabled = true;
   }
@@ -1092,6 +1107,8 @@ function boot() {
     listenStop: document.querySelector("#listen-stop"),
     turnCancel: document.querySelector("#turn-cancel"),
     stopKey: document.querySelector("#stop-key"),
+    audioInput: document.querySelector("#audio-input"),
+    audioOutput: document.querySelector("#audio-output"),
     voice: document.querySelector("#voice"),
     error: document.querySelector("#error"),
     errorText: document.querySelector("#error-text"),
@@ -1171,6 +1188,7 @@ function boot() {
   let stream;
   let context;
   let controller;
+  let deviceController;
   let openPromise;
   let progressTimer;
   let conversationHandshake;
@@ -1229,12 +1247,21 @@ function boot() {
       const disconnectedMedia = {
         context,
         controller,
-        controls: [dom.listenStart, dom.listenStop, dom.turnCancel, dom.voice],
+        controls: [
+          dom.listenStart,
+          dom.listenStop,
+          dom.turnCancel,
+          dom.audioInput,
+          dom.audioOutput,
+          dom.voice,
+        ],
+        deviceController,
         peer,
         stream,
       };
       context = undefined;
       controller = undefined;
+      deviceController = undefined;
       peer = undefined;
       stream = undefined;
       void closeDisconnectedMedia(disconnectedMedia);
@@ -1473,13 +1500,37 @@ function boot() {
         reconnect: connectConversation,
       });
       await connectConversation();
+      const connectedSocket = socket;
+      const nextDeviceController = new AudioDeviceController({
+        inputSelect: dom.audioInput,
+        outputSelect: dom.audioOutput,
+        context,
+        mediaDevices: navigator.mediaDevices,
+        storage: window.localStorage,
+        getCurrentStream: () => stream,
+        getAudioSender: () => peer?.getSenders().find((sender) => sender.track?.kind === "audio"),
+        replaceCurrentStream: (nextStream) => {
+          stream = nextStream;
+          controller.stream = nextStream;
+        },
+        onError: (code) => operatorStatus.showError(code),
+      });
+      deviceController = nextDeviceController;
+      await nextDeviceController.start();
+      if (socket !== connectedSocket || deviceController !== nextDeviceController) {
+        return;
+      }
       dom.listenStart.disabled = false;
       dom.listenStop.disabled = false;
       setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "connected");
     } catch (error) {
       stopPeerWatch?.();
       stopPeerWatch = undefined;
+      deviceController?.close();
+      deviceController = undefined;
       peer?.close();
+      dom.audioInput.disabled = true;
+      dom.audioOutput.disabled = true;
       ({ openPromise, progressTimer } = resetConnectionAttempt(progressTimer));
       const failedSocket = socket;
       socket = undefined;
@@ -1559,6 +1610,12 @@ function boot() {
   dom.listenStop.addEventListener("click", () => void apply("listen_stop"));
   dom.voice.addEventListener("change", () => {
     voiceModels.select(dom.voice.value);
+  });
+  dom.audioInput.addEventListener("change", () => {
+    void deviceController?.selectInput(dom.audioInput.value);
+  });
+  dom.audioOutput.addEventListener("change", () => {
+    void deviceController?.selectOutput(dom.audioOutput.value);
   });
   dom.clear.addEventListener("click", () => transcript.clear());
   dom.errorClose.addEventListener("click", () => operatorStatus.dismissError());

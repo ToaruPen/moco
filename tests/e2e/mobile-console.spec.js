@@ -4,6 +4,8 @@ test("mobile console has no horizontal overflow and exposes touch controls", asy
   await page.goto("/");
   await expect(page.getByRole("button", { name: "音声入力を開始" })).toBeVisible();
   await expect(page.getByRole("button", { name: "音声入力を停止" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "入力マイク" })).toBeVisible();
+  await expect(page.getByRole("combobox", { name: "音声出力先" })).toBeVisible();
   await expect(page.locator(".keycap").first()).toBeHidden();
 
   const metrics = await page.evaluate(() => ({
