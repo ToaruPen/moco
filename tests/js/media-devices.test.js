@@ -14,6 +14,8 @@ class FakeMediaDevices extends EventTarget {
     this.deviceChangeRemoves = 0;
     this.enumerationError = null;
     this.enumerationResults = [];
+    this.getUserMediaCalls = [];
+    this.getUserMediaResults = [];
   }
 
   async enumerateDevices() {
@@ -25,6 +27,15 @@ class FakeMediaDevices extends EventTarget {
       return this.enumerationResults.shift();
     }
     return this.devices;
+  }
+
+  async getUserMedia(constraints) {
+    this.getUserMediaCalls.push(constraints);
+    const result = this.getUserMediaResults.shift();
+    if (result instanceof Error) {
+      throw result;
+    }
+    return await result;
   }
 
   addEventListener(type, listener, options) {
@@ -44,13 +55,65 @@ class FakeMediaDevices extends EventTarget {
 
 function deferred() {
   let resolve;
-  const promise = new Promise((resolvePromise) => {
+  let reject;
+  const promise = new Promise((resolvePromise, rejectPromise) => {
     resolve = resolvePromise;
+    reject = rejectPromise;
   });
-  return { promise, resolve };
+  return { promise, reject, resolve };
 }
 
-function createController({ devices = [], context = {} } = {}) {
+function createTrack({ enabled = true, events, name = "track" } = {}) {
+  return {
+    enabled,
+    stopCalls: 0,
+    stop() {
+      this.stopCalls += 1;
+      events?.push(`stop:${name}`);
+    },
+  };
+}
+
+function createStream(audioTracks = [], tracks = audioTracks) {
+  return {
+    getAudioTracks: () => audioTracks,
+    getTracks: () => tracks,
+  };
+}
+
+class FakeStorage {
+  constructor(entries = {}) {
+    this.items = new Map(Object.entries(entries));
+    this.getCalls = [];
+    this.setCalls = [];
+    this.removeCalls = [];
+  }
+
+  getItem(key) {
+    this.getCalls.push(key);
+    return this.items.get(key) ?? null;
+  }
+
+  setItem(key, value) {
+    this.setCalls.push([key, value]);
+    this.items.set(key, value);
+  }
+
+  removeItem(key) {
+    this.removeCalls.push(key);
+    this.items.delete(key);
+  }
+}
+
+function createController({
+  context = {},
+  currentStream,
+  devices = [],
+  onError,
+  onReplaceCurrentStream,
+  sender,
+  storage = new FakeStorage(),
+} = {}) {
   const dom = new JSDOM(`
     <select id="audio-input" disabled></select>
     <select id="audio-output" disabled></select>
@@ -59,15 +122,34 @@ function createController({ devices = [], context = {} } = {}) {
   const mediaDevices = new FakeMediaDevices(devices);
   const inputSelect = document.querySelector("#audio-input");
   const outputSelect = document.querySelector("#audio-output");
+  let ownedStream = currentStream;
+  const streamReplacements = [];
   const controller = new AudioDeviceController({
     inputSelect,
     outputSelect,
     context,
     mediaDevices,
+    storage,
+    getCurrentStream: () => ownedStream,
+    getAudioSender: () => sender,
+    replaceCurrentStream: (nextStream) => {
+      streamReplacements.push(nextStream);
+      ownedStream = nextStream;
+      onReplaceCurrentStream?.(nextStream);
+    },
+    onError,
     createOption: (label, value) => new dom.window.Option(label, value),
   });
 
-  return { controller, inputSelect, mediaDevices, outputSelect };
+  return {
+    controller,
+    currentStream: () => ownedStream,
+    inputSelect,
+    mediaDevices,
+    outputSelect,
+    storage,
+    streamReplacements,
+  };
 }
 
 function options(select) {
@@ -75,6 +157,852 @@ function options(select) {
 }
 
 describe("AudioDeviceController", () => {
+  it("atomically switches to an explicit microphone while preserving MIC ON", async () => {
+    const events = [];
+    const oldTrack = createTrack({ enabled: true, events, name: "old" });
+    const nextTrack = createTrack({ enabled: false, events, name: "next" });
+    const oldStream = createStream([oldTrack]);
+    const nextStream = createStream([nextTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        events.push("replaceTrack");
+      },
+    };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      ],
+      onReplaceCurrentStream: () => events.push("replaceCurrentStream"),
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+    await setup.controller.start();
+
+    const switched = await setup.controller.selectInput("mic-2");
+
+    assert.equal(switched, true);
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-2" } } },
+    ]);
+    assert.equal(nextTrack.enabled, true);
+    assert.deepEqual(sender.replacements, [nextTrack]);
+    assert.deepEqual(setup.streamReplacements, [nextStream]);
+    assert.equal(setup.currentStream(), nextStream);
+    assert.equal(oldTrack.stopCalls, 1);
+    assert.deepEqual(events, ["replaceTrack", "replaceCurrentStream", "stop:old"]);
+    assert.equal(setup.inputSelect.value, "mic-2");
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), "mic-2");
+  });
+
+  it("preserves MIC OFF when switching microphones", async () => {
+    const oldTrack = createTrack({ enabled: false });
+    const nextTrack = createTrack({ enabled: true });
+    const oldStream = createStream([oldTrack]);
+    const nextStream = createStream([nextTrack]);
+    const sender = { async replaceTrack() {} };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+    await setup.controller.start();
+
+    await setup.controller.selectInput("mic-2");
+
+    assert.equal(nextTrack.enabled, false);
+  });
+
+  it("switches input to the system default and removes its stored selection", async () => {
+    const oldTrack = createTrack();
+    const defaultTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      sender,
+      storage,
+    });
+    setup.controller.inputId = "mic-2";
+    setup.mediaDevices.getUserMediaResults.push(createStream([defaultTrack]));
+    await setup.controller.start();
+    storage.setItem("moco.audio.inputDeviceId", "mic-2");
+
+    const switched = await setup.controller.selectInput("");
+
+    assert.equal(switched, true);
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [{ audio: true }]);
+    assert.deepEqual(sender.replacements, [defaultTrack]);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
+  it("serializes rapid microphone switches and keeps input disabled until both finish", async () => {
+    const first = deferred();
+    const second = deferred();
+    const oldTrack = createTrack();
+    const secondTrack = createTrack();
+    const thirdTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+        { kind: "audioinput", deviceId: "mic-3", label: "Microphone 3" },
+      ],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(first.promise, second.promise);
+    await setup.controller.start();
+
+    const switchingToSecond = setup.controller.selectInput("mic-2");
+    const switchingToThird = setup.controller.selectInput("mic-3");
+
+    assert.equal(setup.inputSelect.disabled, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(setup.mediaDevices.getUserMediaCalls.length, 1);
+    first.resolve(createStream([secondTrack]));
+    assert.equal(await switchingToSecond, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(setup.inputSelect.disabled, true);
+    assert.equal(setup.mediaDevices.getUserMediaCalls.length, 2);
+    second.resolve(createStream([thirdTrack]));
+    assert.equal(await switchingToThird, true);
+
+    assert.equal(setup.inputSelect.disabled, false);
+    assert.deepEqual(sender.replacements, [secondTrack, thirdTrack]);
+    assert.equal(setup.currentStream().getAudioTracks()[0], thirdTrack);
+    assert.equal(setup.controller.inputId, "mic-3");
+    assert.equal(setup.inputSelect.value, "mic-3");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), "mic-3");
+  });
+
+  it("keeps the current input route when microphone acquisition fails", async () => {
+    const errors = [];
+    const oldTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      ],
+      onError: (code) => errors.push(code),
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(new Error("private device detail"));
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+
+    const switched = await setup.controller.selectInput("mic-2");
+
+    assert.equal(switched, false);
+    assert.equal(setup.currentStream(), oldStream);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.deepEqual(sender.replacements, []);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "mic-1");
+    assert.equal(setup.inputSelect.value, "mic-1");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), "mic-1");
+    assert.deepEqual(errors, ["microphone_switch_failed"]);
+  });
+
+  it("stops only the candidate and rolls back display and storage when replaceTrack fails", async () => {
+    const errors = [];
+    const oldTrack = createTrack();
+    const nextTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const nextStream = createStream([nextTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        throw new Error("private peer detail");
+      },
+    };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      ],
+      onError: (code) => errors.push(code),
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+
+    const switched = await setup.controller.selectInput("mic-2");
+
+    assert.equal(switched, false);
+    assert.deepEqual(sender.replacements, [nextTrack]);
+    assert.equal(nextTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.equal(setup.currentStream(), oldStream);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "mic-1");
+    assert.equal(setup.inputSelect.value, "mic-1");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), "mic-1");
+    assert.deepEqual(errors, ["microphone_switch_failed"]);
+  });
+
+  it("safely rejects input switches with a missing candidate track, current track, or sender", async (t) => {
+    const cases = [
+      {
+        name: "candidate audio track",
+        candidate: createStream([], [createTrack()]),
+        current: createStream([createTrack()]),
+        sender: { async replaceTrack() {} },
+      },
+      {
+        name: "current audio track",
+        candidate: createStream([createTrack()]),
+        current: createStream([], [createTrack()]),
+        sender: { async replaceTrack() {} },
+      },
+      {
+        name: "audio sender",
+        candidate: createStream([createTrack()]),
+        current: createStream([createTrack()]),
+        sender: undefined,
+      },
+    ];
+
+    for (const testCase of cases) {
+      await t.test(testCase.name, async () => {
+        const errors = [];
+        const setup = createController({
+          currentStream: testCase.current,
+          devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+          onError: (code) => errors.push(code),
+          sender: testCase.sender,
+        });
+        setup.mediaDevices.getUserMediaResults.push(testCase.candidate);
+        await setup.controller.start();
+
+        const switched = await setup.controller.selectInput("mic-2");
+
+        assert.equal(switched, false);
+        assert.equal(setup.currentStream(), testCase.current);
+        assert.deepEqual(setup.streamReplacements, []);
+        assert.ok(testCase.candidate.getTracks().every((track) => track.stopCalls === 1));
+        assert.deepEqual(errors, ["microphone_switch_failed"]);
+      });
+    }
+  });
+
+  it("cancels a pending input switch without an error when closed", async () => {
+    const pending = deferred();
+    const errors = [];
+    const oldTrack = createTrack();
+    const nextTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      ],
+      onError: (code) => errors.push(code),
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(pending.promise);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    setup.storage.setItem("moco.audio.inputDeviceId", "mic-1");
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    setup.controller.close();
+    pending.resolve(createStream([nextTrack]));
+
+    assert.equal(await switching, false);
+    assert.equal(nextTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.deepEqual(sender.replacements, []);
+    assert.equal(setup.currentStream(), oldStream);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "mic-1");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), "mic-1");
+    assert.deepEqual(errors, []);
+    assert.equal(setup.inputSelect.disabled, true);
+    assert.equal(setup.outputSelect.disabled, true);
+  });
+
+  it("switches output only after setSinkId succeeds and disables only output while pending", async () => {
+    const pending = deferred();
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+        await pending.promise;
+      },
+    };
+    const setup = createController({
+      context,
+      devices: [{ kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" }],
+    });
+    await setup.controller.start();
+
+    const switching = setup.controller.selectOutput("speaker-2");
+    assert.equal(setup.inputSelect.disabled, false);
+    assert.equal(setup.outputSelect.disabled, true);
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), null);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(context.calls, ["speaker-2"]);
+    pending.resolve();
+
+    assert.equal(await switching, true);
+    assert.equal(setup.controller.outputId, "speaker-2");
+    assert.equal(setup.outputSelect.value, "speaker-2");
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), "speaker-2");
+    assert.equal(setup.outputSelect.disabled, false);
+  });
+
+  it("switches output to the system default and removes its stored selection", async () => {
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const setup = createController({
+      context,
+      devices: [{ kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" }],
+    });
+    await setup.controller.start();
+    setup.controller.outputId = "speaker-2";
+    setup.outputSelect.value = "speaker-2";
+    setup.storage.setItem("moco.audio.outputDeviceId", "speaker-2");
+
+    const switched = await setup.controller.selectOutput("");
+
+    assert.equal(switched, true);
+    assert.deepEqual(context.calls, [""]);
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.outputSelect.value, "");
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), null);
+  });
+
+  it("keeps the current output route when setSinkId fails", async () => {
+    const errors = [];
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+        throw new Error("private sink detail");
+      },
+    };
+    const setup = createController({
+      context,
+      devices: [
+        { kind: "audiooutput", deviceId: "speaker-1", label: "Speaker 1" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      onError: (code) => errors.push(code),
+    });
+    await setup.controller.start();
+    setup.controller.outputId = "speaker-1";
+    setup.outputSelect.value = "speaker-1";
+    setup.storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+
+    const switched = await setup.controller.selectOutput("speaker-2");
+
+    assert.equal(switched, false);
+    assert.deepEqual(context.calls, ["speaker-2"]);
+    assert.equal(setup.controller.outputId, "speaker-1");
+    assert.equal(setup.outputSelect.value, "speaker-1");
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), "speaker-1");
+    assert.deepEqual(errors, ["audio_output_switch_failed"]);
+  });
+
+  it("returns false without an error when output selection is unsupported", async () => {
+    const errors = [];
+    const setup = createController({ onError: (code) => errors.push(code) });
+    await setup.controller.start();
+
+    const switched = await setup.controller.selectOutput("speaker-2");
+
+    assert.equal(switched, false);
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.outputSelect.disabled, true);
+    assert.deepEqual(errors, []);
+  });
+
+  it("serializes rapid output switches without blocking input", async () => {
+    const first = deferred();
+    const second = deferred();
+    const context = {
+      calls: [],
+      results: [first.promise, second.promise],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+        await this.results.shift();
+      },
+    };
+    const setup = createController({
+      context,
+      devices: [
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+        { kind: "audiooutput", deviceId: "speaker-3", label: "Speaker 3" },
+      ],
+    });
+    await setup.controller.start();
+
+    const switchingToSecond = setup.controller.selectOutput("speaker-2");
+    const switchingToThird = setup.controller.selectOutput("speaker-3");
+    assert.equal(setup.inputSelect.disabled, false);
+    assert.equal(setup.outputSelect.disabled, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(context.calls, ["speaker-2"]);
+    first.resolve();
+    assert.equal(await switchingToSecond, true);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(context.calls, ["speaker-2", "speaker-3"]);
+    assert.equal(setup.outputSelect.disabled, true);
+    second.resolve();
+
+    assert.equal(await switchingToThird, true);
+    assert.equal(setup.outputSelect.disabled, false);
+    assert.equal(setup.controller.outputId, "speaker-3");
+    assert.equal(setup.outputSelect.value, "speaker-3");
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), "speaker-3");
+  });
+
+  it("restores available stored input and output IDs through the live routes", async () => {
+    const oldTrack = createTrack({ enabled: false });
+    const nextTrack = createTrack({ enabled: true });
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const storage = new FakeStorage({
+      "moco.audio.inputDeviceId": "mic-2",
+      "moco.audio.outputDeviceId": "speaker-2",
+    });
+    const setup = createController({
+      context,
+      currentStream: createStream([oldTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      sender,
+      storage,
+    });
+    const nextStream = createStream([nextTrack]);
+    setup.mediaDevices.getUserMediaResults.push(nextStream);
+
+    await setup.controller.start();
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-2" } } },
+    ]);
+    assert.equal(nextTrack.enabled, false);
+    assert.deepEqual(sender.replacements, [nextTrack]);
+    assert.equal(setup.currentStream(), nextStream);
+    assert.deepEqual(context.calls, ["speaker-2"]);
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.controller.outputId, "speaker-2");
+    assert.equal(setup.inputSelect.value, "mic-2");
+    assert.equal(setup.outputSelect.value, "speaker-2");
+  });
+
+  it("removes missing stored IDs and ignores saved output when selection is unsupported", async () => {
+    const storage = new FakeStorage({
+      "moco.audio.inputDeviceId": "missing-mic",
+      "moco.audio.outputDeviceId": "speaker-2",
+    });
+    const setup = createController({
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      storage,
+    });
+
+    await setup.controller.start();
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, []);
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.equal(storage.getItem("moco.audio.outputDeviceId"), null);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(setup.outputSelect.value, "");
+    assert.equal(setup.outputSelect.disabled, true);
+  });
+
+  it("keeps successful live routes when every storage operation throws", async () => {
+    const storage = {
+      getItem() {
+        throw new Error("storage read denied");
+      },
+      setItem() {
+        throw new Error("storage write denied");
+      },
+      removeItem() {
+        throw new Error("storage remove denied");
+      },
+    };
+    const firstTrack = createTrack();
+    const secondTrack = createTrack();
+    const thirdTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const setup = createController({
+      context,
+      currentStream: createStream([firstTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      sender,
+      storage,
+    });
+    const secondStream = createStream([secondTrack]);
+    const thirdStream = createStream([thirdTrack]);
+    setup.mediaDevices.getUserMediaResults.push(secondStream, thirdStream);
+
+    await assert.doesNotReject(setup.controller.start());
+    assert.equal(await setup.controller.selectInput("mic-2"), true);
+    assert.equal(await setup.controller.selectOutput("speaker-2"), true);
+    assert.equal(await setup.controller.selectInput(""), true);
+    assert.equal(await setup.controller.selectOutput(""), true);
+
+    assert.equal(setup.currentStream(), thirdStream);
+    assert.deepEqual(sender.replacements, [secondTrack, thirdTrack]);
+    assert.deepEqual(context.calls, ["speaker-2", ""]);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(setup.outputSelect.value, "");
+  });
+
+  it("falls back both disconnected selected devices through their normal live routes", async () => {
+    const oldTrack = createTrack();
+    const selectedTrack = createTrack();
+    const defaultTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const setup = createController({
+      context,
+      currentStream: createStream([oldTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(
+      createStream([selectedTrack]),
+      createStream([defaultTrack]),
+    );
+    await setup.controller.start();
+    await setup.controller.selectInput("mic-2");
+    await setup.controller.selectOutput("speaker-2");
+    setup.mediaDevices.getUserMediaCalls.length = 0;
+    sender.replacements.length = 0;
+    context.calls.length = 0;
+    setup.mediaDevices.devices = [];
+
+    await setup.controller.refresh();
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [{ audio: true }]);
+    assert.deepEqual(sender.replacements, [defaultTrack]);
+    assert.deepEqual(context.calls, [""]);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(setup.outputSelect.value, "");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.equal(setup.storage.getItem("moco.audio.outputDeviceId"), null);
+  });
+
+  it("does not reroute selected devices that remain in the refreshed catalog", async () => {
+    const track = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(nextTrack) {
+        this.replacements.push(nextTrack);
+      },
+    };
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const devices = [
+      { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+    ];
+    const setup = createController({
+      context,
+      currentStream: createStream([track]),
+      devices,
+      sender,
+    });
+    await setup.controller.start();
+    setup.controller.inputId = "mic-2";
+    setup.controller.outputId = "speaker-2";
+    setup.inputSelect.value = "mic-2";
+    setup.outputSelect.value = "speaker-2";
+
+    await setup.controller.refresh();
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, []);
+    assert.deepEqual(sender.replacements, []);
+    assert.deepEqual(context.calls, []);
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.controller.outputId, "speaker-2");
+  });
+
+  it("keeps the last successful catalog and route when enumeration later fails", async () => {
+    const oldTrack = createTrack();
+    const nextTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const context = {
+      calls: [],
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+      },
+    };
+    const setup = createController({
+      context,
+      currentStream: createStream([oldTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+        { kind: "audiooutput", deviceId: "speaker-2", label: "Speaker 2" },
+      ],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(createStream([nextTrack]));
+    await setup.controller.start();
+    await setup.controller.selectInput("mic-2");
+    await setup.controller.selectOutput("speaker-2");
+    setup.mediaDevices.getUserMediaCalls.length = 0;
+    sender.replacements.length = 0;
+    context.calls.length = 0;
+    setup.mediaDevices.enumerationError = new Error("transient enumeration failure");
+
+    assert.equal(await setup.controller.refresh(), false);
+
+    assert.deepEqual(options(setup.inputSelect), [
+      ["", "システム既定"],
+      ["mic-2", "Microphone 2"],
+    ]);
+    assert.deepEqual(options(setup.outputSelect), [
+      ["", "システム既定"],
+      ["speaker-2", "Speaker 2"],
+    ]);
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, []);
+    assert.deepEqual(sender.replacements, []);
+    assert.deepEqual(context.calls, []);
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.controller.outputId, "speaker-2");
+  });
+
+  it("never falls back from a stale enumeration that omitted the selected device", async () => {
+    const stale = deferred();
+    const latest = deferred();
+    const track = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(nextTrack) {
+        this.replacements.push(nextTrack);
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([track]),
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      sender,
+    });
+    await setup.controller.start();
+    setup.controller.inputId = "mic-2";
+    setup.inputSelect.value = "mic-2";
+    setup.mediaDevices.enumerationResults.push(stale.promise, latest.promise);
+
+    const staleRefresh = setup.controller.refresh();
+    const latestRefresh = setup.controller.refresh();
+    latest.resolve([{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }]);
+    assert.equal(await latestRefresh, true);
+    stale.resolve([]);
+    assert.equal(await staleRefresh, false);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, []);
+    assert.deepEqual(sender.replacements, []);
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.inputSelect.value, "mic-2");
+  });
+
+  it("rechecks the latest catalog after a stored input restoration finishes", async () => {
+    const initialCatalog = deferred();
+    const latestCatalog = deferred();
+    const savedAcquisition = deferred();
+    const oldTrack = createTrack();
+    const savedTrack = createTrack();
+    const defaultTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const storage = new FakeStorage({ "moco.audio.inputDeviceId": "mic-saved" });
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      sender,
+      storage,
+    });
+    setup.mediaDevices.enumerationResults.push(initialCatalog.promise, latestCatalog.promise);
+    setup.mediaDevices.getUserMediaResults.push(
+      savedAcquisition.promise,
+      createStream([defaultTrack]),
+    );
+
+    const starting = setup.controller.start();
+    initialCatalog.resolve([
+      { kind: "audioinput", deviceId: "mic-saved", label: "Saved microphone" },
+    ]);
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-saved" } } },
+    ]);
+
+    const latestRefresh = setup.controller.refresh();
+    latestCatalog.resolve([]);
+    await new Promise((resolve) => setImmediate(resolve));
+    savedAcquisition.resolve(createStream([savedTrack]));
+    await Promise.all([starting, latestRefresh]);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-saved" } } },
+      { audio: true },
+    ]);
+    assert.deepEqual(sender.replacements, [savedTrack, defaultTrack]);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
+  it("queues a disconnected-input fallback behind an active microphone switch", async () => {
+    const activeAcquisition = deferred();
+    const oldTrack = createTrack();
+    const selectedTrack = createTrack();
+    const defaultTrack = createTrack();
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const setup = createController({
+      currentStream: createStream([oldTrack]),
+      devices: [
+        { kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" },
+        { kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" },
+      ],
+      sender,
+    });
+    setup.mediaDevices.getUserMediaResults.push(
+      activeAcquisition.promise,
+      createStream([defaultTrack]),
+    );
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(setup.mediaDevices.getUserMediaCalls.length, 1);
+    setup.mediaDevices.devices = [];
+
+    const refreshing = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(setup.mediaDevices.getUserMediaCalls.length, 1);
+    activeAcquisition.resolve(createStream([selectedTrack]));
+    assert.equal(await switching, true);
+    assert.equal(await refreshing, true);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-2" } } },
+      { audio: true },
+    ]);
+    assert.deepEqual(sender.replacements, [selectedTrack, defaultTrack]);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
   it("renders unique real audio devices after the synthetic system defaults", async () => {
     const { controller, inputSelect, outputSelect } = createController({
       context: { setSinkId() {} },
