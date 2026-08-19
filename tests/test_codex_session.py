@@ -811,7 +811,11 @@ def test_built_in_prompt_defines_moco_frameless_and_irodori_contract() -> None:
 
 
 def test_packaged_prompt_example_matches_the_runtime_default() -> None:
-    example = Path("config/moco.prompt.example.md").read_text(encoding="utf-8").strip()
+    example = (
+        (Path(__file__).resolve().parents[1] / "config" / "moco.prompt.example.md")
+        .read_text(encoding="utf-8")
+        .strip()
+    )
 
     assert example == DEFAULT_REALTIME_PROMPT
 

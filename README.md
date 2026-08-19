@@ -179,7 +179,9 @@ Copy-Item config\moco.prompt.example.md "$env:APPDATA\moco\prompt.md"
 このファイルがなければ内蔵のmoco専用プロンプトを使います。`prompt`は公式Codex Realtime
 プロンプトへの追記ではなく全文置換です。編集時も、mocoの人格だけでなく、Frameless delegation、
 Codex結果の権威性、二重実行防止、Irodoriのplain speakable text契約を維持してください。
-Codex側の`experimental_realtime_ws_backend_prompt`が非空の場合はそちらが優先されます。
+Codex側の`experimental_realtime_ws_backend_prompt`が非空の場合、mocoのpromptを確実に適用できないため、
+会話開始を`codex_realtime: prompt_overridden`で拒否します。Codex設定からoverrideを削除するか空にして
+から再接続してください。値そのものは画面、ログ、telemetryへ出力しません。
 別のファイルを使う場合は、
 `moco.yaml` の `codex.prompt_file` へ対象ホストで有効な絶対pathを指定してください。
 macOSでは `~` から始まる現在userのpathも使用できます。内容は会話開始ごとに読み直すため、

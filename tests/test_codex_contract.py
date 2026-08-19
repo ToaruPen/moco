@@ -35,6 +35,7 @@ _REQUIRED_SEMANTICS = (
 _OPTIONAL_SEMANTICS = frozenset(SemanticMethod) - _REQUIRED_SEMANTICS
 
 
+@pytest.mark.integration
 def test_installed_codex_advertises_stage_b_core_semantics() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
@@ -50,6 +51,7 @@ def test_installed_codex_advertises_stage_b_core_semantics() -> None:
     assert contract.version
 
 
+@pytest.mark.integration
 def test_installed_codex_advertises_parameterless_managed_requirements_read() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
@@ -60,6 +62,7 @@ def test_installed_codex_advertises_parameterless_managed_requirements_read() ->
     assert requirements.semantic_fields == frozenset()
 
 
+@pytest.mark.integration
 def test_installed_codex_accepts_the_production_realtime_start_payload() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
@@ -83,6 +86,7 @@ def test_installed_codex_accepts_the_production_realtime_start_payload() -> None
     )
 
 
+@pytest.mark.integration
 def test_installed_codex_advertises_agent_execution_semantics() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
@@ -101,6 +105,7 @@ def test_installed_codex_advertises_agent_execution_semantics() -> None:
     assert profile.turn_status_values >= {"completed", "interrupted", "failed", "inProgress"}
 
 
+@pytest.mark.integration
 def test_installed_codex_approval_families_are_adaptable_per_raw_method() -> None:
     command = resolve_codex_command(None)
     contract = CodexSchemaProbe(command).probe_sync()
@@ -143,6 +148,7 @@ def test_installed_codex_approval_families_are_adaptable_per_raw_method() -> Non
         assert contract.file_change_patch_profile is not None
 
 
+@pytest.mark.integration
 def test_installed_codex_keeps_non_stage_b_categories_unadapted() -> None:
     """Extra categories may be discovered without claiming an unsupported adapter."""
     command = resolve_codex_command(None)

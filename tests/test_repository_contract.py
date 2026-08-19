@@ -123,6 +123,13 @@ def test_readme_documents_host_specific_prompt_paths_and_creation_commands() -> 
         'Copy-Item config\\moco.prompt.example.md "$env:APPDATA\\moco\\prompt.md"',
     ]:
         assert command in prompt
+    for override_boundary in [
+        "experimental_realtime_ws_backend_prompt",
+        "codex_realtime: prompt_overridden",
+        "overrideを削除するか空にして",
+        "値そのものは画面、ログ、telemetryへ出力しません",
+    ]:
+        assert override_boundary in prompt
 
 
 def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:

@@ -1356,15 +1356,16 @@ async def test_terminal_after_voice_commit_before_browser_resume_does_not_send_s
     assert states[-1] == "connection_lost"
 
 
-@pytest.mark.parametrize("required", ["agent_admission", "realtime"])
+@pytest.mark.parametrize("required", ["agent_admission", "realtime", "interrupt"])
 def test_conversation_readiness_rejects_missing_required_capability(required: str) -> None:
     unavailable = CapabilityState(CapabilityStatus.VERSION_MISMATCH, "missing")
     base = make_codex_snapshot()
-    snapshot = (
-        replace(base, agent_admission=unavailable)
-        if required == "agent_admission"
-        else replace(base, realtime=unavailable)
-    )
+    if required == "agent_admission":
+        snapshot = replace(base, agent_admission=unavailable)
+    elif required == "realtime":
+        snapshot = replace(base, realtime=unavailable)
+    else:
+        snapshot = replace(base, interrupt=unavailable)
 
     with pytest.raises(CodexRpcError, match="required Codex capability"):
         web_app._conversation_readiness(  # noqa: SLF001
@@ -1440,7 +1441,6 @@ def test_conversation_readiness_allows_explicit_profile_with_unsafe_global_polic
         lambda snapshot, _unavailable: replace(snapshot, effective_policy=None),
         lambda snapshot, unavailable: replace(snapshot, policy_state=unavailable),
         lambda snapshot, unavailable: replace(snapshot, managed_requirements=unavailable),
-        lambda snapshot, unavailable: replace(snapshot, interrupt=unavailable),
         lambda snapshot, unavailable: replace(snapshot, steer=unavailable),
         lambda snapshot, unavailable: replace(snapshot, server_requests=unavailable),
         lambda snapshot, _unavailable: replace(
@@ -1453,7 +1453,6 @@ def test_conversation_readiness_allows_explicit_profile_with_unsafe_global_polic
         "effective_policy",
         "policy_state",
         "managed_requirements",
-        "interrupt",
         "steer",
         "server_requests",
         "has_unclassified_server_requests",
@@ -5533,6 +5532,7 @@ async def test_user_barge_in_discards_assistant_transcripts_waiting_to_send() ->
     await asyncio.gather(old_first, old_second, user, return_exceptions=True)
     await asyncio.gather(*tuple(connection._effect_tasks), return_exceptions=True)  # noqa: SLF001
 
+    assert old_second.cancelled()
     assert [message for message in websocket.messages if message.get("role") == "assistant"] == []
     assert all(role != "assistant" for role, _text, _done in speech.transcripts)
     await connection.close()

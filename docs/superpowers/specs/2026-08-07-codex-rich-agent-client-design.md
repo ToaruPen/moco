@@ -1,30 +1,27 @@
 # Codex rich-agent音声クライアント設計
 
-> **Frameless Bidiによる置換:** 2026-08-19に現行Codex app-serverの生成schema、
-> 公式実装、実機WebRTCを再検証した結果、Realtime v3は`delegation.*`から通常Codex
-> 作業を自動実行し、そのcommentaryとfinalを同じRealtime会話へ返すことが確認された。
-> この文書の「一つのapp-server接続と二つのthread」「VoiceからAgentへのhandoff」
-> 「Voice modelのassistant transcriptを捨てる」「Agent finalだけを読み上げる」という
-> 設計は、`2026-08-19-frameless-bidi-voice-restoration-design.md`に置き換えられる。
-> 双方向RPC、schema検証、能力発見、承認Reviewer、profile、進捗表示に関する設計は
-> 引き続き有効であり、一つのRealtime Threadへ適用する。
+> **2026-08-19改訂:** 現行Codex app-serverの生成schema、公式実装、実機WebRTCを再検証し、
+> Realtime v3の`delegation.*`が通常Codex作業を自動実行してcommentaryとfinalを同じ
+> Realtime会話へ返すことを確認した。以下は、一つのapp-server接続と一つのRealtime Threadを
+> 前提に改訂済みである。復旧時の実測値とwire設定は
+> `2026-08-19-frameless-bidi-voice-restoration-design.md`に記録する。
 
 ## 位置づけ
 
-mocoは現在、Codex Realtimeとの低遅延会話を中心に構成されている。しかし、音声で
-「このリポジトリを調べて直して」のような依頼を受けたとき、会話が成立することと、
-Codexの通常turnが安全に仕事を完遂できることは同じではない。通常turnではコマンド、
-ファイル変更、web search、MCP、apps、skills、subagentなどが動き、その途中でクライアントへ
-承認や追加入力を求めることがある。現行mocoのRPCクライアントは、この双方向契約を扱えない。
+mocoはCodex Realtimeとの低遅延会話を中心に構成されている。音声で「このリポジトリを調べて
+直して」のような依頼を受けると、Realtime v3は必要な作業をCodexへ委譲する。その処理では
+コマンド、ファイル変更、web search、MCP、apps、skills、subagentなどが動き、途中でクライアントへ
+承認や追加入力を求めることがある。したがってmocoは、音声だけでなくapp-serverの双方向契約も
+同じ会話leaseの中で扱う。
 
-本設計は、音声入力をCodex app-serverの通常Agent作業へ引き渡し、進捗と承認要求を安全に
-提示し、最終結果をIrodoriで読み上げるrich clientへmocoを拡張する。macOSを基準環境とする
+本設計は、RealtimeがCodex app-serverへ自動委譲した作業の進捗と承認要求を安全に提示し、
+同じ会話へ返るspeakable textをIrodoriで読み上げるrich clientへmocoを拡張する。macOSを基準環境とする
 一方、Windows 11実機で同じ基本体験が成立することも完成条件に含める。
 
 本設計は、次の既存方針を限定的に置き換える。
 
-- `2026-07-30-moco-first-usable-release-design.md`の「Codex Realtimeが会話と作業をともに所有する」
-  という構成を、Voice Threadと通常Agent Threadの分離へ変更する。
+- `2026-07-30-moco-first-usable-release-design.md`の「Codex Realtimeが会話を所有し、必要な作業を
+  Codexへ委譲する」という構成を維持し、Frameless Bidi v3の公開契約で具体化する。
 - 同仕様の「Windowsクライアントを対象外とする」という境界を、Windows実機対応へ変更する。
 - `2026-08-01-mobile-operator-access-design.md`の公開オペレーター画面は観測とturn取消に利用できるが、
   新設する承認Reviewerには利用しない。遠隔承認は別仕様とする。
@@ -33,10 +30,11 @@ Irodori v4、12 steps、`sway`、既存の音声分割と再生最適化は変�
 
 ## 目的
 
-利用者が音声で依頼すると、mocoは確定した文字起こしを画面に表示してCodex app-serverの通常turnへ
-仕事を渡す。汎用の受付音声は発しない。Codexが有効な設定の範囲内で処理を進め、承認が必要な場合だけローカルの信頼済み
-画面へ正確な操作内容を提示する。処理中は安全な進捗を表示し、割り込みと取消を受け付ける。
-完了後は生ログではなく、Codexの最終回答を発話向けに分割してIrodoriで読み上げる。
+利用者が音声で依頼すると、mocoは確定した文字起こしを表示し、Realtimeに会話と自動delegationを
+継続させる。delegation acknowledgementとspeakable progressはfinalを待たずに同じ会話へ戻る。
+Codexが有効な設定の範囲内で処理を進め、承認が必要な場合だけローカルの信頼済み画面へ正確な
+操作内容を提示する。acknowledgement、progress、finalのspeakable textは同じIrodori経路へ一度だけ
+流し、生ログやCodexの構造化itemは読み上げない。
 
 この体験を実現しても、mocoがCodexの第二の権限設定系になってはならない。Codexの有効設定が
 許したapp-server内蔵能力は、moco独自のtool allowlistを通さず利用できる。反対に、Browserや
@@ -49,15 +47,16 @@ Computer Useのようにホスト側実装を要する能力は、Codex Desktop�
   双方向JSON-RPC peerになる。
 - mocoは起動したapp-serverのバージョンと生成スキーマから契約を判定し、未知のserver requestを
   fail-closedで処理する。
-- Voice Threadは音声入力とtranscript確定だけを担い、Coordinatorは汎用の受付音声を返さずAgentへ渡す。shell、
-  filesystem、web、MCP、apps、skills、subagentなどの実作業は通常Agent Threadだけが担う。
-- Agent Threadは一つの会話中で継続し、「それを直して」のような後続依頼の文脈を保持する。
+- Realtime v3が会話を所有し、必要な作業をCodexへ自動delegationする。mocoはuser finalを別turnへ
+  再送しない。
+- Codexのcommentaryとfinalは同じRealtime Threadへ戻り、「それを直して」のような後続依頼の
+  文脈も同じ会話が保持する。
 - Codexの有効設定が承認なしで許可した操作に、mocoが追加承認を要求しない。
 - app-serverが承認を要求した操作は、request ID、操作、引数、対象範囲に結び付いたReviewer UIで
   一度だけ決定できる。
-- 発話、周辺音、Voice Threadの返答、公開オペレーター画面は承認操作として扱われない。
+- 発話、周辺音、Realtimeの返答、公開オペレーター画面は承認操作として扱われない。
 - 通常ログ、telemetry、公開画面、音声出力へコマンド引数、ファイル内容、approval tokenを出さない。
-- macOSとWindowsの両方で、foreground実行、音声入力、Agent作業、ローカル承認、取消、最終発話が
+- macOSとWindowsの両方で、foreground実行、音声入力、Codex作業、ローカル承認、取消、最終発話が
   成立する。
 - 利用不能な能力、認証不足、モデル不一致、プロトコル不一致を明示し、成功したように見せる
   fallbackを行わない。
@@ -67,7 +66,7 @@ Computer Useのようにホスト側実装を要する能力は、Codex Desktop�
 - CloudflareまたはTailscale経由の遠隔承認
 - 遠隔画面を使ったComputer Use
 - Codex Desktopの非公開実装、バンドル内部契約、private IPCの複製
-- 長期記憶、会話をまたぐAgent Thread永続化、transcript保存
+- 長期記憶、会話をまたぐRealtime Thread永続化、transcript保存
 - Windows ServiceまたはScheduled Taskによる自動起動
 - 音声だけによる破壊的操作の承認
 - `danger-full-access`と`approvalPolicy=never`を組み合わせた音声起動turn
@@ -78,22 +77,17 @@ BrowserとComputer Useのホストアダプターは後続段階で扱う。本�
 
 ## 検討した方式
 
-### 採用: 一つのapp-server接続と二つのthread
+### 採用: 一つのapp-server接続と一つのRealtime Thread
 
-一つのapp-serverプロセスと双方向RPC接続を共有し、その上にVoice ThreadとAgent Threadを分ける。
-Voice Threadは実験的Realtime経路を低遅延の音声入力とtranscript確定に利用するが、taskの回答や
-tool実行を所有しない。Agent Threadは公開された通常の`turn/start`経路を使い、Codexの
-rich-agent機能を所有する。
+一つのapp-serverプロセスと双方向RPC接続を共有し、ephemeralなRealtime Threadを会話leaseの
+所有単位にする。`clientManagedHandoffs: false`でFrameless Bidiの自動delegationを使い、Codexの
+commentaryとfinalを同じ会話へ返す。設定、承認、進捗、接続監視、能力発見もこのThreadへ結び付ける。
 
-この方式なら、Realtimeが将来どのtool catalogを公開するかに依存せず、通常Codex turnと同じ
-設定・承認・進捗契約を利用できる。接続監視と能力発見を共有できるため、threadごとにapp-serverを
-起動する必要もない。
+### 不採用: Voice Threadから別Agent Threadへの手動handoff
 
-### 不採用: Realtime Threadだけで全作業を行う
-
-現在の体験に最も近いが、実験的Realtime会話が通常turnと同じtool catalog、承認要求、MCP、apps、
-skillsを常に公開する保証がない。能力差を推測すると、利用できない処理を利用可能と表示するか、
-Realtime固有の制約をmocoへ固定化することになる。
+user finalを別の`turn/start`へ再送すると、Realtime側のacknowledgementとspeakable progressが失われる。
+さらにFramelessの自動deliveryと併存した場合は、同じ依頼の二重実行や二重読み上げが起き得る。
+`clientManagedHandoffs: true`で応答を再注入する方式も、mocoが順序と重複排除を再実装するため採用しない。
 
 ### 不採用: Codex Desktopの内部機能をproxyする
 
@@ -108,12 +102,11 @@ Browser Media / Hotkey
         │ audio, control
         ▼
 InteractionCoordinator ──────────────── EventProjector ── Operator UI
-        │ handoff / cancel / speech             ▲
+        │ audio / cancel / speech               ▲
         │                                        │ safe events
         ▼                                        │
 Codex integration package                        │
-  ├─ VoiceSession ─── Voice Thread               │
-  ├─ AgentSession ─── Agent Thread ──────────────┘
+  ├─ RealtimeSession ─── Realtime Thread ────────┘
   ├─ CapabilityDiscovery
   └─ InteractionBroker ── Local Reviewer UI
         │
@@ -126,14 +119,14 @@ codex app-server
         ├─ shell / filesystem / web / MCP / apps / skills / subagents
         └─ future explicit host tool calls
 
-Agent final text ── SpeechQueue ── Irodori ── Browser playback
+speakable transcript ── SpeechQueue ── Irodori ── Browser playback
 ```
 
 これは七つの責務単位を示す。実装時に七つの新規top-level packageや抽象基底クラスを作るという
 意味ではない。既存moduleへ収まる責務はそのまま置き、状態所有者とセキュリティ境界だけを分離する。
 
 1. `RpcPeer`と`CodexConnectionSupervisor`
-2. VoiceSession、AgentSession、能力発見を含むCodex integration package
+2. RealtimeSessionと能力発見を含むCodex integration package
 3. `InteractionCoordinator`
 4. `InteractionBroker`
 5. 純粋な`EventProjector`
@@ -197,7 +190,7 @@ method名がversion間で変わる場合は、生成schemaに存在する候補�
 
 生成schemaをReviewer UIの自動生成には使わない。UIが受け付けるdecisionは、typedなserver request、
 そのrequestが提示する選択肢、app-server response契約、mocoの信頼境界の積集合で決める。
-`threadId`と`turnId`を持つmodern approvalは、AgentSessionが所有する現在のactive turnと全一致する場合
+`threadId`と`turnId`を持つmodern approvalは、Realtime会話leaseが所有する現在のactive turnと全一致する場合
 だけ公開する。直近のterminal通知はbounded tombstoneでも拒否し、別turn完了後に古いapprovalを
 再公開しない。turn identityを持たないlegacy familyは生成schemaの専用adapter契約を維持する。
 
@@ -211,8 +204,8 @@ turnは再接続後に自動再送しない。どこまで実行されたか判�
 
 - pending client requestを明示的なconnection-lost errorで完了する。
 - pending server requestを取消し、Reviewer UIを閉じる。
-- 実行中Agent turnを結果不明として扱い、成功発話を行わない。
-- Agent notification購読だけが先に終端した場合もownerへ一度だけ通知し、idleを含むlease全体を閉じる。
+- 実行中Realtime turnを結果不明として扱い、成功発話を行わない。
+- notification購読だけが先に終端した場合もownerへ一度だけ通知し、idleを含むlease全体を閉じる。
 - browserへ安全なfailure codeを表示する。
 - 新しい接続では能力snapshotを再取得する。
 
@@ -224,7 +217,7 @@ turnは再接続後に自動再送しない。どこまで実行されたか判�
 ### policyの所有者
 
 個々の操作を認可するpolicy engineはCodexの有効設定とapp-serverだけである。mocoはtool、command、
-path、MCP/appを独自allowlistで再判定しない。一方、音声からAgent turnを開始してよいかを判断する
+path、MCP/appを独自allowlistで再判定しない。一方、音声からRealtime会話を開始してよいかを判断する
 admission safety ceilingはmocoが所有する。この上限は操作を許可せず、危険な組み合わせのturn開始を
 拒否するだけである。
 
@@ -269,14 +262,14 @@ snapshot化する。
 web searchなどapp-server内部で完結するtoolの全名前も複製しない。
 
 各categoryは`available`、`disabled`、`authentication_required`、`host_adapter_required`、
-`version_mismatch`、`error`のいずれかになる。必須categoryが満たされなければAgent handoffを開始しない。
+`version_mismatch`、`error`のいずれかになる。必須categoryが満たされなければRealtime会話を開始しない。
 任意categoryの失敗はdegraded readinessとして表示する。選択model、profile、MCP、app、Realtimeが
 見つからない場合は、別のものへ黙って変更しない。
 
 段階Aで必須なのはinitialize/version、account readiness、Realtime、interruptと、その段階の
 server request categoryだけである。effective policyは`inherit_codex`のadmissionに限り必須であり、
-明示profileではprobe失敗をdegraded readinessとして表示してもAgent handoffは止めない。model catalog、
-MCP、apps、skillsの完全snapshotは、Agent作業または該当interactionを公開する段階B/Cで追加する。
+明示profileではprobe失敗をdegraded readinessとして表示してもRealtime会話は止めない。model catalog、
+MCP、apps、skillsの完全snapshotは、Codex作業または該当interactionを公開する段階B/Cで追加する。
 
 設定、MCP、app、skill、account、modelの変更notificationを受けた場合はsnapshotをinvalidにし、
 次の会話または安全なidle境界で再取得する。実行中turnのpolicyを途中で推測し直さない。
@@ -291,21 +284,20 @@ macOSでは公開CLIまたは読み取り・実行可能な公式bundle resource
 version query、account readiness、必須semantic capabilityまで確認する。CLI update、login、OS権限変更は
 mocoが自動実行しない。
 
-## VoiceからAgentへのhandoff
+## Frameless Bidiの会話所有権
 
 ### threadの所有権
 
-app-server接続ごとに、ephemeralなVoice ThreadとephemeralなAgent Threadを作る。Voice Threadは
-microphone音声、VAD、user transcript確定だけを扱う。Voice modelのassistant transcriptは
-task結果として表示または発話せず、作業中の中間音声も発しない。
-Agent Threadは通常turnと会話文脈を所有する。
+app-server接続ごとにephemeralなRealtime Threadを一つ作る。Realtimeはmicrophone音声、VAD、
+transcript、会話文脈を所有し、必要な作業をCodexへ自動delegationする。mocoはuser transcriptを
+別Agent Threadへ渡さず、Codex結果を`appendText`や`appendSpeech`で再注入しない。
 
-利用者のutteranceが確定すると、Coordinatorはそのtextをhandoff requestとしてAgent Threadへ渡す。
-Voice ThreadへAgentの最終回答を注入しない。二つのthreadが互いのassistant発話を再解釈して文脈を
-二重化することを防ぐためである。
+`delegationAckFiller: true`によりacknowledgementを有効にし、`codexResponseHandoffMode: "bemTags"`で
+commentaryとfinalを同じ会話へ戻す。`codexResponsesAsItems: false`とし、読み上げのsource of truthは
+Realtimeのassistant transcriptだけにする。
 
-Agent Threadは同じmoco会話中で継続する。新しいVoice接続を作り直しても、利用者が会話を明示終了
-していなければAgentのthread IDを維持する。daemon再起動や会話終了を越えて保存しない。
+Realtime Threadは同じmoco会話中で継続する。Voice接続だけを張り直す場合も同じapp-server接続と
+Threadを維持し、daemon再起動や会話終了を越えて保存しない。
 
 ### 状態model
 
@@ -322,18 +314,18 @@ UI用の状態とidle判定はこのsnapshotから導出する。既存Lifecycle
 
 ### 進捗と発話
 
-進捗はUIへ非同期表示し、raw logやgeneric acknowledgementを読み上げない。完了時は
-Agentの最終回答だけを同一の文字列でUIと既存SpeechQueueへ渡す。失敗時もstable
-error categoryに対応する同一の短い説明をUIと発話に使い、実行していない処理を
-完了したとは言わない。対応するuser transcriptのpresentationをFIFO barrierとして待ち、fastな
-Agent finalが依頼文より先に画面へ出る順序逆転を防ぐ。
+構造化進捗はUIへ非同期表示し、raw logは読み上げない。Realtimeから届くdelegation
+acknowledgement、有用なspeakable progress、finalは、同じassistant transcriptとしてUIと既存
+SpeechQueueへ一度だけ渡す。失敗時もstable error categoryに対応する同一の短い説明をUIと発話に使い、
+実行していない処理を完了したとは言わない。対応するuser transcriptのpresentationをFIFO barrierとして
+待ち、速いassistant応答が依頼文より先に画面へ出る順序逆転を防ぐ。
 
 新しいutteranceは現在の合成・再生generationを先にinvalidateする。Task自体を取消すか、追加指示に
 するかは現在状態で決める。
 
 ### steer、queue、interrupt
 
-Agentが`running`中に新しいutteranceが確定した場合、能力snapshotがsteerを提供すれば現在turnへ
+Codex作業が`running`中に新しいutteranceが確定した場合、能力snapshotがsteerを提供すれば現在turnへ
 追加する。提供しなければ一件だけqueueする。二件目は古いqueued utteranceを黙って上書きせず、
 busyとして拒否する。
 
@@ -382,7 +374,7 @@ requestは`pending`から`resolved`、`cancelled`、`connection_lost`のいず�
 requestへmoco独自の短いtimeoutを加えない。
 
 Reviewer接続が失われたままdecision不能になった場合はfail-closedでserver requestを終了し、必要に
-応じてAgent turnをinterruptする。Voice Threadや自動音声認識結果へ代替承認を求めない。
+応じてRealtime turnをinterruptする。Realtime発話や自動音声認識結果へ代替承認を求めない。
 
 ### method別decision
 
@@ -518,7 +510,7 @@ Codex Desktopの設定に能力が見えても、moco側adapterがなければ`h
 - screenshot、DOM、操作結果のbounded rendering
 - cancellationとtimeout
 - macOS Screen Recording/AccessibilityまたはWindows相当権限のreadiness
-- Agent Threadとhost actionの相関
+- Realtime Threadのactive turnとhost actionの相関
 
 Computer Useの操作承認は通常command approvalへ混ぜない。画面状態が変化し、表示した内容と実行時の
 対象がずれるため、操作直前のhost stateとscopeを結び付ける必要がある。
@@ -533,17 +525,17 @@ Operator UIは少なくとも次を区別する。
 - required capability unavailable
 - selected model/profile unavailable
 - MCP/app/skill degraded
-- Voice unavailable、Agent available
-- Agent unavailable、Voice available
+- Realtime音声経路 unavailable
+- Codex delegation capability unavailable
 - local review required
 - local reviewer disconnected
 - turn interrupted
 - connection lost with outcome unknown
 - Irodori unavailable
 
-Voiceだけがreadyな状態でAgent作業を受け付けてはならない。音声経路の接続確認はできてもtaskを
-実行できないことを明示する。Agentだけがreadyでmicrophoneが使えない場合は、Operator UIにtext入力を
-新設するのではなく、現行の音声要件を満たさない状態として表示する。text composerは別要件である。
+Realtime音声経路だけが接続できても、v3 delegation契約が不足する状態で作業を受け付けてはならない。
+taskを実行できないことを明示する。Codex側がreadyでもmicrophoneが使えない場合は、Operator UIに
+text入力を新設せず、現行の音声要件を満たさない状態として表示する。text composerは別要件である。
 
 errorはstable codeと安全な説明を持つ。外部error本文、command、path、tokenをbrowserやtelemetryへ
 直接転送しない。retry可能性が分かる場合だけ再接続actionを提示する。
@@ -555,19 +547,19 @@ errorはstable codeと安全な説明を持つ。外部error本文、command、p
 - `RpcPeer`を双方向化する。
 - connection supervisorと、initialize/version、account、effective policy、Realtime、interrupt、必要な
   server request categoryに限定したschema-based capability discoveryを追加する。
-- VoiceSessionを新しいpeer上へ移し、既存音声体験を維持する。
+- RealtimeSessionを新しいpeer上へ移し、既存音声体験を維持する。
 - macOS/WindowsのCodex起動、path、protected runtime stateを整える。
 - Windows CIとfake app-server contract testを追加する。
 
-この段階では新しいprivileged Agent UIを公開しない。
+この段階では新しいprivileged Reviewer UIを公開しない。
 
-### 段階B: 最初に使えるAgent作業
+### 段階B: 最初に使えるdelegated Codex作業
 
-- AgentSessionとhandoff reducerを追加する。
+- Realtime v3のserver-managed delegationを接続し、manual handoffを製品経路へ入れない。
 - 現行の固定`read-only`/`approvalPolicy=never`指定を、三つのprofile modeとeffective policy表示へ
   置き換える。
 - commandとfile changeのone-shot approvalをBrokerとlocal Reviewerで扱う。
-- safe progress、interrupt、final-only speechを接続する。
+- delegation acknowledgement、safe speakable progress、final、interruptを接続する。
 - macOSとWindowsの両方でread-orientedな通常作業を実機確認する。
 
 shell、filesystem、web search、設定済みMCPなど、app-server内で完結しCodexが許可した能力は
@@ -583,7 +575,7 @@ moco固有allowlistなしで利用できる。未対応server requestが必要�
 - config、account、MCP、app、skill refresh
 
 この段階で、明示的host adapterを要するBrowser/Computer Useを除き、active Codex configで許可された
-通常Agent能力の中継を完成扱いにする。
+通常Codex能力の中継を完成扱いにする。
 
 ### 段階D: optional host adapter
 
@@ -669,14 +661,14 @@ macOSとWindowsで次を確認する。
 1. `moco doctor`が選択Codex binary、account、schema、profile、Realtime、Irodori、microphone、hotkeyを
    正しく報告する。
 2. local browserで音声依頼を開始できる。
-3. fast taskとlong-running taskのどちらも中間音声を発さない。
-4. read-only taskが通常Agent turnで完了する。
+3. long-running taskではdelegation acknowledgementまたはspeakable progressがfinalより先に届く。
+4. read-only taskが同じRealtime Threadのdelegated Codex作業として完了する。
 5. command/file approvalがlocal Reviewerだけへ出る。
 6. voiceの「はい」や公開画面から承認できない。
 7. `workspace_write`または`inherit_codex`をローカルで明示選択し、Codexが許可した場合だけ変更taskが進む。
 8. interruptでturnと古いspeech generationが止まる。
 9. app-server切断後に実行中turnを再送しない。
-10. final answerだけがIrodoriで読み上げられる。
+10. acknowledgement、speakable progress、finalが重複せずIrodoriで読み上げられる。
 
 Windows実機への自動調査はtraditional OpenSSH over Tailscaleを利用できるが、login、OS permission、
 service、Tailscale Serve設定をtestが変更しない。microphone、hotkey、Reviewerの最終確認はinteractive
@@ -699,13 +691,13 @@ app-server stderrはdrainするが、通常ログへそのまま転送しない�
 
 ## 受け入れ基準
 
-- 音声依頼がVoice Threadから通常Agent Threadへ一度だけhandoffされる。
-- Agent Threadが同一会話中の後続依頼を解決できる。
+- 音声依頼一回につき`delegation.created`が高々一回で、別Threadへのmanual handoffを行わない。
+- Codexのcommentaryとfinalが同じRealtime会話へ返り、後続依頼も同じ文脈で解決できる。
 - active Codex configで許可されたapp-server内蔵能力にmoco独自allowlistが介在しない。
 - profile mode未設定時は`read_only`になり、`inherit_codex`をローカルで選ぶとCodex設定を上書きしない。
 - `read_only`と`workspace_write`はglobal effective policyをadmission条件にせず、`inherit_codex`で
   effective policyを正規化できない場合、または`danger-full-access`かつ`approvalPolicy=never`の場合に
-  音声からAgent turnを開始しない。
+  音声からRealtime turnを開始しない。
 - app-serverがpromptを要求しない操作に追加Reviewerを出さない。
 - app-serverがpromptを要求した操作はlocal Reviewer以外から承認できない。
 - authorization requestに未対応field、decision、scopeがあればReviewerを出さずfail-closedになる。
@@ -713,7 +705,7 @@ app-server stderrはdrainするが、通常ログへそのまま転送しない�
 - string/int Request IDを変えず、server requestへexactly onceで応答する。
 - 未知server request、reviewer disconnect、connection lossがfail-closedになる。
 - remote Operator、voice、telemetryへapproval詳細が漏れない。
-- cancellationがAgent turnと古いspeechを停止する。
+- cancellationがRealtime turnと古いspeechを停止する。
 - capability、authentication、model、MCP/app、host adapter不足を明示する。
 - macOSとWindowsで同じ基本workflowが実機合格する。
 - Windowsのcontrol secretがCodex sandbox accountから読めるdirectoryへ置かれない。

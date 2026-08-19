@@ -250,3 +250,10 @@ def test_stream_invalid_plan_reports_once_and_keeps_body() -> None:
         delivery_caption=None,
         plan=None,
     )
+
+
+def test_stream_rejects_an_unterminated_oversized_plan_prefix() -> None:
+    stream = SpeechPlanStream(max_chars=300)
+
+    with pytest.raises(ValueError, match="speech plan prefix limit"):
+        stream.push("{" + "a" * 8_192)

@@ -3158,6 +3158,34 @@ def test_pending_count_callback_must_be_synchronous() -> None:
     interaction.close()
 
 
+def test_turn_terminal_callback_is_one_shot_and_bound_before_reviewer_use() -> None:
+    interaction = broker()
+    interaction.bind_turn_terminal(lambda _thread_id, _turn_id: None)
+
+    with pytest.raises(CodexReviewError, match="turn terminal callback is already bound"):
+        interaction.bind_turn_terminal(lambda _thread_id, _turn_id: None)
+
+    other = broker()
+    other.connect_reviewer()
+    with pytest.raises(CodexReviewError, match="must be bound before reviewer use"):
+        other.bind_turn_terminal(lambda _thread_id, _turn_id: None)
+    interaction.close()
+    other.close()
+
+
+def test_turn_terminal_callback_must_be_synchronous() -> None:
+    interaction = broker()
+
+    async def asynchronous_callback(_thread_id: str, _turn_id: str) -> None:
+        raise AssertionError
+
+    with pytest.raises(CodexReviewError, match="turn terminal callback must be synchronous"):
+        interaction.bind_turn_terminal(
+            cast("Callable[[str, str], None]", asynchronous_callback),
+        )
+    interaction.close()
+
+
 async def test_pending_count_callback_failure_terminalizes_without_leaking_payload() -> None:
     callback_secret = "CALLBACK_PRIVATE_DETAIL"  # noqa: S105
     calls: list[int] = []
@@ -3181,6 +3209,58 @@ async def test_pending_count_callback_failure_terminalizes_without_leaking_paylo
         await interaction.review(command_request())
     with pytest.raises(StopAsyncIteration):
         await asyncio.wait_for(anext(connection), STREAM_TIMEOUT)
+
+
+@pytest.mark.parametrize("failure", ["raises", "returns_async"])
+async def test_turn_terminal_callback_failure_closes_pending_review(
+    failure: str,
+) -> None:
+    callback_secret = "TERMINAL_CALLBACK_PRIVATE_DETAIL"  # noqa: S105
+    interaction = broker(file_change_patch_contract(agent_events=True))
+    terminal_callback: Callable[[str, str], object]
+
+    if failure == "raises":
+
+        def failing_callback(_thread_id: str, _turn_id: str) -> object:
+            raise RuntimeError(callback_secret)
+
+        terminal_callback = failing_callback
+    else:
+
+        async def asynchronous_result() -> None:
+            raise AssertionError
+
+        def asynchronous_callback(_thread_id: str, _turn_id: str) -> object:
+            return asynchronous_result()
+
+        terminal_callback = asynchronous_callback
+
+    interaction.bind_turn_terminal(
+        cast("Callable[[str, str], None]", terminal_callback),
+    )
+    registrar = Registrar()
+    interaction.register_approval_handlers(registrar)
+    connection = interaction.connect_reviewer()
+    task, _envelope = await published(interaction, connection)
+
+    with pytest.raises(CodexReviewError, match="turn terminal callback failed") as observed:
+        registrar.notification[0](
+            RpcNotification(
+                "turn/completed",
+                {
+                    "threadId": THREAD_ID,
+                    "turn": {"id": TURN_ID, "status": "completed"},
+                },
+            )
+        )
+
+    with pytest.raises(CodexReviewError, match="local review broker is closed") as waiting:
+        await task
+    with pytest.raises(StopAsyncIteration):
+        await asyncio.wait_for(anext(connection), STREAM_TIMEOUT)
+    assert pending_reviews(interaction) == 0
+    assert callback_secret not in hostile_report(observed.value)
+    assert callback_secret not in hostile_report(waiting.value)
 
 
 async def test_cancel_pending_withdraws_read_review_once_and_broker_is_reusable() -> None:

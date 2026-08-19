@@ -93,6 +93,7 @@ _MAX_USER_TRANSCRIPT_PARTS = 256
 _MAX_ASSISTANT_TRANSCRIPT_BYTES = 16_384
 _MAX_ASSISTANT_TRANSCRIPT_PARTS = 256
 _MAX_TERMINAL_TURNS = 64
+_DEFAULT_DELIVERY_CAPTION_MAX_CHARS = 300
 
 
 _CAPABILITY_MISMATCH = "capability_mismatch"
@@ -2343,7 +2344,7 @@ class _BrowserConnection:
         stream = self._assistant_speech_plan_stream
         if stream is None:
             stream = SpeechPlanStream(
-                max_chars=self._delivery_caption_max_chars or 300,
+                max_chars=(self._delivery_caption_max_chars or _DEFAULT_DELIVERY_CAPTION_MAX_CHARS),
             )
             self._assistant_speech_plan_stream = stream
         update = stream.push(event.text, done=event.kind == "done")
@@ -2685,7 +2686,7 @@ class _BrowserConnection:
             except asyncio.QueueEmpty:
                 return
             if not work.completion.done():
-                work.completion.set_result(None)
+                work.completion.cancel()
 
     async def _stop_transcript_pipeline(
         self,
@@ -3253,14 +3254,15 @@ def _conversation_readiness(
     if (
         profile_agent_admission(capabilities, profile).status is not CapabilityStatus.AVAILABLE
         or capabilities.realtime.status is not CapabilityStatus.AVAILABLE
+        or capabilities.interrupt.status is not CapabilityStatus.AVAILABLE
     ):
         message = "required Codex capability is unavailable"
         raise CodexRpcError(message)
     profiles = getattr(contract, "approval_profiles", {})
     modern_file_requires_patch = any(
-        getattr(profile, "category", None) is ServerRequestCategory.FILE_CHANGE_APPROVAL
-        and getattr(profile, "changes_member", object()) is None
-        for profile in profiles.values()
+        getattr(approval_profile, "category", None) is ServerRequestCategory.FILE_CHANGE_APPROVAL
+        and getattr(approval_profile, "changes_member", object()) is None
+        for approval_profile in profiles.values()
     )
     missing_modern_patch_evidence = (
         modern_file_requires_patch and getattr(contract, "file_change_patch_profile", None) is None
@@ -3269,7 +3271,6 @@ def _conversation_readiness(
         capabilities.account,
         capabilities.policy_state,
         capabilities.managed_requirements,
-        capabilities.interrupt,
         capabilities.steer,
         capabilities.server_requests,
     )

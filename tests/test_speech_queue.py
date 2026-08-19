@@ -9,7 +9,7 @@ from opentelemetry.trace import NonRecordingSpan, SpanContext, TraceFlags, use_s
 
 from moco.speech import queue as speech_queue
 from moco.speech.irodori import IrodoriError
-from moco.speech.queue import SpeechQueue
+from moco.speech.queue import SpeechQueue, SpeechQueueOverflowError
 
 
 class FakeSynthesizer:
@@ -97,7 +97,7 @@ async def test_rejects_a_turn_that_would_overflow_pending_segments() -> None:
     synthesizer = FakeSynthesizer()
     queue = SpeechQueue(synthesizer, deliver=ignore_audio, max_chars=80)
 
-    with pytest.raises(RuntimeError, match="speech queue limit"):
+    with pytest.raises(SpeechQueueOverflowError, match="speech queue limit"):
         await queue.on_transcript(
             role="assistant",
             delta="一。" * (speech_queue._MAX_PENDING_SPEECH_ITEMS + 1),  # noqa: SLF001
