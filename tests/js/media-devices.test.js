@@ -13,12 +13,16 @@ class FakeMediaDevices extends EventTarget {
     this.deviceChangeAdds = 0;
     this.deviceChangeRemoves = 0;
     this.enumerationError = null;
+    this.enumerationResults = [];
   }
 
   async enumerateDevices() {
     this.enumerateCalls += 1;
     if (this.enumerationError) {
       throw this.enumerationError;
+    }
+    if (this.enumerationResults.length > 0) {
+      return this.enumerationResults.shift();
     }
     return this.devices;
   }
@@ -36,6 +40,14 @@ class FakeMediaDevices extends EventTarget {
     }
     super.removeEventListener(type, listener, options);
   }
+}
+
+function deferred() {
+  let resolve;
+  const promise = new Promise((resolvePromise) => {
+    resolve = resolvePromise;
+  });
+  return { promise, resolve };
 }
 
 function createController({ devices = [], context = {} } = {}) {
@@ -157,6 +169,67 @@ describe("AudioDeviceController", () => {
     assert.deepEqual(options(setup.outputSelect), [["", "システム既定"]]);
     assert.equal(setup.inputSelect.disabled, false);
     assert.equal(setup.outputSelect.disabled, false);
+  });
+
+  it("keeps a newer devicechange result when the initial enumeration resolves last", async () => {
+    const initial = deferred();
+    const changed = deferred();
+    const setup = createController({ context: { setSinkId() {} } });
+    setup.mediaDevices.enumerationResults.push(initial.promise, changed.promise);
+
+    const starting = setup.controller.start();
+    setup.mediaDevices.dispatchEvent(new Event("devicechange"));
+    changed.resolve([{ kind: "audioinput", deviceId: "new", label: "New microphone" }]);
+    await new Promise((resolve) => setImmediate(resolve));
+    initial.resolve([{ kind: "audioinput", deviceId: "old", label: "Old microphone" }]);
+    await starting;
+
+    assert.deepEqual(options(setup.inputSelect), [
+      ["", "システム既定"],
+      ["new", "New microphone"],
+    ]);
+    assert.equal(setup.mediaDevices.enumerateCalls, 2);
+    assert.equal(setup.mediaDevices.deviceChangeAdds, 1);
+  });
+
+  it("applies the newest requested enumeration when the initial request resolves first", async () => {
+    const initial = deferred();
+    const changed = deferred();
+    const setup = createController({ context: { setSinkId() {} } });
+    setup.mediaDevices.enumerationResults.push(initial.promise, changed.promise);
+
+    const starting = setup.controller.start();
+    setup.mediaDevices.dispatchEvent(new Event("devicechange"));
+    initial.resolve([{ kind: "audioinput", deviceId: "old", label: "Old microphone" }]);
+    await starting;
+    changed.resolve([{ kind: "audioinput", deviceId: "new", label: "New microphone" }]);
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(options(setup.inputSelect), [
+      ["", "システム既定"],
+      ["new", "New microphone"],
+    ]);
+    assert.equal(setup.mediaDevices.enumerateCalls, 2);
+    assert.equal(setup.mediaDevices.deviceChangeAdds, 1);
+  });
+
+  it("ignores an in-flight enumeration after close", async () => {
+    const pending = deferred();
+    const setup = createController({ context: { setSinkId() {} } });
+    setup.mediaDevices.enumerationResults.push(pending.promise);
+
+    const starting = setup.controller.start();
+    setup.controller.close();
+    setup.mediaDevices.dispatchEvent(new Event("devicechange"));
+    pending.resolve([{ kind: "audioinput", deviceId: "late", label: "Late microphone" }]);
+    await starting;
+    await new Promise((resolve) => setImmediate(resolve));
+
+    assert.deepEqual(options(setup.inputSelect), []);
+    assert.equal(setup.inputSelect.disabled, true);
+    assert.equal(setup.outputSelect.disabled, true);
+    assert.equal(setup.mediaDevices.enumerateCalls, 1);
+    assert.equal(setup.mediaDevices.deviceChangeRemoves, 1);
   });
 
   it("refreshes on devicechange and detaches the listener when closed", async () => {

@@ -41,6 +41,7 @@ export class AudioDeviceController {
     this.createOption = createOption;
     this.closed = false;
     this.listening = false;
+    this.refreshGeneration = 0;
     this.handleDeviceChange = () => {
       void this.refresh();
     };
@@ -50,19 +51,25 @@ export class AudioDeviceController {
     if (this.closed) {
       return;
     }
-    await this.refresh();
-    if (this.closed || this.listening) {
-      return;
+    if (!this.listening) {
+      this.mediaDevices.addEventListener("devicechange", this.handleDeviceChange);
+      this.listening = true;
     }
-    this.mediaDevices.addEventListener("devicechange", this.handleDeviceChange);
-    this.listening = true;
+    await this.refresh();
   }
 
   async refresh() {
+    if (this.closed) {
+      return;
+    }
+    const generation = ++this.refreshGeneration;
     let devices = [];
     try {
       devices = await this.mediaDevices.enumerateDevices();
     } catch {}
+    if (this.closed || generation !== this.refreshGeneration) {
+      return;
+    }
 
     const supportsOutputSelection = typeof this.context.setSinkId === "function";
     renderOptions(this.inputSelect, candidates(devices, "audioinput"), "マイク", this.createOption);
@@ -81,6 +88,7 @@ export class AudioDeviceController {
       return;
     }
     this.closed = true;
+    this.refreshGeneration += 1;
     if (this.listening) {
       this.mediaDevices.removeEventListener("devicechange", this.handleDeviceChange);
       this.listening = false;
