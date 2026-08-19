@@ -60,6 +60,8 @@ export class AudioDeviceController {
     this.hasSuccessfulCatalog = false;
     this.restorationStarted = false;
     this.restorationPromise = null;
+    this.retainedInput = null;
+    this.retainedOutput = null;
     this.inputPending = 0;
     this.outputPending = 0;
     this.inputQueue = Promise.resolve();
@@ -123,14 +125,14 @@ export class AudioDeviceController {
     );
     const fallbacks = [];
     if (this.inputId && !inputIds.has(this.inputId)) {
-      fallbacks.push(this.selectInput(""));
+      fallbacks.push(this.#selectInputFallback(this.inputId, generation));
     }
     if (
       this.outputId &&
       typeof this.context.setSinkId === "function" &&
       !outputIds.has(this.outputId)
     ) {
-      fallbacks.push(this.selectOutput(""));
+      fallbacks.push(this.#selectOutputFallback(this.outputId, generation));
     }
     await Promise.all(fallbacks);
     return true;
@@ -138,19 +140,36 @@ export class AudioDeviceController {
 
   #renderCatalog() {
     const supportsOutputSelection = typeof this.context.setSinkId === "function";
-    renderOptions(
+    const inputDevices = this.#devicesWithRetainedSelection(
       this.inputSelect,
       candidates(this.devices, "audioinput"),
-      "マイク",
-      this.createOption,
+      this.inputId,
+      "retainedInput",
     );
-    renderOptions(
+    const outputDevices = this.#devicesWithRetainedSelection(
       this.outputSelect,
       supportsOutputSelection ? candidates(this.devices, "audiooutput") : [],
-      "出力",
-      this.createOption,
+      this.outputId,
+      "retainedOutput",
     );
+    renderOptions(this.inputSelect, inputDevices, "マイク", this.createOption);
+    renderOptions(this.outputSelect, outputDevices, "出力", this.createOption);
     this.#renderSelectionAndAvailability();
+  }
+
+  #devicesWithRetainedSelection(select, devices, selectedId, retainedProperty) {
+    if (!selectedId || devices.some((device) => device.deviceId === selectedId)) {
+      this[retainedProperty] = null;
+      return devices;
+    }
+
+    if (this[retainedProperty]?.deviceId !== selectedId) {
+      const selectedOption = [...select.options].find((option) => option.value === selectedId);
+      this[retainedProperty] = selectedOption
+        ? { deviceId: selectedId, label: selectedOption.textContent }
+        : null;
+    }
+    return this[retainedProperty] ? [...devices, this[retainedProperty]] : devices;
   }
 
   async #restoreStoredSelections() {
@@ -183,23 +202,32 @@ export class AudioDeviceController {
   }
 
   async selectInput(deviceId) {
+    return await this.#enqueueInput(deviceId);
+  }
+
+  async #selectInputFallback(expectedId, refreshGeneration) {
+    return await this.#enqueueInput("", { expectedId, refreshGeneration });
+  }
+
+  async #enqueueInput(deviceId, fallback = null) {
     if (this.closed) {
       return false;
     }
     this.inputPending += 1;
     this.#renderSelectionAndAvailability();
-    const operation = this.inputQueue.then(() => this.#switchInput(deviceId));
+    const operation = this.inputQueue.then(() => this.#switchInput(deviceId, fallback));
     this.inputQueue = operation.catch(() => false);
     try {
       return await operation;
     } finally {
       this.inputPending -= 1;
-      this.#renderSelectionAndAvailability();
+      this.#renderCatalog();
     }
   }
 
-  async #switchInput(deviceId) {
-    if (this.closed || deviceId === this.inputId) {
+  async #switchInput(deviceId, fallback) {
+    fallback = this.#prepareFallback(fallback, "audioinput", this.inputId);
+    if (this.closed || deviceId === this.inputId || fallback === false) {
       return false;
     }
     const generation = this.switchGeneration;
@@ -209,6 +237,10 @@ export class AudioDeviceController {
         audio: deviceId ? { deviceId: { exact: deviceId } } : true,
       });
       if (this.closed || generation !== this.switchGeneration) {
+        this.#stopStream(candidate);
+        return false;
+      }
+      if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
         this.#stopStream(candidate);
         return false;
       }
@@ -222,8 +254,24 @@ export class AudioDeviceController {
       }
 
       nextTrack.enabled = currentTrack.enabled;
+      if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
+        this.#stopStream(candidate);
+        return false;
+      }
       await sender.replaceTrack(nextTrack);
       if (this.closed || generation !== this.switchGeneration) {
+        this.#stopStream(candidate);
+        return false;
+      }
+      if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
+        const rolledBack = await this.#rollbackInputFallback(sender, currentTrack);
+        if (!rolledBack) {
+          this.replaceCurrentStream(candidate);
+          this.#stopStream(current);
+          this.inputId = "";
+          this.#storeDeviceId(INPUT_STORAGE_KEY, "");
+          return true;
+        }
         this.#stopStream(candidate);
         return false;
       }
@@ -235,7 +283,11 @@ export class AudioDeviceController {
       return true;
     } catch {
       this.#stopStream(candidate);
-      if (!this.closed && generation === this.switchGeneration) {
+      if (
+        !this.closed &&
+        generation === this.switchGeneration &&
+        this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)
+      ) {
         this.#emitError("microphone_switch_failed");
       }
       return false;
@@ -243,36 +295,62 @@ export class AudioDeviceController {
   }
 
   async selectOutput(deviceId) {
+    return await this.#enqueueOutput(deviceId);
+  }
+
+  async #selectOutputFallback(expectedId, refreshGeneration) {
+    return await this.#enqueueOutput("", { expectedId, refreshGeneration });
+  }
+
+  async #enqueueOutput(deviceId, fallback = null) {
     if (this.closed || typeof this.context.setSinkId !== "function") {
       return false;
     }
     this.outputPending += 1;
     this.#renderSelectionAndAvailability();
-    const operation = this.outputQueue.then(() => this.#switchOutput(deviceId));
+    const operation = this.outputQueue.then(() => this.#switchOutput(deviceId, fallback));
     this.outputQueue = operation.catch(() => false);
     try {
       return await operation;
     } finally {
       this.outputPending -= 1;
-      this.#renderSelectionAndAvailability();
+      this.#renderCatalog();
     }
   }
 
-  async #switchOutput(deviceId) {
-    if (this.closed || deviceId === this.outputId) {
+  async #switchOutput(deviceId, fallback) {
+    fallback = this.#prepareFallback(fallback, "audiooutput", this.outputId);
+    if (this.closed || deviceId === this.outputId || fallback === false) {
       return false;
     }
     const generation = this.switchGeneration;
+    const previousId = this.outputId;
     try {
+      if (!this.#fallbackIsCurrent(fallback, "audiooutput", this.outputId)) {
+        return false;
+      }
       await this.context.setSinkId(deviceId);
       if (this.closed || generation !== this.switchGeneration) {
+        return false;
+      }
+      if (!this.#fallbackIsCurrent(fallback, "audiooutput", this.outputId)) {
+        const rolledBack = await this.#rollbackOutputFallback(previousId);
+        if (!rolledBack) {
+          this.outputId = "";
+          this.#storeDeviceId(OUTPUT_STORAGE_KEY, "");
+          return true;
+        }
         return false;
       }
       this.outputId = deviceId;
       this.#storeDeviceId(OUTPUT_STORAGE_KEY, deviceId);
       return true;
     } catch {
-      if (!this.closed && generation === this.switchGeneration) {
+      if (
+        !this.closed &&
+        generation === this.switchGeneration &&
+        this.#fallbackIsCurrent(fallback, "audiooutput", this.outputId)
+      ) {
         this.#emitError("audio_output_switch_failed");
       }
       return false;
@@ -323,6 +401,51 @@ export class AudioDeviceController {
       return this.storage?.getItem(key) || "";
     } catch {
       return "";
+    }
+  }
+
+  #fallbackIsCurrent(fallback, kind, currentId) {
+    if (!fallback) {
+      return true;
+    }
+    return (
+      !this.closed &&
+      fallback.refreshGeneration === this.refreshGeneration &&
+      fallback.expectedId === currentId &&
+      !candidates(this.devices, kind).some((device) => device.deviceId === fallback.expectedId)
+    );
+  }
+
+  #prepareFallback(fallback, kind, currentId) {
+    if (!fallback) {
+      return null;
+    }
+    if (
+      this.closed ||
+      fallback.refreshGeneration !== this.refreshGeneration ||
+      !currentId ||
+      candidates(this.devices, kind).some((device) => device.deviceId === currentId)
+    ) {
+      return false;
+    }
+    return { ...fallback, expectedId: currentId };
+  }
+
+  async #rollbackInputFallback(sender, currentTrack) {
+    try {
+      await sender.replaceTrack(currentTrack);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async #rollbackOutputFallback(previousId) {
+    try {
+      await this.context.setSinkId(previousId);
+      return true;
+    } catch {
+      return false;
     }
   }
 
