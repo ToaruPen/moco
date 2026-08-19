@@ -68,6 +68,8 @@ export class AudioDeviceController {
     this.outputQueue = Promise.resolve();
     this.inputFallback = null;
     this.outputFallback = null;
+    this.inputAvailability = { deviceId: "", epoch: 0, missing: false };
+    this.outputAvailability = { deviceId: "", epoch: 0, missing: false };
     this.refreshGeneration = 0;
     this.switchGeneration = 0;
     this.handleDeviceChange = () => {
@@ -125,16 +127,22 @@ export class AudioDeviceController {
     const outputIds = new Set(
       candidates(this.devices, "audiooutput").map((device) => device.deviceId),
     );
+    const inputAvailability = this.#updateAvailability("inputAvailability", this.inputId, inputIds);
+    const outputAvailability = this.#updateAvailability(
+      "outputAvailability",
+      this.outputId,
+      outputIds,
+    );
     const fallbacks = [];
     if (this.inputId && !inputIds.has(this.inputId)) {
-      fallbacks.push(this.#selectInputFallback(this.inputId));
+      fallbacks.push(this.#selectInputFallback(this.inputId, inputAvailability.epoch));
     }
     if (
       this.outputId &&
       typeof this.context.setSinkId === "function" &&
       !outputIds.has(this.outputId)
     ) {
-      fallbacks.push(this.#selectOutputFallback(this.outputId));
+      fallbacks.push(this.#selectOutputFallback(this.outputId, outputAvailability.epoch));
     }
     await Promise.all(fallbacks);
     return true;
@@ -215,13 +223,16 @@ export class AudioDeviceController {
     return await this.#enqueueInput(deviceId, null, pendingSelection);
   }
 
-  #selectInputFallback(expectedId) {
-    if (this.inputFallback) {
+  #selectInputFallback(expectedId, missingEpoch) {
+    if (
+      this.inputFallback?.expectedId === expectedId &&
+      this.inputFallback.missingEpoch === missingEpoch
+    ) {
       return this.inputFallback.promise;
     }
     const fallback = { expectedId };
     const promise = this.#enqueueInput("", fallback);
-    const pending = { promise };
+    const pending = { expectedId, missingEpoch, promise };
     this.inputFallback = pending;
     const clear = () => {
       if (this.inputFallback === pending) {
@@ -298,9 +309,38 @@ export class AudioDeviceController {
       ) {
         const rollbackTrack =
           authoritativeSender === sender && authoritativeTrack ? authoritativeTrack : currentTrack;
-        await this.#rollbackInputFallback(sender, rollbackTrack);
-        this.#stopStream(candidate);
-        return false;
+        const rolledBack = await this.#rollbackInputFallback(sender, rollbackTrack);
+        if (this.closed || generation !== this.switchGeneration) {
+          this.#stopStream(candidate);
+          return false;
+        }
+        if (rolledBack) {
+          this.#stopStream(candidate);
+          return false;
+        }
+        const latestCurrent = this.getCurrentStream();
+        const latestTrack = latestCurrent?.getAudioTracks()[0];
+        const latestSender = this.getAudioSender();
+        if (latestSender !== sender || ("track" in sender && sender.track !== nextTrack)) {
+          this.#stopStream(candidate);
+          return false;
+        }
+
+        nextTrack.enabled =
+          latestTrack?.enabled ?? authoritativeTrack?.enabled ?? currentTrack.enabled;
+        this.replaceCurrentStream(candidate);
+        for (const superseded of new Set([current, authoritativeCurrent, latestCurrent])) {
+          if (superseded && superseded !== candidate) {
+            this.#stopStream(superseded);
+          }
+        }
+        this.inputId = deviceId;
+        if (pendingSelection?.deviceId === deviceId) {
+          this.retainedInput = pendingSelection;
+        }
+        this.#storeDeviceId(INPUT_STORAGE_KEY, deviceId);
+        this.#emitError("microphone_switch_failed");
+        return true;
       }
       if (!this.#fallbackIsCurrent(fallback, "audioinput", this.inputId)) {
         const rolledBack = await this.#rollbackInputFallback(sender, currentTrack);
@@ -350,13 +390,16 @@ export class AudioDeviceController {
     return await this.#enqueueOutput(deviceId, null, pendingSelection);
   }
 
-  #selectOutputFallback(expectedId) {
-    if (this.outputFallback) {
+  #selectOutputFallback(expectedId, missingEpoch) {
+    if (
+      this.outputFallback?.expectedId === expectedId &&
+      this.outputFallback.missingEpoch === missingEpoch
+    ) {
       return this.outputFallback.promise;
     }
     const fallback = { expectedId };
     const promise = this.#enqueueOutput("", fallback);
-    const pending = { promise };
+    const pending = { expectedId, missingEpoch, promise };
     this.outputFallback = pending;
     const clear = () => {
       if (this.outputFallback === pending) {
@@ -483,6 +526,15 @@ export class AudioDeviceController {
     }
     const option = [...select.options].find((candidate) => candidate.value === deviceId);
     return { deviceId, label: option?.textContent || fallbackLabel };
+  }
+
+  #updateAvailability(property, deviceId, availableIds) {
+    const previous = this[property];
+    const missing = Boolean(deviceId) && !availableIds.has(deviceId);
+    if (previous.deviceId !== deviceId || previous.missing !== missing) {
+      this[property] = { deviceId, epoch: previous.epoch + 1, missing };
+    }
+    return this[property];
   }
 
   #fallbackIsCurrent(fallback, kind, currentId) {

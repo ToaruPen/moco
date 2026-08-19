@@ -1827,6 +1827,186 @@ describe("AudioDeviceController", () => {
     assert.deepEqual(errors, []);
   });
 
+  it("preserves the candidate route when authoritative rollback fails on the active sender", async () => {
+    const initialReplacement = deferred();
+    const rollback = deferred();
+    const errors = [];
+    const oldTrack = createTrack({ enabled: true });
+    const authoritativeTrack = createTrack({ enabled: false });
+    const candidateTrack = createTrack({ enabled: true });
+    const oldStream = createStream([oldTrack]);
+    const authoritativeStream = createStream([authoritativeTrack]);
+    const candidateStream = createStream([candidateTrack]);
+    let ownedStream = oldStream;
+    const sender = {
+      replacements: [],
+      track: oldTrack,
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await initialReplacement.promise;
+          this.track = track;
+          return;
+        }
+        await rollback.promise;
+        throw new Error("authoritative rollback failed");
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      getCurrentStream: () => ownedStream,
+      onError: (code) => errors.push(code),
+      onReplaceCurrentStream: (stream) => {
+        ownedStream = stream;
+      },
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(candidateStream);
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    ownedStream = authoritativeStream;
+    initialReplacement.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(sender.replacements, [candidateTrack, authoritativeTrack]);
+    rollback.reject(new Error("rollback rejected"));
+
+    assert.equal(await switching, true);
+    assert.equal(sender.track, candidateTrack);
+    assert.equal(ownedStream, candidateStream);
+    assert.deepEqual(setup.streamReplacements, [candidateStream]);
+    assert.equal(candidateTrack.enabled, false);
+    assert.equal(candidateTrack.stopCalls, 0);
+    assert.equal(oldTrack.stopCalls, 1);
+    assert.equal(authoritativeTrack.stopCalls, 1);
+    assert.equal(setup.controller.inputId, "mic-2");
+    assert.equal(setup.inputSelect.value, "mic-2");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), "mic-2");
+    assert.deepEqual(errors, ["microphone_switch_failed"]);
+  });
+
+  it("does not preserve a candidate after the active sender changes during rollback", async () => {
+    const initialReplacement = deferred();
+    const rollback = deferred();
+    const errors = [];
+    const oldTrack = createTrack();
+    const authoritativeTrack = createTrack();
+    const newestTrack = createTrack();
+    const candidateTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const authoritativeStream = createStream([authoritativeTrack]);
+    const newestStream = createStream([newestTrack]);
+    const candidateStream = createStream([candidateTrack]);
+    let ownedStream = oldStream;
+    const oldSender = {
+      replacements: [],
+      track: oldTrack,
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await initialReplacement.promise;
+          this.track = track;
+          return;
+        }
+        await rollback.promise;
+        throw new Error("rollback failed");
+      },
+    };
+    const newSender = { track: newestTrack, async replaceTrack() {} };
+    let activeSender = oldSender;
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      getAudioSender: () => activeSender,
+      getCurrentStream: () => ownedStream,
+      onError: (code) => errors.push(code),
+      sender: oldSender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(candidateStream);
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    ownedStream = authoritativeStream;
+    initialReplacement.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    activeSender = newSender;
+    ownedStream = newestStream;
+    rollback.reject(new Error("rollback rejected"));
+
+    assert.equal(await switching, false);
+    assert.equal(oldSender.track, candidateTrack);
+    assert.equal(activeSender, newSender);
+    assert.equal(ownedStream, newestStream);
+    assert.equal(candidateTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.equal(authoritativeTrack.stopCalls, 0);
+    assert.equal(newestTrack.stopCalls, 0);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.deepEqual(errors, []);
+  });
+
+  it("does not report or preserve a candidate when close invalidates a failed identity rollback", async () => {
+    const initialReplacement = deferred();
+    const rollback = deferred();
+    const errors = [];
+    const oldTrack = createTrack();
+    const authoritativeTrack = createTrack();
+    const candidateTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const authoritativeStream = createStream([authoritativeTrack]);
+    const candidateStream = createStream([candidateTrack]);
+    let ownedStream = oldStream;
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await initialReplacement.promise;
+          return;
+        }
+        await rollback.promise;
+        throw new Error("rollback failed");
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-2", label: "Microphone 2" }],
+      getCurrentStream: () => ownedStream,
+      onError: (code) => errors.push(code),
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(candidateStream);
+    await setup.controller.start();
+
+    const switching = setup.controller.selectInput("mic-2");
+    await new Promise((resolve) => setImmediate(resolve));
+    ownedStream = authoritativeStream;
+    initialReplacement.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    setup.controller.close();
+    rollback.reject(new Error("rollback rejected"));
+
+    assert.equal(await switching, false);
+    assert.equal(candidateTrack.stopCalls, 1);
+    assert.equal(oldTrack.stopCalls, 0);
+    assert.equal(authoritativeTrack.stopCalls, 0);
+    assert.deepEqual(setup.streamReplacements, []);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+    assert.deepEqual(errors, []);
+  });
+
   it("cancels an input commit when audio sender identity changes during replaceTrack", async () => {
     const replacement = deferred();
     const errors = [];
@@ -2055,6 +2235,116 @@ describe("AudioDeviceController", () => {
 
     assert.deepEqual(context.calls, [""]);
     assert.equal(setup.controller.outputId, "");
+  });
+
+  it("queues a new input fallback after a restored device disappears during rollback", async () => {
+    const firstReplacement = deferred();
+    const rollback = deferred();
+    const oldTrack = createTrack();
+    const firstDefaultTrack = createTrack();
+    const secondDefaultTrack = createTrack();
+    const oldStream = createStream([oldTrack]);
+    const firstDefaultStream = createStream([firstDefaultTrack]);
+    const secondDefaultStream = createStream([secondDefaultTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        if (this.replacements.length === 1) {
+          await firstReplacement.promise;
+        } else if (this.replacements.length === 2) {
+          await rollback.promise;
+        }
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: oldStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }],
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(firstDefaultStream, secondDefaultStream);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+
+    setup.mediaDevices.devices = [];
+    const firstMissing = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    setup.mediaDevices.devices = [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }];
+    await setup.controller.refresh();
+    firstReplacement.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(sender.replacements, [firstDefaultTrack, oldTrack]);
+
+    setup.mediaDevices.devices = [];
+    const secondMissing = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    rollback.resolve();
+    await Promise.all([firstMissing, secondMissing]);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [{ audio: true }, { audio: true }]);
+    assert.deepEqual(sender.replacements, [firstDefaultTrack, oldTrack, secondDefaultTrack]);
+    assert.equal(setup.currentStream(), secondDefaultStream);
+    assert.equal(firstDefaultTrack.stopCalls, 1);
+    assert.equal(secondDefaultTrack.stopCalls, 0);
+    assert.equal(oldTrack.stopCalls, 1);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
+  it("queues a new output fallback after a restored device disappears during rollback", async () => {
+    const firstSwitch = deferred();
+    const rollback = deferred();
+    const context = {
+      calls: [],
+      sinkId: "speaker-1",
+      async setSinkId(deviceId) {
+        this.calls.push(deviceId);
+        if (this.calls.length === 1) {
+          await firstSwitch.promise;
+        } else if (this.calls.length === 2) {
+          await rollback.promise;
+        }
+        this.sinkId = deviceId;
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      context,
+      devices: [{ kind: "audiooutput", deviceId: "speaker-1", label: "Speaker 1" }],
+      storage,
+    });
+    await setup.controller.start();
+    setup.controller.outputId = "speaker-1";
+    setup.outputSelect.value = "speaker-1";
+    storage.setItem("moco.audio.outputDeviceId", "speaker-1");
+
+    setup.mediaDevices.devices = [];
+    const firstMissing = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    setup.mediaDevices.devices = [
+      { kind: "audiooutput", deviceId: "speaker-1", label: "Speaker 1" },
+    ];
+    await setup.controller.refresh();
+    firstSwitch.resolve();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(context.calls, ["", "speaker-1"]);
+
+    setup.mediaDevices.devices = [];
+    const secondMissing = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    rollback.resolve();
+    await Promise.all([firstMissing, secondMissing]);
+
+    assert.deepEqual(context.calls, ["", "speaker-1", ""]);
+    assert.equal(context.sinkId, "");
+    assert.equal(setup.controller.outputId, "");
+    assert.equal(setup.outputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.outputDeviceId"), null);
   });
 
   it("queues a disconnected-input fallback behind an active microphone switch", async () => {
