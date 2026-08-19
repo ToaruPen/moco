@@ -263,7 +263,11 @@ export class AudioDeviceController {
 
   async #switchInput(deviceId, fallback, pendingSelection) {
     fallback = this.#prepareFallback(fallback, "audioinput", this.inputId);
-    if (this.closed || deviceId === this.inputId || fallback === false) {
+    if (
+      this.closed ||
+      (deviceId === this.inputId && this.#currentInputTrackIsLive()) ||
+      fallback === false
+    ) {
       return false;
     }
     const generation = this.switchGeneration;
@@ -314,15 +318,21 @@ export class AudioDeviceController {
           this.#stopStream(candidate);
           return false;
         }
+        const latestSender = this.getAudioSender();
         if (rolledBack) {
           this.#stopStream(candidate);
+          if (!fallback && (authoritativeSender !== sender || latestSender !== sender)) {
+            this.#emitError("microphone_switch_failed");
+          }
           return false;
         }
         const latestCurrent = this.getCurrentStream();
         const latestTrack = latestCurrent?.getAudioTracks()[0];
-        const latestSender = this.getAudioSender();
         if (latestSender !== sender || ("track" in sender && sender.track !== nextTrack)) {
           this.#stopStream(candidate);
+          if (!fallback && latestSender !== sender) {
+            this.#emitError("microphone_switch_failed");
+          }
           return false;
         }
 
@@ -544,7 +554,8 @@ export class AudioDeviceController {
     return (
       !this.closed &&
       fallback.expectedId === currentId &&
-      !candidates(this.devices, kind).some((device) => device.deviceId === fallback.expectedId)
+      (!candidates(this.devices, kind).some((device) => device.deviceId === fallback.expectedId) ||
+        (kind === "audioinput" && !this.#currentInputTrackIsLive()))
     );
   }
 
@@ -555,12 +566,17 @@ export class AudioDeviceController {
     if (
       this.closed ||
       !currentId ||
-      candidates(this.devices, kind).some((device) => device.deviceId === currentId)
+      (candidates(this.devices, kind).some((device) => device.deviceId === currentId) &&
+        (kind !== "audioinput" || this.#currentInputTrackIsLive()))
     ) {
       return false;
     }
     fallback.expectedId = currentId;
     return fallback;
+  }
+
+  #currentInputTrackIsLive() {
+    return this.getCurrentStream()?.getAudioTracks()[0]?.readyState !== "ended";
   }
 
   async #rollbackInputFallback(sender, currentTrack) {

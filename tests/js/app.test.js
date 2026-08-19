@@ -1701,6 +1701,7 @@ async function bootConversationHarness({
   answerStarts = [],
   pendingEnumerations = [],
   pendingOffers = [],
+  pendingSenderReplacements = [],
 } = {}) {
   const html = await readFile(
     new URL("../../src/moco/web/static/index.html", import.meta.url),
@@ -1775,11 +1776,17 @@ async function bootConversationHarness({
 
     addTrack(track, stream) {
       this.addedTracks.push({ track, stream });
+      const peerIndex = this.index;
       this.sender = {
         track,
         replacements: [],
         async replaceTrack(nextTrack) {
           this.replacements.push(nextTrack);
+          if (pendingSenderReplacements.includes(peerIndex) && this.replacements.length === 1) {
+            await new Promise((resolve) => {
+              this.resolveReplacement = resolve;
+            });
+          }
           this.track = nextTrack;
         },
       };
@@ -1880,9 +1887,11 @@ async function bootConversationHarness({
         kind: "audio",
         deviceId,
         enabled: false,
+        readyState: "live",
         stopCalls: 0,
         stop() {
           this.stopCalls += 1;
+          this.readyState = "ended";
         },
       };
       const stream = {
@@ -2024,6 +2033,56 @@ describe("audio device switching", () => {
       assert.equal(connection.peers.length, 1);
       assert.equal(connection.sockets.length, 1);
     } finally {
+      await connection.close();
+    }
+  });
+
+  it("keeps the active route and reports a manual switch canceled by Voice peer replacement", async () => {
+    const unhandled = [];
+    const onUnhandled = (error) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+    const connection = await bootConversationHarness({
+      answerStarts: [0, 1],
+      pendingSenderReplacements: [0],
+    });
+    try {
+      await connection.waitFor(
+        () =>
+          connection.peers[0]?.remoteDescriptions.length === 1 &&
+          connection.dom.window.document.querySelector("#audio-input").disabled === false,
+      );
+      const input = connection.dom.window.document.querySelector("#audio-input");
+      const initialTrack = connection.peers[0].sender.track;
+
+      input.value = "mic-2";
+      input.dispatchEvent(new connection.dom.window.Event("change"));
+      await connection.waitFor(() => connection.peers[0].sender.replacements.length === 1);
+      const candidateTrack = connection.tracks[1];
+
+      connection.requireReplacement();
+      await connection.waitFor(() => connection.peers[1]?.remoteDescriptions.length === 1);
+      connection.peers[0].sender.resolveReplacement();
+      await connection.waitFor(
+        () =>
+          candidateTrack.stopCalls === 1 &&
+          connection.dom.window.document.querySelector("#error-text").textContent !== "",
+      );
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(connection.peers[1].sender.track, initialTrack);
+      assert.equal(initialTrack.stopCalls, 0);
+      assert.equal(candidateTrack.stopCalls, 1);
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "microphone_switch_failed — 入力マイクを切り替えられませんでした",
+      );
+      assert.equal(connection.sent.filter(({ type }) => type === "start").length, 2);
+      assert.equal(connection.peers.length, 2);
+      assert.equal(connection.sockets.length, 1);
+      assert.deepEqual(unhandled, []);
+    } finally {
+      connection.peers[0]?.sender.resolveReplacement?.();
+      process.off("unhandledRejection", onUnhandled);
       await connection.close();
     }
   });

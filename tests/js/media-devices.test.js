@@ -63,12 +63,14 @@ function deferred() {
   return { promise, reject, resolve };
 }
 
-function createTrack({ enabled = true, events, name = "track" } = {}) {
+function createTrack({ enabled = true, events, name = "track", readyState = "live" } = {}) {
   return {
     enabled,
+    readyState,
     stopCalls: 0,
     stop() {
       this.stopCalls += 1;
+      this.readyState = "ended";
       events?.push(`stop:${name}`);
     },
   };
@@ -1048,6 +1050,49 @@ describe("AudioDeviceController", () => {
     assert.deepEqual(errors, []);
   });
 
+  it("commits an acquired default fallback when the restored selected track is ended", async () => {
+    const fallbackAcquisition = deferred();
+    const endedTrack = createTrack();
+    const candidateTrack = createTrack();
+    const endedStream = createStream([endedTrack]);
+    const candidateStream = createStream([candidateTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: endedStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }],
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(fallbackAcquisition.promise);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    endedTrack.readyState = "ended";
+    setup.mediaDevices.devices = [];
+
+    const missingRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    setup.mediaDevices.devices = [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }];
+    assert.equal(await setup.controller.refresh(), true);
+    fallbackAcquisition.resolve(candidateStream);
+    assert.equal(await missingRefresh, true);
+
+    assert.deepEqual(sender.replacements, [candidateTrack]);
+    assert.equal(setup.currentStream(), candidateStream);
+    assert.equal(candidateTrack.stopCalls, 0);
+    assert.equal(endedTrack.stopCalls, 1);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
   it("rolls back a replaced input fallback that becomes stale before commit", async () => {
     const replacement = deferred();
     const errors = [];
@@ -1095,6 +1140,90 @@ describe("AudioDeviceController", () => {
     assert.equal(setup.inputSelect.value, "mic-1");
     assert.equal(storage.getItem("moco.audio.inputDeviceId"), "mic-1");
     assert.deepEqual(errors, []);
+  });
+
+  it("does not roll back a replaced default fallback to a restored ended track", async () => {
+    const replacement = deferred();
+    const endedTrack = createTrack();
+    const candidateTrack = createTrack();
+    const endedStream = createStream([endedTrack]);
+    const candidateStream = createStream([candidateTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+        await replacement.promise;
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: endedStream,
+      devices: [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }],
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(candidateStream);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    endedTrack.readyState = "ended";
+    setup.mediaDevices.devices = [];
+
+    const missingRefresh = setup.controller.refresh();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.deepEqual(sender.replacements, [candidateTrack]);
+    setup.mediaDevices.devices = [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }];
+    assert.equal(await setup.controller.refresh(), true);
+    replacement.resolve();
+    assert.equal(await missingRefresh, true);
+
+    assert.deepEqual(sender.replacements, [candidateTrack]);
+    assert.equal(setup.currentStream(), candidateStream);
+    assert.equal(candidateTrack.stopCalls, 0);
+    assert.equal(endedTrack.stopCalls, 1);
+    assert.equal(setup.controller.inputId, "");
+    assert.equal(setup.inputSelect.value, "");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
+  });
+
+  it("reacquires an explicitly reselected ended input but no-ops once it is live", async () => {
+    const endedTrack = createTrack();
+    const candidateTrack = createTrack();
+    const candidateStream = createStream([candidateTrack]);
+    const sender = {
+      replacements: [],
+      async replaceTrack(track) {
+        this.replacements.push(track);
+      },
+    };
+    const storage = new FakeStorage();
+    const setup = createController({
+      currentStream: createStream([endedTrack]),
+      devices: [{ kind: "audioinput", deviceId: "mic-1", label: "Microphone 1" }],
+      sender,
+      storage,
+    });
+    setup.mediaDevices.getUserMediaResults.push(candidateStream);
+    await setup.controller.start();
+    setup.controller.inputId = "mic-1";
+    setup.inputSelect.value = "mic-1";
+    storage.setItem("moco.audio.inputDeviceId", "mic-1");
+    endedTrack.readyState = "ended";
+
+    assert.equal(await setup.controller.selectInput("mic-1"), true);
+    assert.equal(await setup.controller.selectInput("mic-1"), false);
+
+    assert.deepEqual(setup.mediaDevices.getUserMediaCalls, [
+      { audio: { deviceId: { exact: "mic-1" } } },
+    ]);
+    assert.deepEqual(sender.replacements, [candidateTrack]);
+    assert.equal(setup.currentStream(), candidateStream);
+    assert.equal(candidateTrack.stopCalls, 0);
+    assert.equal(endedTrack.stopCalls, 1);
+    assert.equal(setup.controller.inputId, "mic-1");
+    assert.equal(setup.inputSelect.value, "mic-1");
+    assert.equal(storage.getItem("moco.audio.inputDeviceId"), "mic-1");
   });
 
   it("commits the actual default input route when stale fallback rollback fails", async () => {
@@ -1951,7 +2080,7 @@ describe("AudioDeviceController", () => {
     assert.deepEqual(setup.streamReplacements, []);
     assert.equal(setup.controller.inputId, "");
     assert.equal(storage.getItem("moco.audio.inputDeviceId"), null);
-    assert.deepEqual(errors, []);
+    assert.deepEqual(errors, ["microphone_switch_failed"]);
   });
 
   it("does not report or preserve a candidate when close invalidates a failed identity rollback", async () => {
@@ -2047,7 +2176,7 @@ describe("AudioDeviceController", () => {
     assert.deepEqual(setup.streamReplacements, []);
     assert.equal(setup.controller.inputId, "");
     assert.equal(setup.storage.getItem("moco.audio.inputDeviceId"), null);
-    assert.deepEqual(errors, []);
+    assert.deepEqual(errors, ["microphone_switch_failed"]);
   });
 
   it("does not let a closed controller render after its delayed enumeration rejects", async () => {
