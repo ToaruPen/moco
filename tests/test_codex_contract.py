@@ -69,6 +69,10 @@ def test_installed_codex_accepts_the_production_realtime_start_payload() -> None
     assert realtime.params_kind is ParamsKind.OBJECT
     assert realtime.semantic_fields == frozenset(
         {
+            "clientManagedHandoffs",
+            "codexResponseHandoffMode",
+            "codexResponsesAsItems",
+            "delegationAckFiller",
             "includeStartupContext",
             "outputModality",
             "prompt",

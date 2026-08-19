@@ -31,7 +31,7 @@ from moco.codex.session import (
     ReasoningSummaryEvent,
     TranscriptEvent,
 )
-from moco.config import CodexSettings, MocoSettings
+from moco.config import AgentProfileMode, AgentSettings, CodexSettings, MocoSettings
 from moco.errors import (
     CodexCapabilityError,
     CodexPromptError,
@@ -94,10 +94,12 @@ class FakeRpc:
             if self.emit_sdp:
                 await self.emit(
                     "thread/realtime/sdp",
-                    {"threadId": "thr_test", "sdp": "answer-sdp"},
+                    {"threadId": copied["threadId"], "sdp": "answer-sdp"},
                 )
             return {}
         if method == "thread/realtime/stop":
+            return {}
+        if method == "turn/interrupt":
             return {}
         msg = f"unexpected request: {method}"
         raise AssertionError(msg)
@@ -286,6 +288,10 @@ def make_voice_contract(
                 frozenset(
                     {
                         "includeStartupContext",
+                        "clientManagedHandoffs",
+                        "codexResponseHandoffMode",
+                        "codexResponsesAsItems",
+                        "delegationAckFiller",
                         "outputModality",
                         "prompt",
                         "threadId",
@@ -294,6 +300,11 @@ def make_voice_contract(
                     }
                 ),
             ),
+            SemanticMethod.TURN_INTERRUPT: ClientMethodContract(
+                "turn/interrupt",
+                ParamsKind.OBJECT,
+                frozenset({"threadId", "turnId"}),
+            ),
         },
         server_requests={},
         unclassified_server_request_count=0,
@@ -301,7 +312,7 @@ def make_voice_contract(
     )
 
 
-def make_session(
+def make_session(  # noqa: PLR0913
     connection: CodexConnection,
     *,
     settings: MocoSettings,
@@ -309,6 +320,8 @@ def make_session(
     contract: CodexProtocolContract | None = None,
     working_directory: Path | None = None,
     prompt: str | None = None,
+    existing_thread_id: str | None = None,
+    existing_active_turn_id: str | None = None,
     sdp_timeout: float = 10.0,
 ) -> CodexRealtimeSession:
     return CodexRealtimeSession(
@@ -318,6 +331,8 @@ def make_session(
         capabilities=capabilities,
         working_directory=working_directory,
         prompt=prompt,
+        existing_thread_id=existing_thread_id,
+        existing_active_turn_id=existing_active_turn_id,
         sdp_timeout=sdp_timeout,
     )
 
@@ -618,6 +633,10 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
             "thread/realtime/start",
             {
                 "threadId": "thr_test",
+                "clientManagedHandoffs": False,
+                "delegationAckFiller": True,
+                "codexResponsesAsItems": False,
+                "codexResponseHandoffMode": "bemTags",
                 "outputModality": "audio",
                 "includeStartupContext": False,
                 "prompt": DEFAULT_REALTIME_PROMPT,
@@ -627,6 +646,127 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
         ),
     ]
     await session.close()
+
+
+async def test_starts_realtime_thread_with_workspace_write_profile(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    settings = make_settings(tmp_path).model_copy(
+        update={"agent": AgentSettings(profile=AgentProfileMode.WORKSPACE_WRITE)}
+    )
+    session = make_session(
+        rpc,
+        settings=settings,
+        capabilities=make_snapshot(),
+    )
+
+    await session.start("offer-sdp")
+
+    assert rpc.requests[0] == (
+        "thread/start",
+        {
+            "ephemeral": True,
+            "sandbox": "workspace-write",
+            "approvalPolicy": "on-request",
+            "cwd": str(tmp_path),
+        },
+    )
+    await session.close()
+
+
+async def test_starts_realtime_thread_with_inherited_codex_profile(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    settings = make_settings(tmp_path).model_copy(
+        update={"agent": AgentSettings(profile=AgentProfileMode.INHERIT_CODEX)}
+    )
+    session = make_session(
+        rpc,
+        settings=settings,
+        capabilities=make_snapshot(),
+    )
+
+    await session.start("offer-sdp")
+
+    assert rpc.requests[0] == (
+        "thread/start",
+        {"ephemeral": True, "cwd": str(tmp_path)},
+    )
+    await session.close()
+
+
+async def test_reoffer_reuses_existing_realtime_thread_without_starting_another(
+    tmp_path: Path,
+) -> None:
+    rpc = FakeRpc()
+    session = make_session(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+        existing_thread_id="thr_existing",
+    )
+
+    await session.start("offer-sdp")
+
+    assert rpc.requests[0] == (
+        "thread/realtime/start",
+        {
+            "threadId": "thr_existing",
+            "clientManagedHandoffs": False,
+            "delegationAckFiller": True,
+            "codexResponsesAsItems": False,
+            "codexResponseHandoffMode": "bemTags",
+            "outputModality": "audio",
+            "includeStartupContext": False,
+            "prompt": DEFAULT_REALTIME_PROMPT,
+            "transport": {"type": "webrtc", "sdp": "offer-sdp"},
+            "version": "v3",
+        },
+    )
+    assert all(method != "thread/start" for method, _params in rpc.requests)
+    await session.close()
+
+
+async def test_reoffer_retains_and_interrupts_existing_active_turn(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = make_session(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+        existing_thread_id="thr_existing",
+        existing_active_turn_id="turn_existing",
+    )
+
+    assert session.owns_active_turn("thr_existing", "turn_existing")
+    await session.start("offer-sdp")
+    assert await session.interrupt_active_turn()
+    assert rpc.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thr_existing", "turnId": "turn_existing"},
+    )
+
+    events = session.notifications()
+    await rpc.emit(
+        "turn/completed",
+        {"threadId": "thr_existing", "turn": {"id": "turn_existing"}},
+    )
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "completed",
+        "thr_existing",
+        "turn_existing",
+        None,
+    )
+    assert session.active_turn_id is None
+    await session.close()
+
+
+def test_reoffer_rejects_active_turn_without_existing_thread(tmp_path: Path) -> None:
+    with pytest.raises(ValueError, match="active turn"):
+        make_session(
+            FakeRpc(),
+            settings=make_settings(tmp_path),
+            capabilities=make_snapshot(),
+            existing_active_turn_id="turn_existing",
+        )
 
 
 async def test_uses_contract_derived_start_method_names(tmp_path: Path) -> None:
@@ -659,6 +799,21 @@ async def test_uses_built_in_prompt_when_implicit_file_is_absent(
     monkeypatch.setattr(session_module, "default_prompt_path", lambda: tmp_path / "prompt.md")
 
     assert await _started_prompt(FakeRpc(), MocoSettings()) == DEFAULT_REALTIME_PROMPT
+
+
+def test_built_in_prompt_defines_moco_frameless_and_irodori_contract() -> None:
+    prompt = " ".join(DEFAULT_REALTIME_PROMPT.split())
+    assert "You are moco" in prompt
+    assert "delegate" in prompt
+    assert "same unified assistant" in prompt
+    assert "Irodori" in prompt
+    assert "moco.speech_plan" in prompt
+
+
+def test_packaged_prompt_example_matches_the_runtime_default() -> None:
+    example = Path("config/moco.prompt.example.md").read_text(encoding="utf-8").strip()
+
+    assert example == DEFAULT_REALTIME_PROMPT
 
 
 async def test_reads_implicit_dot_moco_prompt(
@@ -1111,6 +1266,56 @@ async def test_tracks_active_turn_without_sending_control_requests(tmp_path: Pat
     assert session.active_turn_id == "turn-1"
     assert all(method != "turn/interrupt" for method, _params in rpc.requests)
     assert all(method != "thread/realtime/appendText" for method, _params in rpc.requests)
+    await session.close()
+
+
+async def test_owns_only_the_active_turn_on_its_realtime_thread(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = make_session(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+    )
+    await session.start("offer-sdp")
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    await asyncio.sleep(0)
+
+    assert session.owns_active_turn("thr_test", "turn-1")
+    assert not session.owns_active_turn("thr_other", "turn-1")
+    assert not session.owns_active_turn("thr_test", "turn-other")
+    await session.close()
+
+
+async def test_interrupts_the_active_realtime_turn_once(tmp_path: Path) -> None:
+    rpc = FakeRpc()
+    session = make_session(
+        rpc,
+        settings=make_settings(tmp_path),
+        capabilities=make_snapshot(),
+    )
+    await session.start("offer-sdp")
+    await rpc.emit(
+        "turn/started",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    await asyncio.sleep(0)
+
+    assert await session.interrupt_active_turn()
+    assert rpc.requests[-1] == (
+        "turn/interrupt",
+        {"threadId": "thr_test", "turnId": "turn-1"},
+    )
+
+    await rpc.emit(
+        "turn/completed",
+        {"threadId": "thr_test", "turn": {"id": "turn-1"}},
+    )
+    await asyncio.sleep(0)
+    assert not await session.interrupt_active_turn()
+    assert sum(method == "turn/interrupt" for method, _params in rpc.requests) == 1
     await session.close()
 
 

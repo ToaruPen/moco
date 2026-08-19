@@ -8,7 +8,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, Self, cast
 
 from moco.codex.capabilities import CapabilitySnapshot, CapabilityState, CapabilityStatus
 from moco.codex.schema import CodexProtocolContract, SemanticMethod
-from moco.config import default_prompt_path
+from moco.config import AgentProfileMode, default_prompt_path
 from moco.errors import (
     CodexCapabilityError,
     CodexPromptError,
@@ -24,11 +24,40 @@ if TYPE_CHECKING:
     from moco.codex.rpc import JsonValue, RpcNotification
     from moco.config import MocoSettings
 
-DEFAULT_REALTIME_PROMPT = (
-    "Respond in short, natural Japanese suitable for speech synthesis. "
-    "Use clear punctuation. Use Irodori-supported emoji only when expression requires it. "
-    "Do not respond with structured JSON or Markdown."
-)
+DEFAULT_REALTIME_PROMPT = """
+## Identity and voice
+
+You are moco, a macOS-first push-to-talk voice agent and a warm, capable collaborator.
+Speak concise, natural Japanese with clear punctuation. Your user-facing words are rendered by
+Irodori, so return plain speakable text rather than Markdown, tables, diffs, code blocks, or raw
+structured data. Use an Irodori-supported emoji only when it materially improves expression.
+
+## Unified Frameless operation
+
+You own the conversation and Codex performs delegated execution as part of the same unified
+assistant. Never expose an internal frontend/backend split. Present work as something you are doing.
+
+Delegate every action, investigation, repository task, web task, app task, document task, or other
+request that benefits from tools to Codex. Delegate when uncertain whether execution is needed.
+Answer directly only when the request is clearly self-contained and delegation adds no value. Never
+substitute conversation for requested work, and never claim execution succeeded before Codex does.
+
+Treat Codex commentary and final output as authoritative. Do not contradict it, silently change its
+result, or start the same work a second time. Acknowledge delegation promptly and give short,
+grounded progress when useful. When Codex returns a result, speak the key outcome and next step
+once; do not repeat the same update or read raw logs and heavily formatted artifacts aloud.
+
+If the user corrects, redirects, or interrupts active work, pass that steering to Codex immediately.
+Ask a brief question only when proceeding would risk a materially harmful mistake.
+
+## Irodori speech contract
+
+Normal output is plain Japanese speakable text. An optional first physical line may be exactly one
+JSON object with type `moco.speech_plan`, version 1, and `delivery_caption` as a string or null.
+When Codex supplies that control line, preserve it as the first line for moco and follow it with
+non-empty speakable text. Do not emit other JSON. Do not speak or paraphrase the control line
+itself.
+""".strip()
 _MAX_REALTIME_PROMPT_BYTES = 65_536
 type TranscriptKind = Literal["delta", "done"]
 type TranscriptRole = Literal["assistant", "user"]
@@ -117,7 +146,7 @@ class CodexConnection(Protocol):
 
 
 class CodexRealtimeSession:
-    def __init__(
+    def __init__(  # noqa: PLR0913
         self,
         connection: CodexConnection,
         *,
@@ -126,16 +155,32 @@ class CodexRealtimeSession:
         capabilities: CapabilitySnapshot,
         working_directory: Path | None = None,
         prompt: str | None = None,
+        existing_thread_id: str | None = None,
+        existing_active_turn_id: str | None = None,
         sdp_timeout: float = 10.0,
     ) -> None:
         if sdp_timeout <= 0:
             msg = "sdp_timeout must be positive"
+            raise ValueError(msg)
+        if existing_thread_id is not None and (
+            type(existing_thread_id) is not str or not existing_thread_id
+        ):
+            msg = "existing thread id must be a non-empty string"
+            raise ValueError(msg)
+        if existing_active_turn_id is not None and (
+            type(existing_active_turn_id) is not str or not existing_active_turn_id
+        ):
+            msg = "existing active turn id must be a non-empty string"
+            raise ValueError(msg)
+        if existing_active_turn_id is not None and existing_thread_id is None:
+            msg = "existing active turn requires an existing thread"
             raise ValueError(msg)
         self._connection = connection
         self._thread_start_method = contract.require_method(SemanticMethod.THREAD_START).name
         self._realtime_start_method = contract.require_method(
             SemanticMethod.THREAD_REALTIME_START
         ).name
+        self._turn_interrupt_method = contract.require_method(SemanticMethod.TURN_INTERRUPT).name
         self._capabilities = capabilities
         self._settings = settings
         self._prompt = prompt
@@ -147,8 +192,9 @@ class CodexRealtimeSession:
             raise ValueError(msg)
         self._working_directory = resolved_working_directory
         self._sdp_timeout = sdp_timeout
-        self._thread_id: str | None = None
-        self._active_turn_id: str | None = None
+        self._thread_id = existing_thread_id
+        self._active_turn_id = existing_active_turn_id
+        self._interrupt_requested_turn_id: str | None = None
         self._notification_task: asyncio.Task[None] | None = None
         self._sdp_future: asyncio.Future[str] | None = None
         self._events: asyncio.Queue[RealtimeEvent | CodexRpcError | object] = asyncio.Queue(
@@ -172,6 +218,37 @@ class CodexRealtimeSession:
     @property
     def closed(self) -> bool:
         return self._closed
+
+    def owns_active_turn(self, thread_id: str, turn_id: str) -> bool:
+        return (
+            not self._closing
+            and not self._closed
+            and thread_id == self._thread_id
+            and turn_id == self._active_turn_id
+        )
+
+    async def interrupt_active_turn(self) -> bool:
+        thread_id = self._thread_id
+        turn_id = self._active_turn_id
+        if (
+            thread_id is None
+            or turn_id is None
+            or turn_id == self._interrupt_requested_turn_id
+            or self._closing
+            or self._closed
+        ):
+            return False
+        self._interrupt_requested_turn_id = turn_id
+        try:
+            await self._connection.request(
+                self._turn_interrupt_method,
+                {"threadId": thread_id, "turnId": turn_id},
+            )
+        except BaseException:
+            if self._active_turn_id == turn_id:
+                self._interrupt_requested_turn_id = None
+            raise
+        return True
 
     async def __aenter__(self) -> Self:
         return self
@@ -206,20 +283,20 @@ class CodexRealtimeSession:
                 self._pump_notifications(notifications),
                 name="codex-realtime-notifications",
             )
-            thread_result = await self._connection.request(
-                self._thread_start_method,
-                {
-                    "ephemeral": True,
-                    "sandbox": "read-only",
-                    "approvalPolicy": "never",
-                    "cwd": str(self._working_directory),
-                },
-            )
-            self._thread_id = _thread_id_from_result(thread_result)
+            if self._thread_id is None:
+                thread_result = await self._connection.request(
+                    self._thread_start_method,
+                    self._thread_params(),
+                )
+                self._thread_id = _thread_id_from_result(thread_result)
             await self._connection.request(
                 self._realtime_start_method,
                 {
                     "threadId": self._thread_id,
+                    "clientManagedHandoffs": False,
+                    "delegationAckFiller": True,
+                    "codexResponsesAsItems": False,
+                    "codexResponseHandoffMode": "bemTags",
                     "outputModality": "audio",
                     "includeStartupContext": False,
                     "prompt": prompt,
@@ -407,11 +484,13 @@ class CodexRealtimeSession:
         turn_id = _required_string(raw_turn, "id", notification.method)
         if notification.method == "turn/started":
             self._active_turn_id = turn_id
+            self._interrupt_requested_turn_id = None
             self._enqueue_event(
                 ActivityEvent("turn", "started", thread_id, turn_id, None),
             )
         elif turn_id == self._active_turn_id:
             self._active_turn_id = None
+            self._interrupt_requested_turn_id = None
             self._enqueue_event(
                 ActivityEvent("turn", "completed", thread_id, turn_id, None),
             )
@@ -507,6 +586,20 @@ class CodexRealtimeSession:
             return
         self._events_ended = True
         self._events.put_nowait(_EVENTS_END)
+
+    def _thread_params(self) -> dict[str, JsonValue]:
+        params: dict[str, JsonValue] = {
+            "cwd": str(self._working_directory),
+            "ephemeral": True,
+        }
+        profile = self._settings.agent.profile
+        if profile is AgentProfileMode.READ_ONLY:
+            params["sandbox"] = "read-only"
+            params["approvalPolicy"] = "never"
+        elif profile is AgentProfileMode.WORKSPACE_WRITE:
+            params["sandbox"] = "workspace-write"
+            params["approvalPolicy"] = "on-request"
+        return params
 
 
 def _log_cleanup_failure(boundary: str, error: BaseException) -> None:

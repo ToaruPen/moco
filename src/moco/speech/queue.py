@@ -37,6 +37,11 @@ _PUBLIC_IRODORI_ERROR_CODES = frozenset(
         "speech_caption_invalid",
     },
 )
+_MAX_PENDING_SPEECH_ITEMS = 64
+
+
+class SpeechQueueOverflowError(RuntimeError):
+    """The bounded Irodori work queue cannot admit another transcript batch."""
 
 
 class Synthesizer(Protocol):
@@ -201,6 +206,10 @@ class SpeechQueue:
         enqueued_ns = time.monotonic_ns()
         segment_wait_ms = self._segment_wait_ms(enqueued_ns)
         async with self._condition:
+            active_count = int(self._active is not None and not self._active.done())
+            if len(self._items) + active_count + len(segments) > _MAX_PENDING_SPEECH_ITEMS:
+                message = "speech queue limit exceeded"
+                raise SpeechQueueOverflowError(message)
             starting_depth = len(self._items)
             items: list[_SpeechItem] = []
             for segment in segments:

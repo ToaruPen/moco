@@ -560,6 +560,11 @@ async def test_doctor_keeps_schema_compatible_for_one_capability_mismatch(
             DoctorCheck("codex_realtime", "error", "feature_disabled"),
         ),
         (
+            make_snapshot(realtime=CapabilityState(CapabilityStatus.DISABLED, "prompt_overridden")),
+            "codex_realtime",
+            DoctorCheck("codex_realtime", "error", "prompt_overridden"),
+        ),
+        (
             make_snapshot(
                 realtime=CapabilityState(
                     CapabilityStatus.VERSION_MISMATCH,

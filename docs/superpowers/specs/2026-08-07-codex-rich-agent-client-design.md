@@ -1,5 +1,14 @@
 # Codex rich-agent音声クライアント設計
 
+> **Frameless Bidiによる置換:** 2026-08-19に現行Codex app-serverの生成schema、
+> 公式実装、実機WebRTCを再検証した結果、Realtime v3は`delegation.*`から通常Codex
+> 作業を自動実行し、そのcommentaryとfinalを同じRealtime会話へ返すことが確認された。
+> この文書の「一つのapp-server接続と二つのthread」「VoiceからAgentへのhandoff」
+> 「Voice modelのassistant transcriptを捨てる」「Agent finalだけを読み上げる」という
+> 設計は、`2026-08-19-frameless-bidi-voice-restoration-design.md`に置き換えられる。
+> 双方向RPC、schema検証、能力発見、承認Reviewer、profile、進捗表示に関する設計は
+> 引き続き有効であり、一つのRealtime Threadへ適用する。
+
 ## 位置づけ
 
 mocoは現在、Codex Realtimeとの低遅延会話を中心に構成されている。しかし、音声で

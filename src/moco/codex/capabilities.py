@@ -17,6 +17,7 @@ from moco.codex.schema import (
     ServerRequestCategory,
     _is_transport_safe,
 )
+from moco.config import AgentProfileMode
 from moco.errors import (
     CodexProcessExitedError,
     CodexRpcError,
@@ -110,6 +111,8 @@ _AUTHENTICATION_REQUIRED = CapabilityState(
 )
 _FEATURE_DISABLED = CapabilityState(CapabilityStatus.DISABLED, "feature_disabled")
 _NO_VOICE = CapabilityState(CapabilityStatus.DISABLED, "no_voice")
+_PROMPT_OVERRIDDEN = CapabilityState(CapabilityStatus.DISABLED, "prompt_overridden")
+_REALTIME_PROMPT_OVERRIDE_KEY = "experimental_realtime_ws_backend_prompt"
 _APPROVAL_CATEGORIES_UNAVAILABLE = CapabilityState(
     CapabilityStatus.VERSION_MISMATCH,
     "approval_categories_unavailable",
@@ -134,7 +137,10 @@ _TERMINAL_ERRORS = (CodexProcessExitedError, CodexRpcProtocolError)
 
 _EXPECTED_METHODS: dict[SemanticMethod, tuple[ParamsKind, frozenset[str]]] = {
     SemanticMethod.ACCOUNT_READ: (ParamsKind.OBJECT, frozenset()),
-    SemanticMethod.CONFIG_READ: (ParamsKind.OBJECT, frozenset({"cwd"})),
+    SemanticMethod.CONFIG_READ: (
+        ParamsKind.OBJECT,
+        frozenset({"cwd", "includeLayers"}),
+    ),
     SemanticMethod.CONFIG_REQUIREMENTS_READ: (ParamsKind.OMITTED, frozenset()),
     SemanticMethod.EXPERIMENTAL_FEATURE_LIST: (
         ParamsKind.OBJECT,
@@ -149,6 +155,10 @@ _EXPECTED_METHODS: dict[SemanticMethod, tuple[ParamsKind, frozenset[str]]] = {
         ParamsKind.OBJECT,
         frozenset(
             {
+                "clientManagedHandoffs",
+                "codexResponseHandoffMode",
+                "codexResponsesAsItems",
+                "delegationAckFiller",
                 "includeStartupContext",
                 "outputModality",
                 "prompt",
@@ -241,7 +251,10 @@ class CapabilityDiscovery:
                 server_requests=server_requests,
             )
 
-        effective_policy, policy_state, terminal = await self._probe_policy(contract, validation)
+        effective_policy, policy_state, prompt_state, terminal = await self._probe_policy(
+            contract,
+            validation,
+        )
         if terminal:
             return _snapshot_after_terminal(
                 contract,
@@ -279,7 +292,13 @@ class CapabilityDiscovery:
             )
 
         voices, terminal = await self._probe_voices(contract, validation)
-        realtime = _realtime_state(contract, validation, voices, feature_result)
+        realtime = _realtime_state(
+            contract,
+            validation,
+            voices,
+            feature_result,
+            prompt_state,
+        )
         interrupt = _interrupt_state(contract, validation) if not terminal else _PROBE_FAILED
         steer = _steer_state(contract, validation) if not terminal else _PROBE_FAILED
         admission = (
@@ -330,25 +349,30 @@ class CapabilityDiscovery:
         self,
         contract: CodexProtocolContract,
         validation: _ContractValidation,
-    ) -> tuple[EffectivePolicy | None, CapabilityState, bool]:
+    ) -> tuple[EffectivePolicy | None, CapabilityState, CapabilityState, bool]:
         method, unavailable = _method_contract(
             contract,
             SemanticMethod.CONFIG_READ,
             validation,
         )
         if method is None:
-            return None, unavailable, False
+            return None, unavailable, unavailable, False
         try:
             response = await self._rpc.request(
                 method.name,
-                {"cwd": str(self._working_directory)},
+                {"cwd": str(self._working_directory), "includeLayers": True},
             )
         except _TERMINAL_ERRORS:
-            return None, _PROBE_FAILED, True
+            return None, _PROBE_FAILED, _PROBE_FAILED, True
         except CodexRpcError:
-            return None, _PROBE_FAILED, False
+            return None, _PROBE_FAILED, _PROBE_FAILED, False
         policy = _parse_policy(response)
-        return policy, _AVAILABLE if policy is not None else _INVALID_RESPONSE, False
+        return (
+            policy,
+            _AVAILABLE if policy is not None else _INVALID_RESPONSE,
+            _parse_realtime_prompt_override(response),
+            False,
+        )
 
     async def _probe_requirements(
         self,
@@ -608,6 +632,38 @@ def _parse_policy(response: object) -> EffectivePolicy | None:
     return EffectivePolicy(sandbox, approval)
 
 
+def _parse_realtime_prompt_override(response: object) -> CapabilityState:
+    if not isinstance(response, dict):
+        return _INVALID_RESPONSE
+    layers = response.get("layers")
+    if not isinstance(layers, list):
+        return _INVALID_RESPONSE
+    result = _AVAILABLE
+    for layer in layers:
+        if not isinstance(layer, dict):
+            result = _INVALID_RESPONSE
+            break
+        disabled_reason = layer.get("disabledReason")
+        if disabled_reason is not None:
+            if not isinstance(disabled_reason, str):
+                result = _INVALID_RESPONSE
+                break
+            continue
+        config = layer.get("config")
+        if not isinstance(config, dict):
+            result = _INVALID_RESPONSE
+            break
+        prompt = config.get(_REALTIME_PROMPT_OVERRIDE_KEY)
+        if prompt is None or prompt == "":
+            continue
+        if not isinstance(prompt, str):
+            result = _INVALID_RESPONSE
+            break
+        result = _PROMPT_OVERRIDDEN
+        break
+    return result
+
+
 def _parse_approval(value: object) -> ApprovalMode | None:
     if isinstance(value, str):
         try:
@@ -697,6 +753,7 @@ def _realtime_state(
     validation: _ContractValidation,
     voices: CapabilityState,
     feature: _FeatureResult,
+    prompt: CapabilityState,
 ) -> CapabilityState:
     if voices.status is not CapabilityStatus.AVAILABLE:
         return voices
@@ -711,6 +768,8 @@ def _realtime_state(
         return _FEATURE_DISABLED
     if feature is _FeatureResult.INVALID:
         return _INVALID_RESPONSE
+    if prompt.status is not CapabilityStatus.AVAILABLE:
+        return prompt
     return _AVAILABLE
 
 
@@ -765,6 +824,25 @@ def is_unsafe_voice_policy(policy: EffectivePolicy | None) -> bool:
         and policy.sandbox is SandboxMode.DANGER_FULL_ACCESS
         and policy.approval is ApprovalMode.NEVER
     )
+
+
+def profile_agent_admission(
+    snapshot: CapabilitySnapshot,
+    profile: AgentProfileMode,
+) -> CapabilityState:
+    """Project discovered admission through moco's selected execution profile."""
+    admission = snapshot.agent_admission
+    if profile is not AgentProfileMode.INHERIT_CODEX:
+        return admission
+    if admission.status is not CapabilityStatus.AVAILABLE:
+        return admission
+    if snapshot.policy_state.status is not CapabilityStatus.AVAILABLE:
+        return snapshot.policy_state
+    if snapshot.effective_policy is None:
+        return _INVALID_RESPONSE
+    if is_unsafe_voice_policy(snapshot.effective_policy):
+        return CapabilityState(CapabilityStatus.DISABLED, "unsafe_voice_policy")
+    return admission
 
 
 def _approval_readiness(

@@ -142,20 +142,22 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
     ]:
         assert boundary in stage_b
 
-    interaction = readme.split("### Agent 作業、取消、再接続", maxsplit=1)[1].split(
+    interaction = readme.split("### Codex作業、取消、再接続", maxsplit=1)[1].split(
         "### GPTの応答スタイルを変更する", maxsplit=1
     )[0]
     for behavior in [
-        "中間音声は発しません",
-        "final answer",
+        "delegation.created",
+        "acknowledgement",
+        "speakable progress",
+        "final",
         "新しい発話",
         "取消",
         "interrupt",
         "自動再送",
-        "outcome unknown",
     ]:
         assert behavior in interaction
     assert "処理しています。" not in interaction
+    assert "中間音声は発しません" not in interaction
     assert "Realtime 側の自然な割り込み" not in readme
 
     privacy = readme.split("## プライバシーと観測", maxsplit=1)[1].split("## 開発", maxsplit=1)[0]

@@ -268,6 +268,37 @@ def test_snapshot_contract_and_idle_projection() -> None:
     assert not is_idle(interaction)
 
 
+def test_realtime_turn_activity_owns_task_state_without_starting_agent_session() -> None:
+    session = FakeSession()
+    effects = EffectsRecorder()
+    interaction = coordinator(session, effects)
+    interaction.connection_changed(ConnectionState.READY)
+
+    interaction.realtime_turn_started("realtime-turn-1")
+    interaction.review_count_changed(1)
+    interaction.review_count_changed(0)
+    interaction.realtime_turn_completed("realtime-turn-1")
+
+    assert session.started == []
+    assert [snapshot.task for snapshot in effects.snapshots] == [
+        TaskState.NONE,
+        TaskState.RUNNING,
+        TaskState.WAITING_REVIEW,
+        TaskState.RUNNING,
+        TaskState.COMPLETED,
+    ]
+    assert effects.results == []
+
+
+def test_realtime_turn_completion_ignores_a_different_turn() -> None:
+    interaction = coordinator(FakeSession(), EffectsRecorder())
+    interaction.realtime_turn_started("realtime-turn-1")
+
+    interaction.realtime_turn_completed("realtime-turn-other")
+
+    assert interaction.snapshot.task is TaskState.RUNNING
+
+
 def test_coordinator_contract_is_exported_from_runtime_package() -> None:
     assert runtime.InteractionCoordinator is InteractionCoordinator
     assert runtime.InteractionSnapshot is InteractionSnapshot

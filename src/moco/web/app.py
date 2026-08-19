@@ -22,6 +22,7 @@ from moco.codex.capabilities import (
     CapabilityDiscovery,
     CapabilitySnapshot,
     CapabilityStatus,
+    profile_agent_admission,
 )
 from moco.codex.connection import CodexConnectionSupervisor
 from moco.codex.schema import CodexProtocolContract, CodexSchemaProbe, ServerRequestCategory
@@ -34,7 +35,7 @@ from moco.codex.session import (
     TranscriptEvent,
     load_realtime_prompt,
 )
-from moco.config import MocoSettings, canonical_browser_loopback_host
+from moco.config import AgentProfileMode, MocoSettings, canonical_browser_loopback_host
 from moco.errors import CodexReviewError, CodexRpcError
 from moco.platform import resolve_codex_command
 from moco.runtime._cleanup import await_cleanup
@@ -52,8 +53,8 @@ from moco.runtime.lifecycle import IdleLeaseTimer, LifecycleState
 from moco.runtime.telemetry import safe_event
 from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
-from moco.speech.plan import parse_speech_plan
-from moco.speech.queue import SpeechQueue
+from moco.speech.plan import SpeechPlanResult, SpeechPlanStream, parse_speech_plan
+from moco.speech.queue import SpeechQueue, SpeechQueueOverflowError
 from moco.speech.text import strip_control_emojis
 from moco.web.messages import (
     ClientControl,
@@ -89,10 +90,9 @@ _MAX_PENDING_AGENT_ACTIVITIES = 64
 _MAX_PENDING_TRANSCRIPTS = 64
 _MAX_USER_TRANSCRIPT_BYTES = 65_536
 _MAX_USER_TRANSCRIPT_PARTS = 256
-
-
-async def _resolved_result(value: object) -> object:
-    return value
+_MAX_ASSISTANT_TRANSCRIPT_BYTES = 16_384
+_MAX_ASSISTANT_TRANSCRIPT_PARTS = 256
+_MAX_TERMINAL_TURNS = 64
 
 
 _CAPABILITY_MISMATCH = "capability_mismatch"
@@ -168,13 +168,6 @@ class RealtimeSession(Protocol):
 
     def listen_stopped(self) -> None: ...
 
-    def consume_user_final(
-        self,
-        text: str,
-        *,
-        utterance_id: int | None = None,
-    ) -> Awaitable[object]: ...
-
     def speech_changed(self, state: SpeechState) -> None: ...
 
     def claim_close(self) -> None: ...
@@ -194,23 +187,27 @@ class _AsyncClosable(Protocol):
 class _UtteranceSpeechClaim:
     invalidation: asyncio.Task[None] | None
     stopped: asyncio.Event
-
-
-@dataclass(frozen=True, slots=True)
-class _UserFinalClaim:
-    handoff: Awaitable[object] | None
-    target_session: RealtimeSession | None
+    ready: asyncio.Future[None]
 
 
 @dataclass(frozen=True, slots=True)
 class _TranscriptWork:
     text: str
     done: bool
-    user_final: _UserFinalClaim | None
     speech_claim: _UtteranceSpeechClaim | None
     session: RealtimeSession | None
     expected_generation: int | None
     presented: asyncio.Future[None]
+    completion: asyncio.Future[None]
+
+
+@dataclass(frozen=True, slots=True)
+class _AssistantTranscriptWork:
+    event: TranscriptEvent
+    speech_generation: int
+    session: RealtimeSession | None
+    expected_generation: int | None
+    speech_barrier: asyncio.Future[None] | None
     completion: asyncio.Future[None]
 
 
@@ -302,6 +299,9 @@ class _CodexConversationOwner:
         self._reviewer_bound = False
         self._voice_generation_number = 0
         self._voice_active = False
+        self._conversation_thread_id: str | None = None
+        self._active_turn_id: str | None = None
+        self._terminal_turns: dict[tuple[str, str], None] = {}
         self._voice_contract: CodexProtocolContract | None = None
         self._voice_capabilities: CapabilitySnapshot | None = None
         self._voice_prompt: str | None = None
@@ -326,12 +326,19 @@ class _CodexConversationOwner:
         return None if coordinator is None else coordinator.snapshot
 
     async def cancel_turn(self) -> bool:
-        coordinator = self._coordinator
-        if coordinator is None:
+        voice = self._voice
+        if voice is None or not self._voice_active:
+            return False
+        turn_id = voice.active_turn_id
+        if turn_id is not None and (self._conversation_thread_id, turn_id) in self._terminal_turns:
             return False
         if not self._connection_terminated:
             self._cancel_pending_reviews()
-        return await coordinator.cancel_turn()
+        cancelled = await voice.interrupt_active_turn()
+        coordinator = self._coordinator
+        if cancelled and turn_id is not None and coordinator is not None:
+            coordinator.realtime_turn_cancel_requested(turn_id)
+        return cancelled
 
     def _cancel_pending_reviews(self) -> None:
         if self._pending_reviews_cancelled:
@@ -355,6 +362,20 @@ class _CodexConversationOwner:
             self._connection_terminal()
             raise
 
+    def _realtime_turn_terminal(self, thread_id: str, turn_id: str) -> None:
+        if thread_id != self._conversation_thread_id:
+            return
+        terminal_turn = (thread_id, turn_id)
+        self._terminal_turns[terminal_turn] = None
+        while len(self._terminal_turns) > _MAX_TERMINAL_TURNS:
+            del self._terminal_turns[next(iter(self._terminal_turns))]
+        if turn_id != self._active_turn_id:
+            return
+        self._active_turn_id = None
+        coordinator = self._coordinator
+        if coordinator is not None:
+            coordinator.realtime_turn_completed(turn_id)
+
     def claim_close(self) -> None:
         if self._closed:
             return
@@ -372,32 +393,20 @@ class _CodexConversationOwner:
         if coordinator is not None:
             coordinator.listen_stopped()
 
-    def consume_user_final(
-        self,
-        text: str,
-        *,
-        utterance_id: int | None = None,
-    ) -> Awaitable[object]:
-        coordinator = self._coordinator
-        if coordinator is None:
-            return _resolved_result(None)
-        return coordinator.consume_user_final(text, utterance_id=utterance_id)
+    def _owns_active_turn(self, thread_id: str, turn_id: str) -> bool:
+        if self._closing or self._closed or self._connection_terminated:
+            return False
+        if (thread_id, turn_id) in self._terminal_turns:
+            return False
+        voice = self._voice or self._starting_voice
+        if voice is not None:
+            return voice.owns_active_turn(thread_id, turn_id)
+        return thread_id == self._conversation_thread_id and turn_id == self._active_turn_id
 
     def speech_changed(self, state: SpeechState) -> None:
         coordinator = self._coordinator
         if coordinator is not None:
             coordinator.speech_changed(state)
-
-    def _agent_activity(self, event: AgentActivityEvent) -> None:
-        effects = self._effects
-        if effects is None or self._closing or self._closed or self._connection_terminated:
-            return
-        effects.on_agent_activity(event)
-
-    def _agent_terminal(self) -> None:
-        if not self._connection_terminated:
-            self._cancel_pending_reviews()
-        self._connection_terminal()
 
     @property
     def closed(self) -> bool:
@@ -465,6 +474,7 @@ class _CodexConversationOwner:
         contract = await probe.probe()
         broker = InteractionBroker(contract)
         self._broker = broker
+        broker.bind_turn_terminal(self._realtime_turn_terminal)
         broker.register_approval_handlers(self._connection)
         self._connection.register_terminal_callback(self._connection_terminal)
         await self._connection.start()
@@ -477,23 +487,16 @@ class _CodexConversationOwner:
             working_directory=self._working_directory,
         )
         capabilities = await discovery.discover()
-        readiness = _conversation_readiness(contract, capabilities)
-        agent = AgentSession(
-            self._connection,
+        readiness = _conversation_readiness(
             contract,
             capabilities,
-            self._working_directory,
             self._settings.agent.profile,
-            activity_sink=self._agent_activity,
-            terminal_sink=self._agent_terminal,
         )
-        self._agent = agent
-        broker.bind_active_turn_check(agent.owns_active_turn)
-        owner_effects = _ConversationEffects(self, effects)
+        broker.bind_active_turn_check(self._owns_active_turn)
         coordinator = InteractionCoordinator(
-            agent,
-            steer_available=capabilities.steer.status is CapabilityStatus.AVAILABLE,
-            effects=owner_effects,
+            None,
+            steer_available=False,
+            effects=effects,
         )
         self._coordinator = coordinator
         broker.bind_pending_count_changed(self._review_count_changed)
@@ -566,6 +569,14 @@ class _CodexConversationOwner:
             if self._closing or self._closed or self._connection_terminated:
                 message = "Codex conversation is closed"
                 raise CodexRpcError(message)
+            thread_id = voice.thread_id
+            if thread_id is None:
+                message = "Codex Voice did not publish a thread"
+                raise CodexRpcError(message)
+            if self._conversation_thread_id not in {None, thread_id}:
+                message = "Codex Voice changed the conversation thread"
+                raise CodexRpcError(message)
+            self._conversation_thread_id = thread_id
             self._voice = voice
             self._starting_voice = None
             if self._voice_generation_number == 0:
@@ -595,7 +606,24 @@ class _CodexConversationOwner:
                 else "Codex Voice generation is not active"
             )
             raise RuntimeError(message)
-        return voice.notifications()
+        return self._observe_voice_notifications(voice)
+
+    async def _observe_voice_notifications(
+        self,
+        voice: CodexRealtimeSession,
+    ) -> AsyncIterator[RealtimeEvent]:
+        async for event in voice.notifications():
+            coordinator = self._coordinator
+            if isinstance(event, ActivityEvent) and event.kind == "turn":
+                if event.phase == "started":
+                    if (event.thread_id, event.turn_id) in self._terminal_turns:
+                        continue
+                    self._active_turn_id = event.turn_id
+                    if coordinator is not None:
+                        coordinator.realtime_turn_started(event.turn_id)
+                else:
+                    self._realtime_turn_terminal(event.thread_id, event.turn_id)
+            yield event
 
     async def close_voice(
         self,
@@ -614,6 +642,14 @@ class _CodexConversationOwner:
                     or voice is None
                 ):
                     return False
+                voice_turn_id = voice.active_turn_id
+                if (
+                    voice_turn_id is None
+                    or (self._conversation_thread_id, voice_turn_id) in self._terminal_turns
+                ):
+                    self._active_turn_id = None
+                else:
+                    self._active_turn_id = voice_turn_id
                 self._voice_active = False
                 self._voice = None
                 coordinator = self._coordinator
@@ -664,6 +700,8 @@ class _CodexConversationOwner:
                     capabilities=capabilities,
                     working_directory=self._working_directory,
                     prompt=prompt,
+                    existing_thread_id=self._conversation_thread_id,
+                    existing_active_turn_id=self._active_turn_id,
                 )
                 self._starting_voice = voice
             try:
@@ -947,12 +985,20 @@ class _BrowserConnection:
         self._user_utterance_id = 0
         self._claimed_user_utterance_id = 0
         self._last_user_done_event: TranscriptEvent | None = None
+        self._last_assistant_done_event: TranscriptEvent | None = None
+        self._assistant_speech_plan_stream: SpeechPlanStream | None = None
+        self._assistant_utterance_active = False
+        self._assistant_transcript_bytes = 0
+        self._assistant_transcript_parts = 0
+        self._assistant_transcript_queue: asyncio.Queue[_AssistantTranscriptWork] = asyncio.Queue(
+            maxsize=_MAX_PENDING_TRANSCRIPTS
+        )
+        self._assistant_transcript_worker_task: asyncio.Task[None] | None = None
         self._user_transcript_parts = 0
         self._transcript_queue: asyncio.Queue[_TranscriptWork] = asyncio.Queue(
             maxsize=_MAX_PENDING_TRANSCRIPTS,
         )
         self._transcript_worker_task: asyncio.Task[None] | None = None
-        self._transcript_settlement_tasks: set[asyncio.Task[None]] = set()
         self._transcript_presentation_tail: asyncio.Future[None] | None = None
         self._utterance_speech_claim: _UtteranceSpeechClaim | None = None
 
@@ -1432,8 +1478,10 @@ class _BrowserConnection:
             remember_error("browser_effect_close", error)
             self._discard_effect_task(task)
         self._agent_activity_worker_task = None
+        self._assistant_transcript_worker_task = None
         self._discard_pending_agent_activities()
         self._discard_pending_transcripts()
+        self._discard_pending_assistant_transcripts()
         capability_task = self._capability_task
         if capability_task is not None and capability_task is not caller_task:
             capability_task.cancel()
@@ -2002,10 +2050,18 @@ class _BrowserConnection:
             if speech_invalidation is not None:
                 return
             self._transcripts.clear()
+            self._assistant_speech_plan_stream = None
+            self._last_assistant_done_event = None
+            self._reset_assistant_transcript_limits()
             self._user_utterance_active = False
             self._user_transcript_parts = 0
+            self._settle_assistant_speech_barrier(
+                self._utterance_speech_claim,
+                error=None,
+            )
             self._utterance_speech_claim = None
             self._discard_pending_transcripts()
+            self._discard_pending_assistant_transcripts()
             self._last_user_done_event = None
             self._speech_effect_generation += 1
             speech_invalidation = self._queue_speech_effect(
@@ -2108,8 +2164,12 @@ class _BrowserConnection:
             completion.set_result(None)
             return completion
         if event.role == "assistant":
-            completion.set_result(None)
-            return completion
+            return self._enqueue_assistant_transcript(
+                event,
+                completion=completion,
+                session=session,
+                expected_generation=expected_generation,
+            )
         if self._transcript_queue.full():
             message = "transcript queue limit exceeded"
             raise RuntimeError(message)
@@ -2130,9 +2190,8 @@ class _BrowserConnection:
             session=session,
             expected_generation=expected_generation,
         )
-        user_final = (
-            self._claim_user_final(
-                text,
+        user_final_claimed = (
+            self._claim_user_done(
                 event=event,
                 session=session,
                 expected_generation=expected_generation,
@@ -2140,7 +2199,7 @@ class _BrowserConnection:
             if event.role == "user" and done
             else None
         )
-        if done and user_final is None:
+        if done and not user_final_claimed:
             completion.set_result(None)
             return completion
         presented = asyncio.get_running_loop().create_future()
@@ -2149,7 +2208,6 @@ class _BrowserConnection:
             _TranscriptWork(
                 text=text,
                 done=done,
-                user_final=user_final,
                 speech_claim=speech_claim,
                 session=session,
                 expected_generation=expected_generation,
@@ -2159,6 +2217,225 @@ class _BrowserConnection:
         )
         self._ensure_transcript_worker()
         return completion
+
+    def _enqueue_assistant_transcript(
+        self,
+        event: TranscriptEvent,
+        *,
+        completion: asyncio.Future[None],
+        session: RealtimeSession | None,
+        expected_generation: int | None,
+    ) -> asyncio.Future[None]:
+        if event.kind == "done" and event is self._last_assistant_done_event:
+            completion.set_result(None)
+            return completion
+        if self._assistant_transcript_queue.full():
+            message = "transcript queue limit exceeded"
+            raise RuntimeError(message)
+        self._validate_assistant_transcript(event)
+        if event.kind == "done":
+            self._last_assistant_done_event = event
+        self._assistant_transcript_queue.put_nowait(
+            _AssistantTranscriptWork(
+                event=event,
+                speech_generation=self._speech_effect_generation,
+                session=session,
+                expected_generation=expected_generation,
+                speech_barrier=self._assistant_speech_barrier(),
+                completion=completion,
+            )
+        )
+        self._ensure_assistant_transcript_worker()
+        return completion
+
+    def _ensure_assistant_transcript_worker(self) -> None:
+        task = self._assistant_transcript_worker_task
+        if task is not None and not task.done():
+            return
+        task = self._spawn_effect(
+            self._run_assistant_transcript_worker(),
+            name="moco-assistant-transcript-worker",
+        )
+        if task is None:
+            self._discard_pending_assistant_transcripts()
+            return
+        self._assistant_transcript_worker_task = task
+        task.add_done_callback(self._forget_assistant_transcript_worker)
+
+    async def _run_assistant_transcript_worker(self) -> None:
+        while True:
+            try:
+                work = self._assistant_transcript_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            await self._run_assistant_transcript_work(work)
+
+    async def _run_assistant_transcript_work(self, work: _AssistantTranscriptWork) -> None:
+        try:
+            await self._present_assistant_transcript(work)
+        except asyncio.CancelledError:
+            if not work.completion.done():
+                work.completion.cancel()
+            raise
+        except SpeechQueueOverflowError as error:
+            if not work.completion.done():
+                work.completion.set_exception(error)
+            if work.session is not None and work.expected_generation is not None:
+                await self._handle_voice_loss(work.session, work.expected_generation)
+        except Exception as error:  # noqa: BLE001 - isolate one presentation
+            if not work.completion.done():
+                work.completion.set_exception(error)
+        else:
+            if not work.completion.done():
+                work.completion.set_result(None)
+
+    def _forget_assistant_transcript_worker(self, task: asyncio.Task[None]) -> None:
+        if task is self._assistant_transcript_worker_task:
+            self._assistant_transcript_worker_task = None
+
+    def _assistant_work_is_current(self, work: _AssistantTranscriptWork) -> bool:
+        return work.speech_generation == self._speech_effect_generation and (
+            work.session is None
+            or self._voice_generation_is_current(
+                work.session,
+                work.expected_generation,
+            )
+        )
+
+    def _assistant_speech_barrier(self) -> asyncio.Future[None] | None:
+        claim = self._utterance_speech_claim
+        if claim is None or claim.ready.done():
+            return None
+        return claim.ready
+
+    def _validate_assistant_transcript(self, event: TranscriptEvent) -> None:
+        if not self._assistant_utterance_active:
+            parts = 0
+            text_bytes = 0
+        else:
+            parts = self._assistant_transcript_parts
+            text_bytes = self._assistant_transcript_bytes
+        parts += 1
+        if parts > _MAX_ASSISTANT_TRANSCRIPT_PARTS:
+            message = "transcript part limit exceeded"
+            raise RuntimeError(message)
+        event_bytes = len(event.text.encode())
+        text_bytes = event_bytes if event.kind == "done" else text_bytes + event_bytes
+        if text_bytes > _MAX_ASSISTANT_TRANSCRIPT_BYTES:
+            message = "transcript text limit exceeded"
+            raise RuntimeError(message)
+        self._assistant_transcript_parts = parts
+        self._assistant_transcript_bytes = text_bytes
+        self._assistant_utterance_active = event.kind != "done"
+
+    def _reset_assistant_transcript_limits(self) -> None:
+        self._assistant_utterance_active = False
+        self._assistant_transcript_bytes = 0
+        self._assistant_transcript_parts = 0
+
+    async def _present_assistant_transcript(  # noqa: C901, PLR0912
+        self,
+        work: _AssistantTranscriptWork,
+    ) -> None:
+        if not self._assistant_work_is_current(work):
+            return
+        event = work.event
+        stream = self._assistant_speech_plan_stream
+        if stream is None:
+            stream = SpeechPlanStream(
+                max_chars=self._delivery_caption_max_chars or 300,
+            )
+            self._assistant_speech_plan_stream = stream
+        update = stream.push(event.text, done=event.kind == "done")
+        if update is None:
+            return
+        self._report_streamed_speech_plan(update.plan)
+        text = strip_control_emojis(update.text)
+        spoken_delta = strip_control_emojis(update.delta)
+        if not text.strip() and update.done:
+            return
+        sent = await self._send_assistant_json(
+            {
+                "type": "transcript",
+                "role": "assistant",
+                "text": text,
+                "done": update.done,
+            },
+            work=work,
+        )
+        if not sent:
+            return
+        speech = self._speech
+        if speech is not None:
+            if work.speech_barrier is not None:
+                await asyncio.shield(work.speech_barrier)
+            if not self._assistant_work_is_current(work):
+                return
+            if not self._transcripts.get("assistant") and spoken_delta:
+                self._clear_first_playback_timing()
+            caption = (
+                update.delivery_caption
+                if self._settings.irodori.caption_mode == "auto"
+                and self._delivery_caption_max_chars is not None
+                else None
+            )
+            if caption is None:
+                await speech.on_transcript(
+                    role="assistant",
+                    delta=spoken_delta,
+                    done=update.done,
+                )
+            else:
+                await speech.on_transcript(
+                    role="assistant",
+                    delta=spoken_delta,
+                    done=update.done,
+                    delivery_caption=caption,
+                )
+        if not self._assistant_work_is_current(work):
+            return
+        if update.done:
+            self._transcripts.pop("assistant", None)
+        else:
+            self._transcripts["assistant"] = update.text
+        self._idle_timer.touch()
+
+    async def _send_assistant_json(
+        self,
+        message: dict[str, object],
+        *,
+        work: _AssistantTranscriptWork,
+    ) -> bool:
+        async with self._send_lock:
+            if not self._assistant_work_is_current(work):
+                return False
+            await self._websocket.send_json(message)
+            return self._assistant_work_is_current(work)
+
+    def _report_streamed_speech_plan(self, plan: SpeechPlanResult | None) -> None:
+        if plan is None:
+            return
+        if plan.error_code is not None:
+            safe_event(
+                logger,
+                "speech_plan_invalid",
+                component="web",
+                event_code=plan.error_code,
+                plan_chars=plan.plan_chars,
+            )
+            self._spawn_effect(
+                self._send_error(plan.error_code),
+                name="moco-speech-plan-error",
+            )
+            return
+        safe_event(
+            logger,
+            "speech_plan_received",
+            caption_present=plan.delivery_caption is not None,
+            component="web",
+            contract_version=1,
+            plan_chars=plan.plan_chars,
+        )
 
     def _ensure_transcript_worker(self) -> None:
         task = self._transcript_worker_task
@@ -2197,22 +2474,7 @@ class _BrowserConnection:
         if work.done and work.speech_claim is self._utterance_speech_claim:
             self._utterance_speech_claim = None
 
-        if work.user_final is None or work.user_final.handoff is None:
-            self._finish_transcript_work(work, error=presentation_error)
-            return
-        await self._await_transcript_settlement_slot()
-        task = self._spawn_effect(
-            self._settle_user_final(
-                work,
-                presentation_error=presentation_error,
-            ),
-            name="moco-user-final-settlement",
-        )
-        if task is None:
-            self._cancel_transcript_work(work)
-            return
-        self._transcript_settlement_tasks.add(task)
-        task.add_done_callback(self._forget_transcript_settlement)
+        self._finish_transcript_work(work, error=presentation_error)
 
     async def _publish_transcript(self, work: _TranscriptWork) -> Exception | None:
         if work.session is not None and not self._voice_generation_is_current(
@@ -2233,7 +2495,7 @@ class _BrowserConnection:
             )
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # noqa: BLE001 - handoff claim must still settle
+        except Exception as error:  # noqa: BLE001 - isolate transcript presentation
             return error
         if sent:
             self._idle_timer.touch()
@@ -2243,6 +2505,7 @@ class _BrowserConnection:
         self,
         work: _TranscriptWork,
     ) -> Exception | None:
+        error: Exception | None = None
         try:
             await self._await_utterance_speech_stop(work.speech_claim)
             if work.done:
@@ -2251,9 +2514,11 @@ class _BrowserConnection:
                     await speech.on_transcript(role="user", delta="", done=True)
         except asyncio.CancelledError:
             raise
-        except Exception as error:  # noqa: BLE001 - handoff claim must still settle
-            return error
-        return None
+        except Exception as caught:  # noqa: BLE001 - isolate speech invalidation
+            error = caught
+        if work.done:
+            self._settle_assistant_speech_barrier(work.speech_claim, error=error)
+        return error
 
     def _prepare_transcript_event(
         self,
@@ -2266,8 +2531,13 @@ class _BrowserConnection:
             self._user_utterance_active = True
             self._user_utterance_id += 1
             self._transcripts.pop("assistant", None)
+            self._assistant_speech_plan_stream = None
+            self._last_assistant_done_event = None
+            self._reset_assistant_transcript_limits()
             self._speech_effect_generation += 1
+            self._discard_pending_assistant_transcripts()
             speech_stopped = asyncio.Event()
+            speech_ready = asyncio.get_running_loop().create_future()
             if self._speech is None:
                 speech_invalidation, notice = self._claim_speech_invalidation(
                     reason="user_transcript",
@@ -2296,68 +2566,46 @@ class _BrowserConnection:
             self._utterance_speech_claim = _UtteranceSpeechClaim(
                 invalidation=invalidation,
                 stopped=speech_stopped,
+                ready=speech_ready,
             )
         return self._utterance_speech_claim
 
-    def _claim_user_final(
+    @staticmethod
+    def _settle_assistant_speech_barrier(
+        claim: _UtteranceSpeechClaim | None,
+        *,
+        error: Exception | None,
+    ) -> None:
+        if claim is None or claim.ready.done():
+            return
+        if error is None:
+            claim.ready.set_result(None)
+            return
+        claim.ready.set_exception(error)
+        claim.ready.exception()
+
+    def _claim_user_done(
         self,
-        text: str,
         *,
         event: TranscriptEvent,
         session: RealtimeSession | None,
         expected_generation: int | None,
-    ) -> _UserFinalClaim | None:
+    ) -> bool:
         target_session = self._session if session is None else session
         self._user_utterance_active = False
         if target_session is None:
-            return _UserFinalClaim(handoff=None, target_session=None)
+            return True
         if session is not None and not self._voice_generation_is_current(
             session=session,
             expected_generation=expected_generation,
         ):
-            return None
+            return False
         utterance_id = self._user_utterance_id
         if utterance_id <= self._claimed_user_utterance_id:
-            return None
+            return False
         self._claimed_user_utterance_id = utterance_id
         self._last_user_done_event = event
-        handoff = target_session.consume_user_final(text, utterance_id=utterance_id)
-        return _UserFinalClaim(
-            handoff=handoff,
-            target_session=target_session,
-        )
-
-    async def _settle_user_final(
-        self,
-        work: _TranscriptWork,
-        *,
-        presentation_error: Exception | None,
-    ) -> None:
-        claim = work.user_final
-        if claim is None or claim.handoff is None or claim.target_session is None:
-            self._finish_transcript_work(work, error=presentation_error)
-            return
-        try:
-            await claim.handoff
-        except asyncio.CancelledError:
-            work.completion.cancel()
-            raise
-        except Exception as error:  # noqa: BLE001 - strict handoff boundary
-            self._finish_transcript_work(work, error=error)
-            return
-        if presentation_error is not None:
-            self._finish_transcript_work(work, error=presentation_error)
-            return
-        if work.session is not None and not self._voice_generation_is_current(
-            work.session,
-            work.expected_generation,
-        ):
-            self._finish_transcript_work(work)
-            return
-        candidate = claim.target_session.interaction_snapshot
-        if type(candidate) is InteractionSnapshot:
-            self._snapshot = candidate
-        self._finish_transcript_work(work)
+        return True
 
     async def _await_utterance_speech_stop(
         self,
@@ -2385,19 +2633,9 @@ class _BrowserConnection:
                 with suppress(asyncio.CancelledError):
                     await stopped_wait
 
-    async def _await_transcript_settlement_slot(self) -> None:
-        while len(self._transcript_settlement_tasks) >= _MAX_PENDING_TRANSCRIPTS:
-            await asyncio.wait(
-                tuple(self._transcript_settlement_tasks),
-                return_when=asyncio.FIRST_COMPLETED,
-            )
-
     def _forget_transcript_worker(self, task: asyncio.Task[None]) -> None:
         if task is self._transcript_worker_task:
             self._transcript_worker_task = None
-
-    def _forget_transcript_settlement(self, task: asyncio.Task[None]) -> None:
-        self._transcript_settlement_tasks.discard(task)
 
     @staticmethod
     def _report_transcript_completion(completion: asyncio.Future[None]) -> None:
@@ -2426,15 +2664,6 @@ class _BrowserConnection:
         _BrowserConnection._mark_transcript_presented(work)
         if not work.completion.done():
             work.completion.cancel()
-        claim = work.user_final
-        if claim is None or claim.handoff is None:
-            return
-        if isinstance(claim.handoff, asyncio.Future):
-            claim.handoff.cancel()
-            return
-        close = getattr(claim.handoff, "close", None)
-        if close is not None:
-            close()
 
     @staticmethod
     def _mark_transcript_presented(work: _TranscriptWork) -> None:
@@ -2449,17 +2678,25 @@ class _BrowserConnection:
                 return
             self._cancel_transcript_work(work)
 
+    def _discard_pending_assistant_transcripts(self) -> None:
+        while True:
+            try:
+                work = self._assistant_transcript_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if not work.completion.done():
+                work.completion.set_result(None)
+
     async def _stop_transcript_pipeline(
         self,
         caller_task: asyncio.Task[object] | None,
     ) -> None:
+        worker = self._transcript_worker_task
+        assistant_worker = self._assistant_transcript_worker_task
         tasks = {
-            task
-            for task in (
-                self._transcript_worker_task,
-                *self._transcript_settlement_tasks,
-            )
-            if task is not None and task is not caller_task and not task.done()
+            worker
+            for worker in (worker, assistant_worker)
+            if worker is not None and worker is not caller_task and not worker.done()
         }
         for task in tasks:
             task.cancel()
@@ -2469,8 +2706,9 @@ class _BrowserConnection:
                 _log_boundary_failure("browser_transcript_close", error)
             self._discard_effect_task(task)
         self._transcript_worker_task = None
-        self._transcript_settlement_tasks.clear()
+        self._assistant_transcript_worker_task = None
         self._discard_pending_transcripts()
+        self._discard_pending_assistant_transcripts()
 
     async def _invalidate_and_reset_speech(
         self,
@@ -3010,9 +3248,10 @@ def _codex_session_factory(
 def _conversation_readiness(
     contract: object,
     capabilities: CapabilitySnapshot,
+    profile: AgentProfileMode = AgentProfileMode.READ_ONLY,
 ) -> ConnectionState:
     if (
-        capabilities.agent_admission.status is not CapabilityStatus.AVAILABLE
+        profile_agent_admission(capabilities, profile).status is not CapabilityStatus.AVAILABLE
         or capabilities.realtime.status is not CapabilityStatus.AVAILABLE
     ):
         message = "required Codex capability is unavailable"

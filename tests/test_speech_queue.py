@@ -93,6 +93,22 @@ async def test_worker_synthesizes_and_delivers_fifo() -> None:
     await queue.close()
 
 
+async def test_rejects_a_turn_that_would_overflow_pending_segments() -> None:
+    synthesizer = FakeSynthesizer()
+    queue = SpeechQueue(synthesizer, deliver=ignore_audio, max_chars=80)
+
+    with pytest.raises(RuntimeError, match="speech queue limit"):
+        await queue.on_transcript(
+            role="assistant",
+            delta="一。" * (speech_queue._MAX_PENDING_SPEECH_ITEMS + 1),  # noqa: SLF001
+            done=True,
+        )
+
+    assert queue.pending_count == 0
+    assert synthesizer.calls == []
+    await queue.close()
+
+
 async def test_caption_is_sent_to_every_segment_and_not_reused() -> None:
     synthesizer = CaptionAwareSynthesizer()
     queue = SpeechQueue(synthesizer, deliver=ignore_audio, max_chars=80)

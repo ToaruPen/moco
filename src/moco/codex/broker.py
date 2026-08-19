@@ -250,6 +250,8 @@ class InteractionBroker:
         self._terminal_turns: dict[tuple[str, str], None] = {}
         self._active_turn_check: Callable[[str, str], bool] | None = None
         self._active_turn_callback_bound = False
+        self._turn_terminal_callback: Callable[[str, str], None] | None = None
+        self._turn_terminal_callback_bound = False
         self._reviewer: _ReviewerSlot | None = None
         self._terminal: str | None = None
         self._pending_count_changed: Callable[[int], None] | None = None
@@ -304,6 +306,20 @@ class InteractionBroker:
             raise CodexReviewError(_ACTIVE_TURN_CALLBACK_ASYNC)
         self._active_turn_check = callback
         self._active_turn_callback_bound = True
+
+    def bind_turn_terminal(self, callback: Callable[[str, str], None]) -> None:
+        """Bind the conversation owner that must observe terminal turns across Voice gaps."""
+        self._require_open()
+        if self._turn_terminal_callback_bound:
+            raise CodexReviewError(_ACTIVE_TURN_CALLBACK_BOUND)
+        if self._reviewer is not None or self._pending or self._file_change_explanations:
+            raise CodexReviewError(_ACTIVE_TURN_CALLBACK_LATE)
+        if not callable(callback):
+            raise CodexReviewError(_ACTIVE_TURN_CALLBACK_LATE)
+        if inspect.iscoroutinefunction(callback):
+            raise CodexReviewError(_ACTIVE_TURN_CALLBACK_ASYNC)
+        self._turn_terminal_callback = callback
+        self._turn_terminal_callback_bound = True
 
     def disconnect_reviewer(self, connection: ReviewerConnection) -> None:
         """Release the reviewer slot and fail every review bound to that reviewer closed.
@@ -362,6 +378,7 @@ class InteractionBroker:
         terminal_turn = self._terminal_turn_identity(notification)
         if terminal_turn is not None:
             self._remember_terminal_turn(terminal_turn)
+            self._notify_turn_terminal(terminal_turn)
             for key in tuple(self._file_change_explanations):
                 if key[:2] == terminal_turn:
                     del self._file_change_explanations[key]
@@ -386,6 +403,19 @@ class InteractionBroker:
         self._terminal_turns[turn] = None
         while len(self._terminal_turns) > _MAX_TERMINAL_TURNS:
             del self._terminal_turns[next(iter(self._terminal_turns))]
+
+    def _notify_turn_terminal(self, turn: tuple[str, str]) -> None:
+        callback = self._turn_terminal_callback
+        if callback is None:
+            return
+        returned = cast("Callable[[str, str], object]", callback)(*turn)
+        if returned is None:
+            return
+        if inspect.iscoroutine(returned):
+            with suppress(Exception):
+                returned.close()
+        message = "turn terminal callback returned an invalid result"
+        raise CodexReviewError(message)
 
     def _withdraw_terminal_turn(self, turn: tuple[str, str]) -> None:
         pending_reviews = tuple(
@@ -676,6 +706,7 @@ class InteractionBroker:
         self._terminal = message
         self._file_change_explanations.clear()
         self._terminal_turns.clear()
+        self._turn_terminal_callback = None
         slot = self._reviewer
         self._reviewer = None
         for pending in tuple(self._pending.values()):
