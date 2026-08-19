@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_valida
 
 _PHYSICAL_LINE_BOUNDARY = re.compile(r"(?<=\n)|(?<=\r)(?!\n)")
 _FORBIDDEN_CAPTION_CATEGORIES = frozenset({"Cc", "Zl", "Zp"})
+_MAX_SPEECH_PLAN_PREFIX_CHARS = 8_192
 
 
 @dataclass(frozen=True, slots=True)
@@ -29,6 +30,96 @@ class SpeechPlanResult:
             plan_chars=0,
             plan_present=False,
         )
+
+
+@dataclass(frozen=True, slots=True)
+class SpeechPlanUpdate:
+    text: str
+    delta: str
+    done: bool
+    delivery_caption: str | None
+    plan: SpeechPlanResult | None
+
+
+class SpeechPlanStream:
+    """Remove an optional first-line speech plan without delaying plain speech."""
+
+    def __init__(self, *, max_chars: int) -> None:
+        if type(max_chars) is not int or max_chars <= 0:
+            message = "caption maximum must be a positive integer"
+            raise ValueError(message)
+        self._max_chars = max_chars
+        self._raw = ""
+        self._emitted = ""
+        self._plan_decided = False
+        self._plan_present = False
+        self._initial_plan_reported = False
+
+    def push(self, text: str, *, done: bool = False) -> SpeechPlanUpdate | None:
+        if type(text) is not str:
+            message = "speech plan stream text must be a string"
+            raise TypeError(message)
+        self._raw = text if done else self._raw + text
+        plan: SpeechPlanResult | None = None
+
+        if not self._plan_decided:
+            decision = self._decide(done=done)
+            if decision is None:
+                return None
+            plan = decision if decision.plan_present else None
+            self._plan_decided = True
+            self._plan_present = decision.plan_present
+
+        current = (
+            parse_speech_plan(self._raw, max_chars=self._max_chars)
+            if self._plan_present
+            else SpeechPlanResult.plain(self._raw)
+        )
+        delta = current.body[len(self._emitted) :] if current.body.startswith(self._emitted) else ""
+        self._emitted = current.body
+        if self._plan_present and not self._initial_plan_reported:
+            plan = current
+            self._initial_plan_reported = True
+        update = SpeechPlanUpdate(
+            text=current.body,
+            delta=delta,
+            done=done,
+            delivery_caption=current.delivery_caption if plan is not None else None,
+            plan=plan,
+        )
+        if done:
+            self.reset()
+        return update
+
+    def reset(self) -> None:
+        self._raw = ""
+        self._emitted = ""
+        self._plan_decided = False
+        self._plan_present = False
+        self._initial_plan_reported = False
+
+    def _decide(self, *, done: bool) -> SpeechPlanResult | None:
+        lines = _PHYSICAL_LINE_BOUNDARY.split(self._raw)
+        candidate_index = next(
+            (index for index, line in enumerate(lines) if line.strip()),
+            None,
+        )
+        if candidate_index is None:
+            return SpeechPlanResult.plain(self._raw) if done else None
+        candidate = lines[candidate_index]
+        if not candidate.lstrip().startswith("{"):
+            return SpeechPlanResult.plain(self._raw)
+        has_line_boundary = candidate.endswith(("\n", "\r"))
+        if not has_line_boundary:
+            if len(candidate) > _MAX_SPEECH_PLAN_PREFIX_CHARS:
+                message = "speech plan prefix limit exceeded"
+                raise ValueError(message)
+            if not done:
+                return None
+        result = parse_speech_plan(self._raw, max_chars=self._max_chars)
+        if not done and not result.body.strip():
+            return None
+        return result
 
 
 class _SpeechPlan(BaseModel):

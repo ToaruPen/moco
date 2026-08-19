@@ -4,7 +4,12 @@ import json
 
 import pytest
 
-from moco.speech.plan import SpeechPlanResult, parse_speech_plan
+from moco.speech.plan import (
+    SpeechPlanResult,
+    SpeechPlanStream,
+    SpeechPlanUpdate,
+    parse_speech_plan,
+)
 
 
 def test_parses_plan_and_removes_control_line() -> None:
@@ -166,3 +171,89 @@ def test_leading_blank_lines_do_not_hide_plan_candidate() -> None:
     assert result.body == "\n本文です。"
     assert result.delivery_caption == "calm"
     assert result.plan_chars == len(control_line)
+
+
+def test_stream_holds_control_line_and_emits_only_speakable_body_deltas() -> None:
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
+    stream = SpeechPlanStream(max_chars=300)
+
+    assert stream.push(control_line[:24]) is None
+    assert stream.push(f"{control_line[24:]}\n本") == SpeechPlanUpdate(
+        text="本",
+        delta="本",
+        done=False,
+        delivery_caption="calm",
+        plan=SpeechPlanResult(
+            body="本",
+            delivery_caption="calm",
+            error_code=None,
+            plan_chars=len(control_line),
+            plan_present=True,
+        ),
+    )
+    assert stream.push("文です。") == SpeechPlanUpdate(
+        text="本文です。",
+        delta="文です。",
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push(f"{control_line}\n本文です。", done=True) == SpeechPlanUpdate(
+        text="本文です。",
+        delta="",
+        done=True,
+        delivery_caption=None,
+        plan=None,
+    )
+
+
+def test_stream_plain_text_is_available_without_waiting_for_done() -> None:
+    stream = SpeechPlanStream(max_chars=300)
+
+    assert stream.push("確認") == SpeechPlanUpdate(
+        text="確認",
+        delta="確認",
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push("します。") == SpeechPlanUpdate(
+        text="確認します。",
+        delta="します。",
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push("確認します。", done=True) == SpeechPlanUpdate(
+        text="確認します。",
+        delta="",
+        done=True,
+        delivery_caption=None,
+        plan=None,
+    )
+
+
+def test_stream_invalid_plan_reports_once_and_keeps_body() -> None:
+    stream = SpeechPlanStream(max_chars=300)
+
+    update = stream.push("{not-json}\n本文")
+
+    assert update is not None
+    assert update.text == "本文"
+    assert update.delta == "本文"
+    assert update.plan is not None
+    assert update.plan.error_code == "speech_caption_invalid"
+    assert stream.push("です。") == SpeechPlanUpdate(
+        text="本文です。",
+        delta="です。",
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+
+
+def test_stream_rejects_an_unterminated_oversized_plan_prefix() -> None:
+    stream = SpeechPlanStream(max_chars=300)
+
+    with pytest.raises(ValueError, match="speech plan prefix limit"):
+        stream.push("{" + "a" * 8_192)

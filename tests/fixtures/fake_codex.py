@@ -59,7 +59,10 @@ def write_schema(output: Path, attempt: int) -> None:
         schema_variant(
             "fake/config",
             "ConfigReadParams",
-            properties={"cwd": {"type": ["string", "null"]}},
+            properties={
+                "cwd": {"type": ["string", "null"]},
+                "includeLayers": {"type": "boolean"},
+            },
         ),
         {
             "title": "ConfigRequirements/readRequest",

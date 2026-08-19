@@ -772,7 +772,7 @@ export function connectionCloseErrorCode(failure, wasOnline) {
 }
 
 export function beginAudioActivation(AudioContextConstructor = globalThis.AudioContext) {
-  const context = new AudioContextConstructor();
+  const context = new AudioContextConstructor({ sampleRate: 48_000 });
   return { context, ready: context.resume() };
 }
 

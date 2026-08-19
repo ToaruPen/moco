@@ -18,7 +18,7 @@ from moco.codex.capabilities import (
     CapabilityState,
     CapabilityStatus,
     EffectivePolicy,
-    is_unsafe_voice_policy,
+    profile_agent_admission,
 )
 from moco.codex.connection import CodexConnectionSupervisor
 from moco.codex.schema import CodexSchemaProbe
@@ -94,7 +94,9 @@ _CODEX_CHECK_CODES = (
     "codex_server_requests",
 )
 _CODEX_DETAILS_BY_STATUS: dict[CapabilityStatus, frozenset[str]] = {
-    CapabilityStatus.DISABLED: frozenset({"feature_disabled", "no_voice", "unsafe_voice_policy"}),
+    CapabilityStatus.DISABLED: frozenset(
+        {"feature_disabled", "no_voice", "prompt_overridden", "unsafe_voice_policy"}
+    ),
     CapabilityStatus.AUTHENTICATION_REQUIRED: frozenset({"authentication_required"}),
     CapabilityStatus.VERSION_MISMATCH: frozenset(
         {
@@ -317,7 +319,7 @@ def _project_codex_snapshot(
         _project_policy(snapshot.effective_policy, snapshot.policy_state),
         _project_capability(
             "codex_agent_admission",
-            _profile_agent_admission(snapshot, profile),
+            profile_agent_admission(snapshot, profile),
             available_detail="allowed",
         ),
         _project_capability(
@@ -333,24 +335,6 @@ def _project_codex_snapshot(
             available_detail="discovered",
         ),
     ]
-
-
-def _profile_agent_admission(
-    snapshot: CapabilitySnapshot,
-    profile: AgentProfileMode,
-) -> CapabilityState:
-    admission = snapshot.agent_admission
-    if profile is not AgentProfileMode.INHERIT_CODEX:
-        return admission
-    if admission.status is not CapabilityStatus.AVAILABLE:
-        return admission
-    if snapshot.policy_state.status is not CapabilityStatus.AVAILABLE:
-        return snapshot.policy_state
-    if snapshot.effective_policy is None:
-        return CapabilityState(CapabilityStatus.VERSION_MISMATCH, "invalid_response")
-    if is_unsafe_voice_policy(snapshot.effective_policy):
-        return CapabilityState(CapabilityStatus.DISABLED, "unsafe_voice_policy")
-    return admission
 
 
 def _project_schema(snapshot: CapabilitySnapshot) -> DoctorCheck:

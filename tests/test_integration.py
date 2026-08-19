@@ -367,10 +367,6 @@ class FinalSpeechSession:
     ) -> AsyncIterator[RealtimeEvent]:
         assert expected_generation in {None, self.voice_generation}
         yield TranscriptEvent("done", "thr_test", "assistant", "Voice の応答。")
-        effects = self.effects
-        assert effects is not None
-        effects.on_turn_terminal_claimed()
-        effects.on_turn_finished(TurnResult(final_answer="Agent の最終回答。", error_code=None))
         await asyncio.Event().wait()
 
     def speech_changed(self, state: SpeechState) -> None:
@@ -404,7 +400,7 @@ class BoundaryIrodoriClient:
         self.closed = True
 
 
-def test_agent_final_reaches_browser_as_irodori_wav_without_speaking_voice_reply() -> None:
+def test_realtime_speakable_final_reaches_browser_as_irodori_wav_once() -> None:
     capabilities = make_capabilities(3)
     discovery = BoundaryIrodoriClient(capabilities)
     active = BoundaryIrodoriClient(capabilities)
@@ -481,7 +477,7 @@ def test_agent_final_reaches_browser_as_irodori_wav_without_speaking_voice_reply
     assert transcript == {
         "type": "transcript",
         "role": "assistant",
-        "text": "Agent の最終回答。",
+        "text": "Voice の応答。",
         "done": True,
     }
     assert audio["type"] == "audio"
@@ -489,7 +485,7 @@ def test_agent_final_reaches_browser_as_irodori_wav_without_speaking_voice_reply
     assert discovery.requests == []
     assert len(active.requests) == 1
     request = active.requests[0]
-    assert request.text == "Agent の最終回答。"
+    assert request.text == "Voice の応答。"
     assert request.voice_id == selected.id
     assert request.if_generation == capabilities.generation
     assert discovery.closed

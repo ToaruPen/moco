@@ -135,9 +135,9 @@ closed.
 
 The adapter starts the ChatGPT.app-bundled `codex app-server` over stdio and
 uses the binary's experimental API capability. Each conversation receives an
-ephemeral, read-only, no-approval thread and a Realtime v3 WebRTC session.
-Startup context is disabled; moco supplies a short speech-oriented developer
-prompt.
+ephemeral thread using the configured profile and a Realtime v3 WebRTC session.
+Startup context is disabled; moco supplies its complete Realtime conversation,
+Frameless delegation, and Irodori speech contract as the session prompt.
 
 The adapter consumes user/assistant transcripts and Realtime errors. Realtime
 natural turn-taking owns utterance boundaries and backend interruption.

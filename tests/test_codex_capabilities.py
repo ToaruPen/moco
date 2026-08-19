@@ -123,13 +123,17 @@ _ALIASES = {
 }
 _FIELDS = {
     SemanticMethod.ACCOUNT_READ: frozenset(),
-    SemanticMethod.CONFIG_READ: frozenset({"cwd"}),
+    SemanticMethod.CONFIG_READ: frozenset({"cwd", "includeLayers"}),
     SemanticMethod.CONFIG_REQUIREMENTS_READ: frozenset(),
     SemanticMethod.EXPERIMENTAL_FEATURE_LIST: frozenset({"cursor"}),
     SemanticMethod.REALTIME_VOICES_LIST: frozenset(),
     SemanticMethod.THREAD_START: frozenset({"cwd", "ephemeral", "sandbox", "approvalPolicy"}),
     SemanticMethod.THREAD_REALTIME_START: frozenset(
         {
+            "clientManagedHandoffs",
+            "codexResponseHandoffMode",
+            "codexResponsesAsItems",
+            "delegationAckFiller",
             "includeStartupContext",
             "outputModality",
             "prompt",
@@ -359,6 +363,7 @@ def happy_actions(
         },
         _ALIASES[SemanticMethod.CONFIG_READ]: {
             "config": {"sandbox_mode": sandbox, "approval_policy": approval},
+            "layers": [],
         },
         _ALIASES[SemanticMethod.CONFIG_REQUIREMENTS_READ]: {"requirements": {"managed": True}},
         _ALIASES[SemanticMethod.EXPERIMENTAL_FEATURE_LIST]: {
@@ -410,7 +415,9 @@ async def test_happy_snapshot_uses_aliases_and_exact_adapter_params(tmp_path: Pa
         has_unclassified_server_requests=False,
     )
     assert requester.params_for(_ALIASES[SemanticMethod.ACCOUNT_READ]) == [{}]
-    assert requester.params_for(_ALIASES[SemanticMethod.CONFIG_READ]) == [{"cwd": str(tmp_path)}]
+    assert requester.params_for(_ALIASES[SemanticMethod.CONFIG_READ]) == [
+        {"cwd": str(tmp_path), "includeLayers": True}
+    ]
     assert requester.params_for(_ALIASES[SemanticMethod.CONFIG_REQUIREMENTS_READ]) == [_OMITTED]
     assert requester.params_for(_ALIASES[SemanticMethod.EXPERIMENTAL_FEATURE_LIST]) == [
         {"cursor": None}
@@ -618,7 +625,57 @@ async def test_invalid_config_shapes_fail_closed(
     assert snapshot.effective_policy is None
     assert snapshot.policy_state.status is CapabilityStatus.VERSION_MISMATCH
     assert snapshot.account.status is CapabilityStatus.AVAILABLE
-    assert snapshot.realtime.status is CapabilityStatus.AVAILABLE
+    assert snapshot.realtime.status is CapabilityStatus.VERSION_MISMATCH
+
+
+async def test_nonempty_realtime_backend_prompt_override_disables_realtime(
+    tmp_path: Path,
+) -> None:
+    actions = happy_actions()
+    actions[_ALIASES[SemanticMethod.CONFIG_READ]] = {
+        "config": {
+            "sandbox_mode": "workspace-write",
+            "approval_policy": "on-request",
+        },
+        "layers": [
+            {
+                "config": {
+                    "experimental_realtime_ws_backend_prompt": "PRIVATE_OVERRIDE",
+                },
+                "disabledReason": None,
+            }
+        ],
+    }
+
+    snapshot, _ = await discover(tmp_path, actions=actions)
+
+    assert snapshot.realtime == CapabilityState(
+        CapabilityStatus.DISABLED,
+        "prompt_overridden",
+    )
+    assert "PRIVATE_OVERRIDE" not in repr(snapshot)
+
+
+async def test_disabled_realtime_backend_prompt_override_is_ignored(tmp_path: Path) -> None:
+    actions = happy_actions()
+    actions[_ALIASES[SemanticMethod.CONFIG_READ]] = {
+        "config": {
+            "sandbox_mode": "workspace-write",
+            "approval_policy": "on-request",
+        },
+        "layers": [
+            {
+                "config": {
+                    "experimental_realtime_ws_backend_prompt": "PRIVATE_OVERRIDE",
+                },
+                "disabledReason": "superseded",
+            }
+        ],
+    }
+
+    snapshot, _ = await discover(tmp_path, actions=actions)
+
+    assert snapshot.realtime == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
 
 
 @pytest.mark.parametrize(
@@ -844,7 +901,7 @@ async def test_feature_page_budget_fails_closed_and_remains_bounded(tmp_path: Pa
     assert len(requester.params_for(_ALIASES[SemanticMethod.EXPERIMENTAL_FEATURE_LIST])) == 32
 
 
-async def test_optional_method_failure_or_absence_does_not_hide_profile_readiness(
+async def test_config_failure_preserves_agent_readiness_but_blocks_realtime_identity(
     tmp_path: Path,
 ) -> None:
     actions = happy_actions()
@@ -859,13 +916,15 @@ async def test_optional_method_failure_or_absence_does_not_hide_profile_readines
 
     assert snapshot.account.status is CapabilityStatus.AVAILABLE
     assert snapshot.policy_state == CapabilityState(CapabilityStatus.ERROR, "probe_failed")
-    assert snapshot.realtime == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
+    assert snapshot.realtime == CapabilityState(CapabilityStatus.ERROR, "probe_failed")
     assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
     assert requester.params_for(_ALIASES[SemanticMethod.REALTIME_VOICES_LIST]) == [{}]
     assert "CONFIG_ERROR_SECRET" not in repr(snapshot)
 
 
-async def test_missing_optional_config_does_not_hide_profile_readiness(tmp_path: Path) -> None:
+async def test_missing_config_preserves_agent_readiness_but_blocks_realtime_identity(
+    tmp_path: Path,
+) -> None:
     included = frozenset(SemanticMethod) - {SemanticMethod.CONFIG_READ}
 
     snapshot, _ = await discover(tmp_path, contract=make_contract(included=included))
@@ -876,7 +935,10 @@ async def test_missing_optional_config_does_not_hide_profile_readiness(tmp_path:
         "method_unavailable",
     )
     assert snapshot.agent_admission == CapabilityState(CapabilityStatus.AVAILABLE, "ready")
-    assert snapshot.realtime.status is CapabilityStatus.AVAILABLE
+    assert snapshot.realtime == CapabilityState(
+        CapabilityStatus.VERSION_MISMATCH,
+        "method_unavailable",
+    )
 
 
 @pytest.mark.parametrize(
@@ -1094,7 +1156,7 @@ async def test_nonterminal_errors_continue_remaining_requests(tmp_path: Path) ->
     assert _ALIASES[SemanticMethod.CONFIG_REQUIREMENTS_READ] in called
     assert _ALIASES[SemanticMethod.EXPERIMENTAL_FEATURE_LIST] in called
     assert _ALIASES[SemanticMethod.REALTIME_VOICES_LIST] in called
-    assert snapshot.realtime.status is CapabilityStatus.AVAILABLE
+    assert snapshot.realtime.status is CapabilityStatus.ERROR
 
 
 @pytest.mark.parametrize(

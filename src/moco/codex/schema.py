@@ -1674,6 +1674,10 @@ _THREAD_START_BASE: Mapping[str, _Witness] = MappingProxyType(
 )
 _REALTIME_START = _object_value(
     {
+        "clientManagedHandoffs": _LiteralValue(value=False),
+        "codexResponseHandoffMode": _LiteralValue("bemTags"),
+        "codexResponsesAsItems": _LiteralValue(value=False),
+        "delegationAckFiller": _LiteralValue(value=True),
         "includeStartupContext": _LiteralValue(value=False),
         "outputModality": _LiteralValue("audio"),
         "prompt": _DYNAMIC_STRING,
@@ -1701,7 +1705,14 @@ _CLIENT_INVOCATIONS: dict[SemanticMethod, _InvocationSpec] = {
     SemanticMethod.ACCOUNT_READ: _InvocationSpec(ParamsKind.OBJECT, (_EMPTY_PARAMS,)),
     SemanticMethod.CONFIG_READ: _InvocationSpec(
         ParamsKind.OBJECT,
-        (_object_value({"cwd": _DYNAMIC_STRING}),),
+        (
+            _object_value(
+                {
+                    "cwd": _DYNAMIC_STRING,
+                    "includeLayers": _LiteralValue(value=True),
+                }
+            ),
+        ),
     ),
     SemanticMethod.CONFIG_REQUIREMENTS_READ: _InvocationSpec(ParamsKind.OMITTED),
     SemanticMethod.EXPERIMENTAL_FEATURE_LIST: _InvocationSpec(

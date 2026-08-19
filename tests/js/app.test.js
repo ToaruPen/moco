@@ -2241,6 +2241,10 @@ describe("media cleanup", () => {
   it("starts AudioContext resume synchronously before microphone permission", async () => {
     const order = [];
     class FakeAudioContext {
+      constructor(options) {
+        order.push(["construct", options]);
+      }
+
       resume() {
         order.push("resume");
         return Promise.resolve();
@@ -2251,7 +2255,7 @@ describe("media cleanup", () => {
     order.push("permission");
     await activation.ready;
 
-    assert.deepEqual(order, ["resume", "permission"]);
+    assert.deepEqual(order, [["construct", { sampleRate: 48_000 }], "resume", "permission"]);
   });
 
   it("classifies mobile audio and microphone failures without a success fallback", () => {

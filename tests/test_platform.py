@@ -199,7 +199,7 @@ def test_windows_without_path_command_does_not_use_private_fallback(
     assert calls == ["codex"]
 
 
-def test_darwin_path_command_precedes_official_bundle(
+def test_darwin_official_bundle_precedes_unconfigured_path_command(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -215,7 +215,7 @@ def test_darwin_path_command_precedes_official_bundle(
         which=lambda _name: path_command,
     )
 
-    assert command == CodexCommand((path_command,))
+    assert command == CodexCommand((str(bundle_candidate),))
 
 
 def test_darwin_without_path_command_uses_official_bundle(

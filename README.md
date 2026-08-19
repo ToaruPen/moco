@@ -1,9 +1,9 @@
 # moco
 
 moco は、macOS または Windows 11 の手元のマシンに話しかけて Codex に作業を頼み、
-その最終回答を Irodori の声で聞くための macOS-first ローカル音声エージェントです。
-Realtime の Voice Thread は音声入力と文字起こしを担い、確定した依頼を通常の Codex
-Agent Thread が実行します。
+その応答を Irodori の声で聞くための macOS-first ローカル音声エージェントです。
+Codex Realtime v3が会話を所有し、Frameless Bidiの`delegation.*`で同じThreadのCodexへ
+必要な作業を委譲します。acknowledgement、進捗、最終結果は同じRealtime会話へ戻ります。
 
 ただし、F1/F2 が機能そのものなのではありません。内部の契約は
 `LISTEN_START` / `LISTEN_STOP` であり、キーは YAML で変更できます。F1/F2 は
@@ -37,7 +37,8 @@ Reviewer はこの画面と認証を共有しない別の loopback-only surface 
 - スマートフォンから使う場合は iOS Safari または Android Chrome
 - Python 3.13、[uv](https://docs.astral.sh/uv/)、Node.js、`just`
 - `PATH` 上、または `codex.command` に設定した公開 Codex CLI と、利用可能な ChatGPT
-  アカウント。macOS では ChatGPT.app の bundle を fallback として利用できます
+  アカウント。macOSで`codex.command`が未指定なら、対応するChatGPT.app bundleを
+  `PATH`上のCLIより先に利用します
 - Irodori-TTS API。通常は Windows GPU ホストで起動し、Tailscale 経由で接続します
 - 初回利用時の Chrome または Edge のマイク許可
 - グローバルキーを使う場合、macOS では moco を起動するターミナルまたは実行ファイルへの
@@ -53,7 +54,7 @@ Realtime セッションを明示的に破棄して新しい会話を始める�
 
 ### macOS / Windows Stage B
 
-moco は macOS-first ですが、Stage B の Agent handoff とローカル approval は macOS と
+moco は macOS-first ですが、Frameless delegation とローカル approval は macOS と
 Windows 11 の各ホストで foreground 実行する同じ基本契約を対象にします。各ホストの moco は
 そのホストの Codex CLI、設定、workspace を使い、別ホストの app-server を暗黙に proxy
 しません。`codex.command: null` の場合、Windows は `PATH` 上の公開 Codex CLI だけを使い、
@@ -69,7 +70,7 @@ Agent profile は設定ファイルの `agent.profile` で選びます。既定�
 公開画面から profile は変更できません。`read_only` と `workspace_write` は global Codex policy を admission 条件にしません。
 `read_only` と `workspace_write` は sandbox と approval policy を thread 作成時に明示します。`inherit_codex` だけが global Codex policy を継承します。
 この profile で有効 policy を確認できない場合、または `danger-full-access` と approval policy
-`never` の組み合わせになる場合は、音声から Agent turn を開始しません。承認が発生し得る依頼を始める前に、
+`never` の組み合わせになる場合は、音声からCodex作業を開始しません。承認が発生し得る依頼を始める前に、
 同じホストの別ターミナルで `uv run moco review` を実行してローカル Reviewer を接続します。
 Reviewer が未接続のまま承認要求を受けると fail-closed になります。公開画面は待機状態と
 turn 全体の取消だけを扱い、操作詳細の閲覧や decision はできません。音声の「はい」も承認に
@@ -107,7 +108,7 @@ codex:
   command: ["/absolute/path/to/codex"]
 ```
 
-ホストの `PATH` と、macOSで利用可能な公式bundle fallbackから自動解決する場合は次を使います。
+macOSの公式bundle、または他のOSでホストの`PATH`から自動解決する場合は次を使います。
 
 ```yaml
 codex:
@@ -118,39 +119,44 @@ codex:
 F1/F2を使う機能テストでは、次のように操作します。
 
 1. F1 を一度押して音声入力を開始する
-2. 依頼を話す。Realtime の VAD が発話ごとに文字起こしを確定し、Agent Thread へ渡す
+2. 依頼を話す。RealtimeのVADが発話を確定し、必要な作業を同じThreadのCodexへ自動委譲する
 3. マイクをONのまま、続けて複数ターン会話する
 4. 事前に接続したローカル Reviewer へ要求が届いた場合だけ、内容を確認して決定する
-5. Codex Agent の final answer を Irodori の声で聞く
+5. acknowledgement、speakable progress、finalをIrodoriの声で聞く
 6. マイク入力を止めるときだけ F2 を押す
 
-F2 はマイク入力だけを停止します。文字起こし確定や Agent handoff の開始条件ではなく、進行中の
-Agent turn、Irodori の読み上げ、Realtime の会話コンテキストも取り消しません。F1 を押すと
+F2 はマイク入力だけを停止します。文字起こし確定やdelegationの開始条件ではなく、進行中の
+Codex作業、Irodoriの読み上げ、Realtimeの会話コンテキストも取り消しません。F1を押すと
 同じ会話で直ちにライブ入力を再開します。停止処理の遅い状態通知が後から届いても、その後の
 `listening` 状態を正としてマイクと表示を ON に戻します。
 
-### Agent 作業、取消、再接続
+### Codex作業、取消、再接続
 
-確定した user transcript は同じ会話の Agent Thread へ一度だけ渡されます。作業中の進捗は
-画面にだけ表示し、作業中の中間音声は発しません。Voice assistant
-transcript も画面の task 回答や読み上げには使わず、Agent の final answer を同じ
-文章で画面に表示し、Irodori で読み上げます。失敗、interrupt、結果不明も
-外部エラー本文ではなく、画面と音声で同一の固定短文を使います。対応する user transcript の
-表示が遅い場合も、Agent final を先に表示して会話順を逆転させません。
+確定したuser transcriptはapp-serverの別Threadへ再送しません。Realtime v3が一つの
+`delegation.created`を作り、Codexのcommentaryとfinalを同じ会話へ自動返送します。
+`clientManagedHandoffs`と`codexResponsesAsItems`はfalse、`delegationAckFiller`はtrue、
+`codexResponseHandoffMode`は`bemTags`です。mocoは`appendText`や`appendSpeech`で応答を
+再注入しないため、同じ依頼の二重実行と同じ応答の二重読み上げを行いません。
 
-Realtime event と user transcript の未処理queueはそれぞれ64件、user transcript は1発話あたり
-64 KiB／256 partsに制限します。上限を超える不正・異常なstreamは黙って欠落させず、Voiceを
-停止して明示的な再接続待ちにします。Agent notification の購読終了は待機中でも会話lease全体へ
-伝播し、次の依頼を壊れた接続へ受け付けません。
+Realtimeのspeakable assistant transcriptを表示とSpeechQueueの共通source of truthにします。
+acknowledgementやspeakable progressはfinalを待たずIrodoriへ流れます。reasoning、command output、
+raw Codex itemは読み上げません。任意の`moco.speech_plan`先頭行は表示・読み上げから除き、
+検証済みdelivery captionだけをIrodoriへ渡します。
 
-進行中に新しい発話を確定すると、利用可能なら active turn を steer し、そうでなければ1件だけ
-queue します。同時に再生中・合成中の古い speech generation を停止します。操作画面の明示的な
-取消は pending local review を撤回して Agent turn の interrupt 経路へ進みます。音声で話した
+Realtime event とuser/assistant transcriptの未処理queueはそれぞれ64件です。1発話あたりuserは
+64 KiB／256 parts、assistantは16 KiB／256 parts、Irodori待機segmentは64件に制限します。上限を
+超える不正・異常なstreamは黙って欠落させず、合成へ渡す前にVoiceを停止して明示的な再接続待ちに
+します。app-server notificationの購読終了は待機中でも会話lease全体へ伝播し、次の依頼を壊れた
+接続へ受け付けません。
+
+進行中に新しい発話を始めると、Frameless会話へそのままsteering contextとして入り、同時に
+再生中・合成中の古いspeech generationを停止します。操作画面の明示的な取消はpending local
+reviewを撤回して、同じRealtime Threadのactive turnへ`turn/interrupt`を一度だけ送ります。音声で話した
 「キャンセル」は通常の依頼であり、取消や Reviewer decision にはなりません。
 
-Voice 接続だけを失った場合は Agent Thread を維持し、画面から明示的に再接続します。自動 retry は
-しません。app-server 接続を失った場合は active turn の outcome unknown を報告し、旧依頼や queue を
-新しい接続へ自動再送しません。
+Voice接続だけを失った場合は同じRealtime Threadを維持し、画面から明示的に再接続します。自動retryは
+しません。app-server接続を失った場合はactive turnを成功扱いにせず、旧依頼を新しい接続へ
+自動再送しません。
 
 ### GPTの応答スタイルを変更する
 
@@ -170,7 +176,13 @@ New-Item -ItemType Directory -Force "$env:APPDATA\moco"
 Copy-Item config\moco.prompt.example.md "$env:APPDATA\moco\prompt.md"
 ```
 
-このファイルがなければ内蔵プロンプトを使います。別のファイルを使う場合は、
+このファイルがなければ内蔵のmoco専用プロンプトを使います。`prompt`は公式Codex Realtime
+プロンプトへの追記ではなく全文置換です。編集時も、mocoの人格だけでなく、Frameless delegation、
+Codex結果の権威性、二重実行防止、Irodoriのplain speakable text契約を維持してください。
+Codex側の`experimental_realtime_ws_backend_prompt`が非空の場合、mocoのpromptを確実に適用できないため、
+会話開始を`codex_realtime: prompt_overridden`で拒否します。Codex設定からoverrideを削除するか空にして
+から再接続してください。値そのものは画面、ログ、telemetryへ出力しません。
+別のファイルを使う場合は、
 `moco.yaml` の `codex.prompt_file` へ対象ホストで有効な絶対pathを指定してください。
 macOSでは `~` から始まる現在userのpathも使用できます。内容は会話開始ごとに読み直すため、
 編集後のmoco再起動は不要で、次の会話
@@ -181,6 +193,11 @@ macOSでは `~` から始まる現在userのpathも使用できます。内容�
 候補、表示順、既定話者は Irodori が所有し、moco は固定の話者やナレーターを追加しません。
 会話中の変更は次の読み上げから反映されます。選択中の話者がカタログから消えた場合は、
 別の話者へ自動で切り替えず音声を停止します。
+
+IrodoriのWAVはheaderと実データを検証してから配信します。現在のv4出力は48 kHz、mono、
+PCM16です。ブラウザのAudioContextも48 kHzを要求し、decode段階の不要な48→44.1 kHz
+再標本化を避けます。再生速度は1、detuneは0のままで、sample rateだけを理由に音質不良とは
+判定しません。
 
 操作画面の進捗帯とアクティビティ欄には、Codex turn と作業種別の固定ラベル、phase、
 音声生成、再生、マイク、接続状態だけを表示します。コマンド本文、ファイルパス、patch、
@@ -196,9 +213,9 @@ Dark 5種（Midnight、Graphite、Ocean、Forest、Aubergine）、High Contrast 
 `localStorage` に保存し、capability、会話、音声、アクティビティは含めません。配色入力中は
 ブラウザ側のフォールバックキーを抑止します。
 
-新しい user transcript を確定すると、前述の steer／queue と同時に再生中または合成中の古い
-Irodori 音声を無効化します。Agent turn、Voice、speech が idle のまま設定時間を過ぎると会話
-だけが閉じられ、デーモンと操作ページは残ります。次の入力開始では新しい Agent Thread が作られ、
+新しいuser transcriptを開始すると、再生中または合成中の古いIrodori音声を無効化します。
+Codex turn、Voice、speechがidleのまま設定時間を過ぎると会話だけが閉じられ、デーモンと
+操作ページは残ります。次の入力開始では新しいRealtime Threadが作られ、
 以前の文字起こしや未完了依頼は自動投入されません。
 
 ## スマートフォンから使う
@@ -343,7 +360,7 @@ uninstall はラベルと実行ファイルが moco のものと一致する pli
 | `codex_policy` | Codexが返すeffective sandboxとapproval policyの妥当性 |
 | `codex_agent_admission` | policyとserver request categoryに基づくAgent利用可否 |
 | `codex_local_review` | command/file approvalのschemaをローカルReviewer adapterで扱えるか。接続中かどうかとは別です |
-| `codex_realtime` | Realtime voiceの利用可否 |
+| `codex_realtime` | Realtime voiceとmoco promptの利用可否。Codex側のprompt overrideは`prompt_overridden` |
 | `codex_interrupt` | turn interrupt semanticの利用可否 |
 | `codex_server_requests` | approval用server request categoryの互換性 |
 | `irodori_capabilities` / `irodori_synthesis` | runtime readiness、話者選択可否、任意の条件付き合成 |

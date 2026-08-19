@@ -5,12 +5,12 @@ import gc
 import json
 import logging
 import time
-from collections.abc import AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Mapping
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Literal, cast
+from typing import Any, ClassVar, Literal, cast
 
 import pytest
 from fastapi.testclient import TestClient
@@ -57,6 +57,7 @@ from moco.codex.session import (
     load_realtime_prompt,
 )
 from moco.config import (
+    AgentProfileMode,
     CodexSettings,
     IrodoriSettings,
     MocoSettings,
@@ -84,6 +85,7 @@ from moco.runtime.coordinator import (
 )
 from moco.runtime.hotkeys import Control
 from moco.runtime.lifecycle import IdleLeaseTimer, LifecycleState
+from moco.speech import queue as speech_queue
 from moco.speech.contracts import IrodoriCapabilities
 from moco.speech.irodori import (
     _MAX_CAPABILITY_VOICES,
@@ -97,8 +99,13 @@ from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import ClientControl, StartMessage
 from moco.web.reviewer import ReviewerBroker
 from test_codex_agent import FakeSharedConnection, make_session
+from test_codex_approval import (
+    Registrar,
+    command_request,
+    file_change_patch_contract,
+    published,
+)
 from test_codex_approval import broker as make_broker
-from test_codex_approval import command_request, published
 from test_coordinator import (
     EffectsRecorder,
     begin_real_coordinator_turn,
@@ -134,13 +141,16 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
             return contract
 
     class Connection:
+        terminal_callbacks: ClassVar[list[Callable[[], object]]] = []
+
         def __init__(self, command: object) -> None:
             assert command == "resolved"
 
         def register_notification_observer(self, _observer: object) -> None:
             events.append("observer")
 
-        def register_terminal_callback(self, _callback: object) -> None:
+        def register_terminal_callback(self, callback: object) -> None:
+            self.terminal_callbacks.append(cast("Callable[[], object]", callback))
             events.append("terminal")
 
         def register_server_request_handler(self, _method: str, _handler: object) -> None:
@@ -172,6 +182,9 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
         def bind_active_turn_check(self, _callback: object) -> None:
             events.append("broker.active")
 
+        def bind_turn_terminal(self, _callback: object) -> None:
+            events.append("broker.terminal")
+
         def cancel_pending(self) -> None:
             events.append("broker.withdraw")
 
@@ -189,34 +202,12 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
             return snapshot
 
     class Agent:
-        instance: Agent | None = None
-
-        def __init__(
-            self,
-            rpc: object,
-            value: object,
-            capabilities: object,
-            *_args: object,
-            activity_sink: Callable[[AgentActivityEvent], object],
-            terminal_sink: Callable[[], object],
-        ) -> None:
-            assert isinstance(rpc, Connection)
-            assert value is contract
-            assert capabilities is snapshot
-            self.activity_sink = activity_sink
-            self.terminal_sink = terminal_sink
-            type(self).instance = self
-            events.append("agent")
-
-        def owns_active_turn(self, _thread_id: str, _turn_id: str) -> bool:
-            return True
-
-        async def close(self) -> None:
-            events.append("agent.close")
+        def __init__(self, *_args: object, **_kwargs: object) -> None:
+            raise AssertionError
 
     class Coordinator:
         def __init__(self, session: object, **_kwargs: object) -> None:
-            assert isinstance(session, Agent)
+            assert session is None
             self.snapshot = InteractionSnapshot(
                 connection=ConnectionState.STARTING,
                 voice=VoiceState.IDLE,
@@ -238,6 +229,8 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
             return None
 
     class Voice:
+        thread_id = "thr_test"
+
         def __init__(self, rpc: object, **kwargs: object) -> None:
             assert isinstance(rpc, Connection)
             assert kwargs["capabilities"] is snapshot
@@ -290,6 +283,7 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
     assert events == [
         "probe",
         "broker",
+        "broker.terminal",
         "observer",
         "approval",
         "terminal",
@@ -297,7 +291,6 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
         "connection.start",
         "discovery.construct",
         "discovery",
-        "agent",
         "broker.active",
         "coordinator",
         "broker.bind",
@@ -306,27 +299,23 @@ async def test_production_owner_composes_one_contract_before_start_and_publishes
         "slot.bind",
         "publish.degraded",
     ]
-    agent = cast("Agent", Agent.instance)
-    agent.activity_sink(AgentActivityEvent("command_execution", "started"))
-    assert effects.activities == [AgentActivityEvent("command_execution", "started")]
-    agent.terminal_sink()
-    agent.terminal_sink()
+    assert effects.activities == []
+    Connection.terminal_callbacks[-1]()
+    Connection.terminal_callbacks[-1]()
     for _ in range(20):
         if owner.closed:
             break
         await asyncio.sleep(0)
 
     assert owner.closed
-    assert events[-7:] == [
-        "broker.withdraw",
+    assert events[-5:] == [
         "coordinator.connection_lost",
-        "agent.close",
         "slot.release",
         "broker.close",
         "voice.close",
         "connection.close",
     ]
-    assert events.count("broker.withdraw") == 1
+    assert events.count("coordinator.connection_lost") == 1
 
 
 class FakeInteractionEffects:
@@ -348,7 +337,7 @@ class FakeInteractionEffects:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("close_path", ["owner", "stop", "socket", "idle"])
-async def test_published_owner_close_terminalizes_active_turn_before_owned_resources(  # noqa: C901
+async def test_published_owner_closes_without_starting_a_second_agent_thread(  # noqa: C901
     monkeypatch: pytest.MonkeyPatch,
     close_path: str,
 ) -> None:
@@ -391,6 +380,9 @@ async def test_published_owner_close_terminalizes_active_turn_before_owned_resou
         def bind_active_turn_check(self, _callback: object) -> None:
             return None
 
+        def bind_turn_terminal(self, _callback: object) -> None:
+            return None
+
         def cancel_pending(self) -> None:
             events.append("broker.withdraw")
 
@@ -408,28 +400,10 @@ async def test_published_owner_close_terminalizes_active_turn_before_owned_resou
         instance: Agent | None = None
 
         def __init__(self, *_args: object, **_kwargs: object) -> None:
-            type(self).instance = self
-            self.started = asyncio.Event()
-            self.turns: list[str] = []
-            self.reusable = True
-
-        async def start_turn(self, text: str) -> str:
-            self.turns.append(text)
-            self.started.set()
-            await asyncio.Event().wait()
-            return "unreachable"
-
-        async def steer(self, _text: str) -> None:
-            await asyncio.Event().wait()
-
-        def owns_active_turn(self, _thread_id: str, _turn_id: str) -> bool:
-            return True
-
-        async def close(self) -> None:
-            events.append("agent.close")
-            self.reusable = False
+            raise AssertionError
 
     class Voice:
+        thread_id = "thr_test"
         active_turn_id: str | None = None
 
         def __init__(self, _rpc: object, **_kwargs: object) -> None:
@@ -482,14 +456,7 @@ async def test_published_owner_close_terminalizes_active_turn_before_owned_resou
     )
     owner.bind_effects(effects)
     assert await owner.start("offer-sdp") == "answer-sdp"
-    owner.listen_started()
-    owner.listen_stopped()
-    assert await owner.consume_user_final("accepted turn") is HandoffDisposition.STARTED
-    agent = cast("Agent", Agent.instance)
-    await agent.started.wait()
-    owner.listen_started()
-    owner.listen_stopped()
-    assert await owner.consume_user_final("queued turn") is HandoffDisposition.QUEUED
+    assert Agent.instance is None
 
     browser = web_app._BrowserConnection(  # noqa: SLF001
         cast("WebSocket", CapturingWebSocket()),
@@ -511,17 +478,14 @@ async def test_published_owner_close_terminalizes_active_turn_before_owned_resou
     await asyncio.sleep(0)
 
     assert owner.closed
-    assert effects.terminal_claims == 1
-    assert effects.results == [TurnResult(final_answer=None, error_code="agent_turn_interrupted")]
+    assert effects.terminal_claims == 0
+    assert effects.results == []
     assert all(
         snapshot.connection is not ConnectionState.DISCONNECTED for snapshot in effects.snapshots
     )
     assert effects.submission_errors == []
-    assert agent.turns == ["accepted turn"]
     assert events[events.index("slot.bind") + 1 :] == [
         "broker.withdraw",
-        "terminal.claim",
-        "agent.close",
         "slot.release",
         "broker.close",
         "voice.close",
@@ -531,7 +495,7 @@ async def test_published_owner_close_terminalizes_active_turn_before_owned_resou
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("operation", ["cancel", "close"])
-async def test_owner_withdraws_review_before_blocked_turn_settlement(  # noqa: PLR0915
+async def test_owner_withdraws_review_before_blocked_turn_settlement(  # noqa: C901, PLR0915
     operation: str,
 ) -> None:
     connection = FakeSharedConnection()
@@ -574,6 +538,24 @@ async def test_owner_withdraws_review_before_blocked_turn_settlement(  # noqa: P
     assert coordinator.snapshot.task is TaskState.WAITING_REVIEW
     assert pending_counts == [1]
 
+    if operation == "cancel":
+
+        class RealtimeVoice:
+            active_turn_id = "agent-turn-1"
+
+            async def interrupt_active_turn(self) -> bool:
+                connection.interrupt_requested.set()
+                gate = connection.interrupt_gate
+                assert gate is not None
+                await gate.wait()
+                return True
+
+            async def close(self) -> None:
+                return None
+
+        owner._voice = cast("CodexRealtimeSession", RealtimeVoice())  # noqa: SLF001
+        owner._voice_active = True  # noqa: SLF001
+
     close_state_lock_held = operation == "close"
     if close_state_lock_held:
         await owner._state_lock.acquire()  # noqa: SLF001
@@ -605,6 +587,8 @@ async def test_owner_withdraws_review_before_blocked_turn_settlement(  # noqa: P
         assert result is (True if operation == "cancel" else None)
         with pytest.raises(CodexReviewError):
             await review_task
+        if operation == "cancel":
+            assert await coordinator.cancel_turn()
         assert downstream.results == [
             TurnResult(final_answer=None, error_code="agent_turn_interrupted")
         ]
@@ -684,6 +668,45 @@ async def test_broken_review_count_callback_terminalizes_the_whole_owner_lease()
     assert coordinator.connection_losses == 1
     assert owner.closed
     assert connection.close_called
+
+
+def test_owner_observes_turn_completion_while_voice_is_disconnected() -> None:
+    class Coordinator:
+        def __init__(self) -> None:
+            self.completed: list[str] = []
+
+        def realtime_turn_completed(self, turn_id: str) -> None:
+            self.completed.append(turn_id)
+
+    owner = web_app._CodexConversationOwner(  # noqa: SLF001
+        MocoSettings(),
+        connection=cast("CodexConnectionSupervisor", FakeSharedConnection()),
+        working_directory=Path.cwd(),
+    )
+    coordinator = Coordinator()
+    owner._conversation_thread_id = "thr_test"  # noqa: SLF001
+    owner._active_turn_id = "turn-1"  # noqa: SLF001
+    owner._coordinator = cast("InteractionCoordinator", coordinator)  # noqa: SLF001
+    interaction = make_broker(file_change_patch_contract(agent_events=True))
+    interaction.bind_turn_terminal(owner._realtime_turn_terminal)  # noqa: SLF001
+    registrar = Registrar()
+    interaction.register_approval_handlers(registrar)
+
+    registrar.notification[0](
+        RpcNotification(
+            "turn/completed",
+            {
+                "threadId": "thr_test",
+                "turn": {"id": "turn-1", "status": "completed"},
+            },
+        )
+    )
+
+    active_turn_id: object = owner._active_turn_id  # noqa: SLF001
+    assert active_turn_id is None
+    assert coordinator.completed == ["turn-1"]
+    assert not owner._owns_active_turn("thr_test", "turn-1")  # noqa: SLF001
+    interaction.close()
 
 
 @pytest.mark.asyncio
@@ -892,6 +915,9 @@ async def test_pre_coordinator_terminal_publishes_connection_lost_and_aborts_sta
             registrar.register_terminal_callback(self.connection_lost)
             registrar.register_server_request_handler("approval", object())
 
+        def bind_turn_terminal(self, _callback: object) -> None:
+            return None
+
         def connection_lost(self) -> None:
             events.append("broker.connection_lost")
 
@@ -904,6 +930,8 @@ async def test_pre_coordinator_terminal_publishes_connection_lost_and_aborts_sta
             events.append("discovery.construct")
 
     class Voice:
+        thread_id = "thr_test"
+
         def __init__(self, _rpc: object, **_kwargs: object) -> None:
             events.append("voice.construct")
 
@@ -1140,6 +1168,9 @@ async def test_terminal_before_voice_start_success_never_publishes_dead_voice(  
         def bind_active_turn_check(self, _callback: object) -> None:
             return None
 
+        def bind_turn_terminal(self, _callback: object) -> None:
+            return None
+
         def cancel_pending(self) -> None:
             events.append("broker.withdraw")
 
@@ -1325,15 +1356,16 @@ async def test_terminal_after_voice_commit_before_browser_resume_does_not_send_s
     assert states[-1] == "connection_lost"
 
 
-@pytest.mark.parametrize("required", ["agent_admission", "realtime"])
+@pytest.mark.parametrize("required", ["agent_admission", "realtime", "interrupt"])
 def test_conversation_readiness_rejects_missing_required_capability(required: str) -> None:
     unavailable = CapabilityState(CapabilityStatus.VERSION_MISMATCH, "missing")
     base = make_codex_snapshot()
-    snapshot = (
-        replace(base, agent_admission=unavailable)
-        if required == "agent_admission"
-        else replace(base, realtime=unavailable)
-    )
+    if required == "agent_admission":
+        snapshot = replace(base, agent_admission=unavailable)
+    elif required == "realtime":
+        snapshot = replace(base, realtime=unavailable)
+    else:
+        snapshot = replace(base, interrupt=unavailable)
 
     with pytest.raises(CodexRpcError, match="required Codex capability"):
         web_app._conversation_readiness(  # noqa: SLF001
@@ -1355,6 +1387,53 @@ def test_conversation_readiness_degrades_when_only_steer_is_unavailable() -> Non
     )
 
 
+def test_conversation_readiness_rejects_unsafe_inherited_policy() -> None:
+    snapshot = replace(
+        make_codex_snapshot(),
+        effective_policy=EffectivePolicy(
+            sandbox=SandboxMode.DANGER_FULL_ACCESS,
+            approval=ApprovalMode.NEVER,
+        ),
+    )
+
+    with pytest.raises(CodexRpcError, match="required Codex capability"):
+        web_app._conversation_readiness(  # noqa: SLF001
+            SimpleNamespace(approval_profiles={}),
+            snapshot,
+            AgentProfileMode.INHERIT_CODEX,
+        )
+
+
+def test_conversation_readiness_rejects_unknown_inherited_policy() -> None:
+    snapshot = replace(make_codex_snapshot(), effective_policy=None)
+
+    with pytest.raises(CodexRpcError, match="required Codex capability"):
+        web_app._conversation_readiness(  # noqa: SLF001
+            SimpleNamespace(approval_profiles={}),
+            snapshot,
+            AgentProfileMode.INHERIT_CODEX,
+        )
+
+
+def test_conversation_readiness_allows_explicit_profile_with_unsafe_global_policy() -> None:
+    snapshot = replace(
+        make_codex_snapshot(),
+        effective_policy=EffectivePolicy(
+            sandbox=SandboxMode.DANGER_FULL_ACCESS,
+            approval=ApprovalMode.NEVER,
+        ),
+    )
+
+    assert (
+        web_app._conversation_readiness(  # noqa: SLF001
+            SimpleNamespace(approval_profiles={}),
+            snapshot,
+            AgentProfileMode.READ_ONLY,
+        )
+        is ConnectionState.READY
+    )
+
+
 @pytest.mark.parametrize(
     "degrade_snapshot",
     [
@@ -1362,7 +1441,6 @@ def test_conversation_readiness_degrades_when_only_steer_is_unavailable() -> Non
         lambda snapshot, _unavailable: replace(snapshot, effective_policy=None),
         lambda snapshot, unavailable: replace(snapshot, policy_state=unavailable),
         lambda snapshot, unavailable: replace(snapshot, managed_requirements=unavailable),
-        lambda snapshot, unavailable: replace(snapshot, interrupt=unavailable),
         lambda snapshot, unavailable: replace(snapshot, steer=unavailable),
         lambda snapshot, unavailable: replace(snapshot, server_requests=unavailable),
         lambda snapshot, _unavailable: replace(
@@ -1375,7 +1453,6 @@ def test_conversation_readiness_degrades_when_only_steer_is_unavailable() -> Non
         "effective_policy",
         "policy_state",
         "managed_requirements",
-        "interrupt",
         "steer",
         "server_requests",
         "has_unclassified_server_requests",
@@ -2235,7 +2312,13 @@ async def test_owner_reoffers_only_inactive_voice_and_rejects_stale_generations(
     connection = OwnerConnection(event_log)
     discovery = OwnerDiscovery(make_codex_snapshot(), event_log)
     voices = [ReofferVoice("answer-1"), ReofferVoice("answer-2")]
-    monkeypatch.setattr(web_app, "CodexRealtimeSession", lambda *_args, **_kwargs: voices.pop(0))
+    voice_kwargs: list[dict[str, object]] = []
+
+    def voice_factory(*_args: object, **kwargs: object) -> ReofferVoice:
+        voice_kwargs.append(kwargs)
+        return voices.pop(0)
+
+    monkeypatch.setattr(web_app, "CodexRealtimeSession", voice_factory)
     owner = make_owner(tmp_path, connection, discovery)
     coordinator = VoiceLossCoordinator()
 
@@ -2243,7 +2326,9 @@ async def test_owner_reoffers_only_inactive_voice_and_rejects_stale_generations(
     owner._coordinator = cast("InteractionCoordinator", coordinator)  # noqa: SLF001
     first_voice = cast("ReofferVoice", owner._voice)  # noqa: SLF001
     assert owner.voice_generation == 1
-    assert owner.notifications(1) is first_voice.stream
+    first_stream = owner.notifications(1)
+    assert first_stream is not first_voice.stream
+    await cast("AsyncGenerator[RealtimeEvent]", first_stream).aclose()
     assert not await owner.close_voice(2, on_claimed=lambda: None)
     assert await owner.close_voice(1, on_claimed=lambda: None)
     assert first_voice.close_calls == 1
@@ -2254,9 +2339,155 @@ async def test_owner_reoffers_only_inactive_voice_and_rejects_stale_generations(
     assert await owner.replace_voice("offer-2") == "answer-2"
     second_voice = cast("ReofferVoice", owner._voice)  # noqa: SLF001
     assert owner.voice_generation == 2
-    assert owner.notifications(2) is second_voice.stream
+    assert "existing_thread_id" not in voice_kwargs[0]
+    assert voice_kwargs[1]["existing_thread_id"] == "thr_test"
+    second_stream = owner.notifications(2)
+    assert second_stream is not second_voice.stream
+    await cast("AsyncGenerator[RealtimeEvent]", second_stream).aclose()
     assert not await owner.close_voice(1, on_claimed=lambda: None)
 
+    await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_owner_retains_active_turn_across_voice_replacement(tmp_path: Path) -> None:
+    connection = OwnerConnection()
+    discovery = OwnerDiscovery(make_codex_snapshot(), connection.event_log)
+    owner = make_owner(tmp_path, connection, discovery)
+
+    assert await owner.start("offer-sdp") == "answer-sdp"
+    first_events = owner.notifications(1)
+    await connection.emit(
+        "turn/started",
+        {"threadId": "owner-thread", "turn": {"id": "turn-1"}},
+    )
+    assert await anext(first_events) == ActivityEvent(
+        "turn",
+        "started",
+        "owner-thread",
+        "turn-1",
+        None,
+    )
+    assert owner._owns_active_turn("owner-thread", "turn-1")  # noqa: SLF001
+
+    assert await owner.close_voice(1, on_claimed=lambda: None)
+    assert owner._owns_active_turn("owner-thread", "turn-1")  # noqa: SLF001
+    assert await owner.replace_voice("replacement-offer") == "answer-sdp"
+    assert owner._owns_active_turn("owner-thread", "turn-1")  # noqa: SLF001
+    assert await owner.cancel_turn()
+    assert connection.event_log.count("turn/interrupt") == 1
+
+    replacement_events = owner.notifications(2)
+    await connection.emit(
+        "turn/completed",
+        {
+            "threadId": "owner-thread",
+            "turn": {"id": "turn-1", "status": "completed"},
+        },
+    )
+    assert await anext(replacement_events) == ActivityEvent(
+        "turn",
+        "completed",
+        "owner-thread",
+        "turn-1",
+        None,
+    )
+    assert not owner._owns_active_turn("owner-thread", "turn-1")  # noqa: SLF001
+    await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_observer_cannot_be_overwritten_by_stale_voice_on_reoffer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = OwnerConnection()
+    discovery = OwnerDiscovery(make_codex_snapshot(), connection.event_log)
+    voices = [ReofferVoice("answer-1"), ReofferVoice("answer-2")]
+    voice_kwargs: list[dict[str, object]] = []
+
+    def voice_factory(*_args: object, **kwargs: object) -> ReofferVoice:
+        voice_kwargs.append(kwargs)
+        return voices.pop(0)
+
+    monkeypatch.setattr(web_app, "CodexRealtimeSession", voice_factory)
+    owner = make_owner(tmp_path, connection, discovery)
+    assert await owner.start("offer-1") == "answer-1"
+    first_voice = cast("ReofferVoice", owner._voice)  # noqa: SLF001
+    first_voice.active_turn_id = "turn-1"
+    owner._active_turn_id = "turn-1"  # noqa: SLF001
+
+    owner._realtime_turn_terminal("thr_test", "turn-1")  # noqa: SLF001
+    assert not owner._owns_active_turn("thr_test", "turn-1")  # noqa: SLF001
+    assert not await owner.cancel_turn()
+    assert await owner.close_voice(1, on_claimed=lambda: None)
+    assert await owner.replace_voice("offer-2") == "answer-2"
+
+    assert voice_kwargs[1]["existing_active_turn_id"] is None
+    assert not owner._owns_active_turn("thr_test", "turn-1")  # noqa: SLF001
+    await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_observer_suppresses_a_delayed_started_event(tmp_path: Path) -> None:
+    connection = OwnerConnection()
+    discovery = OwnerDiscovery(make_codex_snapshot(), connection.event_log)
+    owner = make_owner(tmp_path, connection, discovery)
+
+    assert await owner.start("offer-sdp") == "answer-sdp"
+    events = owner.notifications(1)
+    await connection.emit(
+        "turn/started",
+        {"threadId": "owner-thread", "turn": {"id": "turn-1"}},
+    )
+    await connection.emit(
+        "turn/completed",
+        {
+            "threadId": "owner-thread",
+            "turn": {"id": "turn-1", "status": "completed"},
+        },
+    )
+    owner._realtime_turn_terminal("owner-thread", "turn-1")  # noqa: SLF001
+
+    assert await anext(events) == ActivityEvent(
+        "turn",
+        "completed",
+        "owner-thread",
+        "turn-1",
+        None,
+    )
+    assert not owner._owns_active_turn("owner-thread", "turn-1")  # noqa: SLF001
+    await owner.close()
+
+
+@pytest.mark.asyncio
+async def test_terminal_observer_remembers_multiple_completed_turns_during_backlog(
+    tmp_path: Path,
+) -> None:
+    connection = OwnerConnection()
+    discovery = OwnerDiscovery(make_codex_snapshot(), connection.event_log)
+    owner = make_owner(tmp_path, connection, discovery)
+
+    assert await owner.start("offer-sdp") == "answer-sdp"
+    events = owner.notifications(1)
+    for turn_id in ("turn-1", "turn-2"):
+        await connection.emit(
+            "turn/started",
+            {"threadId": "owner-thread", "turn": {"id": turn_id}},
+        )
+        await connection.emit(
+            "turn/completed",
+            {
+                "threadId": "owner-thread",
+                "turn": {"id": turn_id, "status": "completed"},
+            },
+        )
+        owner._realtime_turn_terminal("owner-thread", turn_id)  # noqa: SLF001
+
+    assert [await anext(events), await anext(events)] == [
+        ActivityEvent("turn", "completed", "owner-thread", "turn-1", None),
+        ActivityEvent("turn", "completed", "owner-thread", "turn-2", None),
+    ]
     await owner.close()
 
 
@@ -2325,6 +2556,7 @@ async def test_owner_close_does_not_close_voice_during_replacement_start(
 
 
 class ReofferVoice:
+    thread_id = "thr_test"
     active_turn_id: str | None = None
 
     def __init__(self, answer: str) -> None:
@@ -2345,6 +2577,9 @@ class ReofferVoice:
 
     def notifications(self) -> AsyncIterator[RealtimeEvent]:
         return self.stream
+
+    def owns_active_turn(self, thread_id: str, turn_id: str) -> bool:
+        return self.thread_id == thread_id and self.active_turn_id == turn_id
 
     async def close(self) -> None:
         self.close_calls += 1
@@ -2596,6 +2831,8 @@ class OwnerConnection:
             return {}
         if method == "thread/realtime/stop":
             return {}
+        if method == "turn/interrupt":
+            return {}
         message = f"unexpected owner request: {method}"
         raise AssertionError(message)
 
@@ -2650,6 +2887,7 @@ class OwnerDiscovery:
 
 
 class OwnerVoice:
+    thread_id = "thr_test"
     active_turn_id: str | None = None
 
     def __init__(self, event_log: list[str]) -> None:
@@ -2740,6 +2978,10 @@ def make_voice_contract() -> CodexProtocolContract:
                 frozenset(
                     {
                         "includeStartupContext",
+                        "clientManagedHandoffs",
+                        "codexResponseHandoffMode",
+                        "codexResponsesAsItems",
+                        "delegationAckFiller",
                         "outputModality",
                         "prompt",
                         "threadId",
@@ -2747,6 +2989,11 @@ def make_voice_contract() -> CodexProtocolContract:
                         "version",
                     }
                 ),
+            ),
+            SemanticMethod.TURN_INTERRUPT: ClientMethodContract(
+                "turn/interrupt",
+                ParamsKind.OBJECT,
+                frozenset({"threadId", "turnId"}),
             ),
         },
         server_requests={},
@@ -4918,7 +5165,7 @@ async def test_turn_cancel_routes_only_through_conversation_owner_wrapper() -> N
 
 
 @pytest.mark.asyncio
-async def test_user_done_invalidates_speech_before_agent_handoff_once() -> None:
+async def test_user_done_invalidates_speech_without_client_managed_handoff() -> None:
     events: list[object] = []
 
     class Session(FakeSession):
@@ -4957,14 +5204,13 @@ async def test_user_done_invalidates_speech_before_agent_handoff_once() -> None:
         "speech.invalidate",
         ("speech", "user", "", True),
         "speech.reset",
-        ("handoff", "done only"),
     ]
     assert speech.invalidations == ["user_transcript"]
     assert connection._generation == 1  # noqa: SLF001
 
 
 @pytest.mark.asyncio
-async def test_duplicate_user_done_reuses_the_claimed_utterance_identity() -> None:
+async def test_duplicate_user_done_is_presented_once_without_agent_resubmission() -> None:
     class Session(FakeSession):
         def __init__(self) -> None:
             super().__init__()
@@ -4999,15 +5245,11 @@ async def test_duplicate_user_done_reuses_the_claimed_utterance_identity() -> No
     )
     await connection._enqueue_transcript(final)  # noqa: SLF001
 
-    assert session.user_finals == [
-        ("同じ依頼", 1),
-        ("次の依頼", 2),
-        ("同じ依頼", 3),
-    ]
+    assert session.user_finals == []
 
 
 @pytest.mark.asyncio
-async def test_blocked_handoff_does_not_block_later_realtime_transcript() -> None:
+async def test_user_final_does_not_wait_for_obsolete_client_handoff() -> None:
     class Session(FakeSession):
         def __init__(self) -> None:
             super().__init__()
@@ -5036,19 +5278,18 @@ async def test_blocked_handoff_does_not_block_later_realtime_transcript() -> Non
     consumer = asyncio.create_task(connection._consume_notifications())  # noqa: SLF001
 
     await session.emit(TranscriptEvent("done", "thr_test", "user", "first"))
-    await asyncio.wait_for(session.handoff_started.wait(), timeout=1)
     await session.emit(TranscriptEvent("delta", "thr_test", "user", "next"))
     await asyncio.sleep(0.01)
 
     assert connection._transcripts == {"user": "next"}  # noqa: SLF001
 
-    session.handoff_release.set()
+    assert not session.handoff_started.is_set()
     await session.close()
     await asyncio.wait_for(consumer, timeout=1)
 
 
 @pytest.mark.asyncio
-async def test_blocked_handoff_preserves_outbound_transcript_order() -> None:
+async def test_automatic_delegation_preserves_outbound_user_transcript_order() -> None:
     class Session(FakeSession):
         def __init__(self) -> None:
             super().__init__()
@@ -5078,7 +5319,6 @@ async def test_blocked_handoff_preserves_outbound_transcript_order() -> None:
     consumer = asyncio.create_task(connection._consume_notifications())  # noqa: SLF001
 
     await session.emit(TranscriptEvent("done", "thr_test", "user", "first"))
-    await asyncio.wait_for(session.handoff_started.wait(), timeout=1)
     await session.emit(TranscriptEvent("delta", "thr_test", "user", "second"))
     for _ in range(10):
         if len([message for message in websocket.messages if message["type"] == "transcript"]) == 2:
@@ -5091,7 +5331,7 @@ async def test_blocked_handoff_preserves_outbound_transcript_order() -> None:
         {"type": "transcript", "role": "user", "text": "second", "done": False},
     ]
 
-    session.handoff_release.set()
+    assert not session.handoff_started.is_set()
     await session.close()
     await asyncio.wait_for(consumer, timeout=1)
 
@@ -5157,6 +5397,198 @@ async def test_pending_transcript_work_is_bounded() -> None:
         )
 
     assert connection._transcript_queue.qsize() == web_app._MAX_PENDING_TRANSCRIPTS  # noqa: SLF001
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_pending_assistant_transcript_work_is_bounded() -> None:
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", BlockingJsonWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+
+    for index in range(web_app._MAX_PENDING_TRANSCRIPTS):  # noqa: SLF001
+        connection._enqueue_transcript(  # noqa: SLF001
+            TranscriptEvent("delta", "thr_test", "assistant", str(index)),
+        )
+    with pytest.raises(RuntimeError, match="transcript queue limit"):
+        connection._enqueue_transcript(  # noqa: SLF001
+            TranscriptEvent("delta", "thr_test", "assistant", "overflow"),
+        )
+
+    assistant_queue = connection._assistant_transcript_queue  # noqa: SLF001
+    assert assistant_queue.qsize() == web_app._MAX_PENDING_TRANSCRIPTS  # noqa: SLF001
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_assistant_transcript_text_is_bounded_by_utf8_bytes() -> None:
+    speech = RecordingSpeechComposition()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    oversized = "a" * (web_app._MAX_ASSISTANT_TRANSCRIPT_BYTES + 1)  # noqa: SLF001
+
+    with pytest.raises(RuntimeError, match="transcript text limit"):
+        connection._enqueue_transcript(  # noqa: SLF001
+            TranscriptEvent("done", "thr_test", "assistant", oversized),
+        )
+
+    assert speech.transcripts == []
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_assistant_transcript_part_count_is_bounded() -> None:
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+
+    for _ in range(web_app._MAX_ASSISTANT_TRANSCRIPT_PARTS):  # noqa: SLF001
+        await connection._enqueue_transcript(  # noqa: SLF001
+            TranscriptEvent("delta", "thr_test", "assistant", "a"),
+        )
+    with pytest.raises(RuntimeError, match="transcript part limit"):
+        connection._enqueue_transcript(  # noqa: SLF001
+            TranscriptEvent("delta", "thr_test", "assistant", "overflow"),
+        )
+
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_speech_segment_overflow_closes_voice_without_irodori_work() -> None:
+    session = GenerationSession()
+    synthesizer = FakeSynthesizer()
+    speech = SpeechQueue(synthesizer, deliver=lambda *_args: None, max_chars=80)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", synthesizer),
+    )
+    connection._session = cast("RealtimeSession", session)  # noqa: SLF001
+    connection._speech = speech  # noqa: SLF001
+
+    completion = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent(
+            "done",
+            "thr_test",
+            "assistant",
+            "一。" * (speech_queue._MAX_PENDING_SPEECH_ITEMS + 1),  # noqa: SLF001
+        ),
+        session=cast("RealtimeSession", session),
+        expected_generation=1,
+    )
+    with pytest.raises(RuntimeError, match="speech queue limit"):
+        await completion
+    await asyncio.gather(*tuple(connection._effect_tasks), return_exceptions=True)  # noqa: SLF001
+
+    assert not session.voice_active
+    assert connection._voice_reconnect_required  # noqa: SLF001
+    assert synthesizer.synthesized_texts == []
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_user_barge_in_discards_assistant_transcripts_waiting_to_send() -> None:
+    websocket = CapturingWebSocket()
+    speech = RecordingSpeechComposition()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    await connection._send_lock.acquire()  # noqa: SLF001
+
+    old_first = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "old-1"),
+    )
+    await asyncio.sleep(0)
+    old_second = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "old-2"),
+    )
+    user = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "user", "割り込み"),
+    )
+
+    connection._send_lock.release()  # noqa: SLF001
+    await asyncio.gather(old_first, old_second, user, return_exceptions=True)
+    await asyncio.gather(*tuple(connection._effect_tasks), return_exceptions=True)  # noqa: SLF001
+
+    assert old_second.cancelled()
+    assert [message for message in websocket.messages if message.get("role") == "assistant"] == []
+    assert all(role != "assistant" for role, _text, _done in speech.transcripts)
+    await connection.close()
+
+
+@pytest.mark.asyncio
+async def test_new_ack_waits_for_user_speech_invalidation_before_irodori() -> None:
+    class BlockingSuppressingSpeech(RecordingSpeechComposition):
+        def __init__(self) -> None:
+            super().__init__()
+            self.suppressed = False
+            self.invalidation_started = asyncio.Event()
+            self.invalidation_release = asyncio.Event()
+
+        async def invalidate(self, *, reason: str) -> None:
+            assert reason == "user_transcript"
+            self.suppressed = True
+            self.invalidation_started.set()
+            await self.invalidation_release.wait()
+
+        async def on_transcript(self, *, role: str, delta: str, done: bool) -> None:
+            if role == "user" and done:
+                self.suppressed = False
+                return
+            if role == "assistant" and not self.suppressed:
+                await super().on_transcript(role=role, delta=delta, done=done)
+
+    websocket = CapturingWebSocket()
+    speech = BlockingSuppressingSpeech()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+
+    user = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "user", "調べて"),
+    )
+    await speech.invalidation_started.wait()
+    acknowledgement = connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", "確認するね。"),
+    )
+    for _ in range(10):
+        if any(message.get("role") == "assistant" for message in websocket.messages):
+            break
+        await asyncio.sleep(0)
+
+    assert any(message.get("text") == "確認するね。" for message in websocket.messages)
+    assert speech.transcripts == []
+
+    speech.invalidation_release.set()
+    await asyncio.gather(user, acknowledgement)
+    assert speech.transcripts == [("assistant", "確認するね。", True)]
     await connection.close()
 
 
@@ -5275,7 +5707,7 @@ async def test_user_final_claim_survives_speech_invalidation_failure() -> None:
             timeout=0.1,
         )
 
-    assert session.handoffs == ["must hand off once"]
+    assert session.handoffs == []
 
 
 @pytest.mark.asyncio
@@ -5318,7 +5750,7 @@ async def test_user_final_claim_survives_transcript_send_failure() -> None:
             TranscriptEvent("done", "thr_test", "user", "must hand off once"),
         )
 
-    assert session.handoffs == ["must hand off once"]
+    assert session.handoffs == []
 
 
 @pytest.mark.asyncio
@@ -5586,6 +6018,52 @@ async def test_auto_mode_removes_valid_plan_and_passes_caption_to_speech(
 
 
 @pytest.mark.asyncio
+async def test_streamed_realtime_plan_never_leaks_control_line_to_display_or_speech() -> None:
+    websocket = CapturingWebSocket()
+    speech = CaptionRecordingSpeech()
+    capabilities = make_dynamic_capabilities(max_chars=300)
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(irodori=IrodoriSettings(caption_mode="auto")),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    await connection._cache_capabilities(capabilities)  # noqa: SLF001
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
+
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", control_line[:24]),
+    )
+    assert websocket.messages == []
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", f"{control_line[24:]}\n本"),
+    )
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("delta", "thr_test", "assistant", "文です。"),
+    )
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", f"{control_line}\n本文です。"),
+    )
+
+    assert [
+        message["text"] for message in websocket.messages if message["type"] == "transcript"
+    ] == [
+        "本",
+        "本文です。",
+        "本文です。",
+    ]
+    assert speech.transcripts == [
+        ("assistant", "本", False, "calm"),
+        ("assistant", "文です。", False, None),
+        ("assistant", "", True, None),
+    ]
+    assert control_line not in repr(websocket.messages)
+    assert control_line not in repr(speech.transcripts)
+
+
+@pytest.mark.asyncio
 async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_caption(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
@@ -5793,7 +6271,7 @@ def test_each_user_utterance_invalidates_old_speech_once() -> None:
         assert socket.receive_json()["text"] == "次"
 
 
-def test_streamed_voice_assistant_response_is_replaced_by_agent_final() -> None:
+def test_streamed_realtime_assistant_response_is_the_only_speech_source() -> None:
     session = EffectsSession()
     synthesizer = FakeSynthesizer()
     app = create_app(
@@ -5821,25 +6299,25 @@ def test_streamed_voice_assistant_response_is_replaced_by_agent_final() -> None:
             session.emit,
             TranscriptEvent("done", "thr_test", "assistant", "確認します。"),
         )
-        effects = session.effects
-        assert effects is not None
-        portal.call(effects.on_turn_terminal_claimed)
-        portal.call(
-            effects.on_turn_finished,
-            TurnResult(final_answer="Agent の確定回答。", error_code=None),
-        )
+        delta = socket.receive_json()
         completed = socket.receive_json()
 
+        assert delta == {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "確",
+            "done": False,
+        }
         assert completed == {
             "type": "transcript",
             "role": "assistant",
-            "text": "Agent の確定回答。",
+            "text": "確認します。",
             "done": True,
         }
 
         portal.call(asyncio.sleep, 0.1)
 
-    assert synthesizer.synthesized_texts == ["Agent の確定回答。"]
+    assert synthesizer.synthesized_texts == ["確認します。"]
 
 
 def test_agent_final_uses_existing_speech_queue() -> None:
@@ -5931,8 +6409,9 @@ def test_user_final_transcript_replaces_incorrect_interim_text() -> None:
 
 
 @pytest.mark.asyncio
-async def test_voice_assistant_transcript_is_not_shown_as_agent_answer() -> None:
+async def test_voice_assistant_transcript_is_displayed_and_streamed_to_speech_once() -> None:
     websocket = CapturingWebSocket()
+    speech = RecordingSpeechComposition()
     connection = web_app._BrowserConnection(  # noqa: SLF001
         cast("WebSocket", websocket),
         settings=MocoSettings(),
@@ -5940,6 +6419,7 @@ async def test_voice_assistant_transcript_is_not_shown_as_agent_answer() -> None
         session_factory=lambda: cast("RealtimeSession", FakeSession()),
         synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
     )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
 
     await connection._enqueue_transcript(  # noqa: SLF001
         TranscriptEvent("delta", "thr_test", "assistant", "中断される応答"),
@@ -5955,11 +6435,61 @@ async def test_voice_assistant_transcript_is_not_shown_as_agent_answer() -> None
     assert transcripts == [
         {
             "type": "transcript",
+            "role": "assistant",
+            "text": "中断される応答",
+            "done": False,
+        },
+        {
+            "type": "transcript",
             "role": "user",
             "text": "割り込み",
             "done": True,
-        }
+        },
+        {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "新しい応答です。",
+            "done": True,
+        },
     ]
+    assert speech.transcripts == [
+        ("assistant", "中断される応答", False),
+        ("user", "", True),
+        ("assistant", "新しい応答です。", True),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_user_final_is_not_resubmitted_to_a_client_managed_agent_turn() -> None:
+    class Session(FakeSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.handoffs: list[str] = []
+
+        async def consume_user_final(
+            self,
+            text: str,
+            *,
+            utterance_id: int | None = None,
+        ) -> None:
+            del utterance_id
+            self.handoffs.append(text)
+
+    session = Session()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", CapturingWebSocket()),
+        settings=MocoSettings(),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", session),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._session = cast("RealtimeSession", session)  # noqa: SLF001
+
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "user", "同じ依頼を二重実行しない"),
+    )
+
+    assert session.handoffs == []
 
 
 @pytest.mark.asyncio
@@ -6030,7 +6560,7 @@ async def test_stale_voice_generation_drops_outbound_event_waiting_for_send_lock
 
 
 @pytest.mark.asyncio
-async def test_user_final_claim_begins_before_blocked_outbound_send() -> None:
+async def test_user_final_is_never_resubmitted_while_outbound_send_is_blocked() -> None:
     websocket = CapturingWebSocket()
     session = GenerationSession()
     connection = web_app._BrowserConnection(  # noqa: SLF001
@@ -6056,8 +6586,8 @@ async def test_user_final_claim_begins_before_blocked_outbound_send() -> None:
     await consumer
     await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
 
-    assert claim_began_before_reoffer
-    assert session.user_finals == ["current final"]
+    assert not claim_began_before_reoffer
+    assert session.user_finals == []
     assert websocket.messages == []
 
 
@@ -6095,7 +6625,7 @@ async def test_stale_generation_after_blocked_event_drops_queued_user_final() ->
 
 
 @pytest.mark.asyncio
-async def test_voice_assistant_is_dropped_before_outbound_send_or_speech() -> None:
+async def test_voice_assistant_reaches_outbound_send_and_speech() -> None:
     websocket = BlockingJsonWebSocket()
     session = GenerationSession()
     speech = RecordingSpeech()
@@ -6116,9 +6646,18 @@ async def test_voice_assistant_is_dropped_before_outbound_send_or_speech() -> No
     await session.end_generation(1)
     await consumer
 
-    assert not websocket.send_started.is_set()
-    assert websocket.messages == []
-    assert speech.transcripts == []
+    assert websocket.send_started.is_set()
+    websocket.send_release.set()
+    await asyncio.gather(*tuple(connection._effect_tasks))  # noqa: SLF001
+    assert websocket.messages == [
+        {
+            "type": "transcript",
+            "role": "assistant",
+            "text": "current transcript",
+            "done": True,
+        }
+    ]
+    assert speech.transcripts == [("assistant", "current transcript", True)]
 
 
 @pytest.mark.asyncio
@@ -6262,7 +6801,7 @@ async def test_successful_voice_replacement_clears_prior_generation_transcript_b
             for message in websocket.messages[start_index:]
             if message["type"] == "transcript"
         ]
-        expected_texts = [new_delta, new_final] if role == "user" else []
+        expected_texts = [new_delta, new_final]
         assert [message["text"] for message in transcripts] == expected_texts
         assert old_delta not in repr(transcripts)
         assert owner.voice_generation == 2

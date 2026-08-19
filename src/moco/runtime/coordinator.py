@@ -128,7 +128,7 @@ class _AgentSession(Protocol):
 class InteractionCoordinator:
     def __init__(
         self,
-        session: _AgentSession,
+        session: _AgentSession | None,
         *,
         steer_available: bool,
         effects: InteractionEffects,
@@ -146,6 +146,8 @@ class InteractionCoordinator:
         self._turn_task: asyncio.Task[None] | None = None
         self._steer_task: asyncio.Task[HandoffDisposition] | None = None
         self._cancel_claimed = False
+        self._realtime_turn_id: str | None = None
+        self._realtime_turn_cancelled = False
         self._snapshot = InteractionSnapshot(
             connection=ConnectionState.STARTING,
             voice=VoiceState.IDLE,
@@ -178,12 +180,14 @@ class InteractionCoordinator:
         if self._snapshot.voice is not VoiceState.IDLE:
             self._replace_snapshot(voice=VoiceState.IDLE)
 
-    def consume_user_final(  # noqa: PLR0911
+    def consume_user_final(  # noqa: C901, PLR0911
         self,
         text: str,
         *,
         utterance_id: int | None = None,
     ) -> Coroutine[object, object, HandoffDisposition]:
+        if self._session is None:
+            return _resolved_handoff(HandoffDisposition.IGNORED)
         voice = self._snapshot.voice
         stopped_final = voice is VoiceState.IDLE and self._listen_generation not in {
             0,
@@ -241,11 +245,36 @@ class InteractionCoordinator:
     def review_count_changed(self, count: int) -> None:
         if count < 0:
             raise ValueError
-        if self._turn_task is None:
+        if self._turn_task is None and self._realtime_turn_id is None:
             return
         self._replace_snapshot(
             task=TaskState.WAITING_REVIEW if count else TaskState.RUNNING,
         )
+
+    def realtime_turn_started(self, turn_id: str) -> None:
+        if not turn_id:
+            raise ValueError
+        if self._realtime_turn_id == turn_id:
+            return
+        if self._realtime_turn_id is not None or self._turn_task is not None:
+            self._emit(self._effects.on_submission_error, "interaction_busy")
+            return
+        self._realtime_turn_id = turn_id
+        self._realtime_turn_cancelled = False
+        self._replace_snapshot(task=TaskState.RUNNING)
+
+    def realtime_turn_cancel_requested(self, turn_id: str) -> None:
+        if turn_id == self._realtime_turn_id:
+            self._realtime_turn_cancelled = True
+            self._emit(self._effects.on_turn_terminal_claimed)
+
+    def realtime_turn_completed(self, turn_id: str) -> None:
+        if turn_id != self._realtime_turn_id:
+            return
+        terminal = TaskState.INTERRUPTED if self._realtime_turn_cancelled else TaskState.COMPLETED
+        self._realtime_turn_id = None
+        self._realtime_turn_cancelled = False
+        self._replace_snapshot(task=terminal)
 
     async def cancel_turn(self) -> bool:
         turn_task = self._turn_task
@@ -345,6 +374,15 @@ class InteractionCoordinator:
         if steer_task is not None:
             steer_task.cancel()
         turn_task = self._turn_task
+        if self._realtime_turn_id is not None:
+            self._realtime_turn_id = None
+            self._realtime_turn_cancelled = False
+            self._replace_snapshot(
+                connection=ConnectionState.DISCONNECTED,
+                voice=VoiceState.IDLE,
+                task=TaskState.FAILED,
+            )
+            return
         if turn_task is None:
             self._replace_snapshot(
                 connection=ConnectionState.DISCONNECTED,
@@ -393,8 +431,9 @@ class InteractionCoordinator:
             self._emit(self._effects.on_snapshot_changed, snapshot)
 
     async def _run_turn(self, generation: int, text: str) -> None:
+        session = cast("_AgentSession", self._session)
         try:
-            final_answer = await self._session.start_turn(text)
+            final_answer = await session.start_turn(text)
         except CodexAgentError as error:
             if error.code not in {
                 AgentTurnErrorCode.FAILED,
@@ -421,8 +460,9 @@ class InteractionCoordinator:
     async def _run_steer(self, generation: int, text: str) -> HandoffDisposition:
         # A locally claimed turn can be RUNNING one loop tick before its remote turn/start arrives.
         await asyncio.sleep(0)
+        session = cast("_AgentSession", self._session)
         try:
-            await self._session.steer(text)
+            await session.steer(text)
         except CodexAgentError:
             if self._session_reusable():
                 effect_eligible = generation == self._turn_generation
@@ -596,7 +636,7 @@ class InteractionCoordinator:
 
     def _session_reusable(self) -> bool:
         # Re-read after async boundaries; the session can become terminal between checks.
-        return self._session.reusable
+        return self._session is not None and self._session.reusable
 
     def _replace_snapshot(
         self,

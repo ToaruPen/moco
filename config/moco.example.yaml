@@ -16,7 +16,7 @@ runtime:
   idle_timeout_seconds: 300
 
 codex:
-  # null resolves codex from PATH; macOS may then use the official app bundle resource.
+  # null prefers the official ChatGPT.app resource on macOS, then resolves from PATH.
   command: null
   # null uses moco's startup working directory on each host.
   working_directory: null
@@ -24,7 +24,7 @@ codex:
   prompt_file: null
 
 agent:
-  # Capability profile moco requests for Codex Agent turns. Default: read_only.
+  # Capability profile moco requests for delegated Codex turns. Default: read_only.
   #   read_only:       request Codex's read-only profile.
   #   workspace_write: request Codex's workspace-write profile.
   #   inherit_codex:   send no override and keep Codex's own effective settings.

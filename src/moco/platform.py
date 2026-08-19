@@ -102,16 +102,16 @@ def resolve_codex_command(
             raise CodexCommandError(message)
         return CodexCommand((executable, *configured[1:]))
 
-    discovered = which("codex")
-    if discovered is not None:
-        return CodexCommand((discovered,))
-
     if (
         platform_value == "darwin"
         and _DEFAULT_CODEX_BUNDLE.is_file()
         and os.access(_DEFAULT_CODEX_BUNDLE, os.X_OK)
     ):
         return CodexCommand((str(_DEFAULT_CODEX_BUNDLE),))
+
+    discovered = which("codex")
+    if discovered is not None:
+        return CodexCommand((discovered,))
     message = "Codex command is unavailable"
     raise CodexCommandError(message)
 

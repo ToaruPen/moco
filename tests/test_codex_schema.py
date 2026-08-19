@@ -64,10 +64,13 @@ def schema_variant(
     params_is_required: bool = True,
 ) -> dict[str, JsonValue]:
     if params_schema is None:
+        properties = dict(params_properties or {})
+        if params_title == "ConfigReadParams":
+            properties.setdefault("includeLayers", {"type": "boolean"})
         required_fields: list[JsonValue] = [*sorted(params_required)]
         params_schema = {
             "type": "object",
-            "properties": params_properties or {},
+            "properties": properties,
             "required": required_fields,
         }
         if params_title is not None:
@@ -325,6 +328,15 @@ def thread_realtime_start_variant(
         params_title="ThreadRealtimeStartParams",
         params_required={"outputModality", "threadId"},
         params_properties={
+            "clientManagedHandoffs": {"type": ["boolean", "null"]},
+            "codexResponseHandoffMode": {
+                "anyOf": [
+                    {"type": "string", "enum": ["thinking", "commentary", "bemTags"]},
+                    {"type": "null"},
+                ]
+            },
+            "codexResponsesAsItems": {"type": ["boolean", "null"]},
+            "delegationAckFiller": {"type": ["boolean", "null"]},
             "includeStartupContext": {"type": ["boolean", "null"]},
             "outputModality": {"type": "string", "enum": ["text", "audio"]},
             "prompt": {"type": ["string", "null"]},
@@ -517,6 +529,10 @@ def test_realtime_start_schema_selects_alias_for_the_v3_audio_webrtc_payload(
         ParamsKind.OBJECT,
         frozenset(
             {
+                "clientManagedHandoffs",
+                "codexResponseHandoffMode",
+                "codexResponsesAsItems",
+                "delegationAckFiller",
                 "includeStartupContext",
                 "outputModality",
                 "prompt",
@@ -940,7 +956,10 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
         schema_variant(
             "alias-b",
             params_title="ConfigReadParams",
-            params_properties={"cwd": {"type": ["string", "null"]}},
+            params_properties={
+                "cwd": {"type": ["string", "null"]},
+                "includeLayers": {"type": "boolean"},
+            },
         ),
         schema_variant(
             "alias-c",
@@ -974,7 +993,9 @@ def test_contract_selects_aliases_only_by_semantic_schema_signals(tmp_path: Path
     contract = load_generated_contract(tmp_path, version="fake 1")
 
     assert contract.require_method(SemanticMethod.ACCOUNT_READ).name == "alias-a"
-    assert contract.require_method(SemanticMethod.CONFIG_READ).semantic_fields == frozenset({"cwd"})
+    assert contract.require_method(SemanticMethod.CONFIG_READ).semantic_fields == frozenset(
+        {"cwd", "includeLayers"}
+    )
     assert contract.require_method(SemanticMethod.CONFIG_REQUIREMENTS_READ) == ClientMethodContract(
         "alias-c",
         ParamsKind.OMITTED,
@@ -3178,7 +3199,7 @@ def test_object_keywords_without_a_type_do_not_exclude_the_string_moco_sends(
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 
@@ -3212,7 +3233,7 @@ def test_declared_string_keeps_inapplicable_object_keywords_from_withdrawing_the
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 
@@ -3307,7 +3328,7 @@ def test_one_of_sibling_with_unique_required_members_keeps_its_definite_rejectio
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 
@@ -3439,7 +3460,7 @@ def test_readable_type_declarations_keep_their_composition_verdict(
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 
@@ -3468,7 +3489,7 @@ def test_any_of_stays_available_when_one_branch_definitely_admits_the_dynamic_va
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 
@@ -3498,7 +3519,7 @@ def test_annotation_only_fields_do_not_constrain_the_emitted_request(tmp_path: P
     assert contract.require_method(SemanticMethod.CONFIG_READ) == ClientMethodContract(
         "config-alias",
         ParamsKind.OBJECT,
-        frozenset({"cwd"}),
+        frozenset({"cwd", "includeLayers"}),
     )
 
 

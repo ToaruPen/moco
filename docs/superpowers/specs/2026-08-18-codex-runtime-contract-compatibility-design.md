@@ -6,7 +6,7 @@ moco の launchd サービスは、シェルの `PATH` にある Codex ではな
 Codex を自動検出する場合がある。2026-08-18 時点で、この PC には次の二つの契約が存在する。
 
 - PATH 版 `codex-cli 0.144.1` は Realtime protocol `v1` と `v2` だけを受理する。
-- ChatGPT.app 同梱版 `codex-cli 0.148.0-alpha.9` は `v3` を受理する一方、legacy approval
+- ChatGPT.app 同梱版 `codex-cli 0.148.0-alpha.15` は `v3` を受理する一方、legacy approval
   response に `approved_mcp_policy_amendment` を追加している。
 
 現行 moco は Realtime start payload の `version: "v3"` を生成 schema で検証せず、承認応答の
@@ -26,10 +26,10 @@ error となり、同梱版では接続開始前の approval handler 登録で�
 
 ## 非目的
 
-- Realtime v2 への自動 fallback は追加しない。moco の会話と Agent handoff は v3 を製品契約
+- Realtime v2 への自動 fallback は追加しない。moco の会話とFrameless delegationはv3を製品契約
   としており、v2 の機能同等性は確認されていない。
-- Codex executable の設定を特定パスへ固定しない。各プロセスが既存の解決規則で選んだ
-  executable を、その executable 自身の schema に対して評価する。
+- Codex executable の設定を特定versionへ固定しない。macOSの未設定時は公式ChatGPT.app
+  bundleをPATHより優先し、選んだexecutable自身のschemaに対して評価する。
 - 新しい approval decision、永続 MCP policy 承認、設定項目、UI は追加しない。
 - schema 全体の汎用 negotiation layer や、RPC failure 後の retry mechanism は追加しない。
 
@@ -42,6 +42,10 @@ schema probe は、moco が production で送る次の完全な invocation witne
 する。
 
 - dynamic `threadId`
+- `clientManagedHandoffs: false`
+- `delegationAckFiller: true`
+- `codexResponsesAsItems: false`
+- `codexResponseHandoffMode: "bemTags"`
 - `outputModality: "audio"`
 - `includeStartupContext: false`
 - dynamic prompt
@@ -117,7 +121,7 @@ TDD で次の回帰を先に固定する。
 ### 実環境
 
 - PATH 版 `0.144.1` は v3 非互換として schema/doctor contract check が失敗する。
-- ChatGPT.app 同梱版 `0.148.0-alpha.9` は必須 approval family と Realtime v3 contract を通る。
+- ChatGPT.app 同梱版 `0.148.0-alpha.15` は必須 approval family と Realtime v3 contract を通る。
 - 全 unit、integration、static checks を通す。
 - PR merge 後に launchd を再インストールまたは再起動し、browser WebRTC の会話開始まで確認
   する。

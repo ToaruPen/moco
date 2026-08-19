@@ -123,6 +123,13 @@ def test_readme_documents_host_specific_prompt_paths_and_creation_commands() -> 
         'Copy-Item config\\moco.prompt.example.md "$env:APPDATA\\moco\\prompt.md"',
     ]:
         assert command in prompt
+    for override_boundary in [
+        "experimental_realtime_ws_backend_prompt",
+        "codex_realtime: prompt_overridden",
+        "overrideを削除するか空にして",
+        "値そのものは画面、ログ、telemetryへ出力しません",
+    ]:
+        assert override_boundary in prompt
 
 
 def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
@@ -142,20 +149,22 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
     ]:
         assert boundary in stage_b
 
-    interaction = readme.split("### Agent 作業、取消、再接続", maxsplit=1)[1].split(
+    interaction = readme.split("### Codex作業、取消、再接続", maxsplit=1)[1].split(
         "### GPTの応答スタイルを変更する", maxsplit=1
     )[0]
+    normalized_interaction = " ".join(interaction.split())
     for behavior in [
-        "中間音声は発しません",
-        "final answer",
-        "新しい発話",
-        "取消",
-        "interrupt",
-        "自動再送",
-        "outcome unknown",
+        (
+            "Realtime v3が一つの `delegation.created`を作り、"
+            "Codexのcommentaryとfinalを同じ会話へ自動返送します。"
+        ),
+        "acknowledgementやspeakable progressはfinalを待たずIrodoriへ流れます。",
+        "同じRealtime Threadのactive turnへ`turn/interrupt`を一度だけ送ります。",
+        "旧依頼を新しい接続へ 自動再送しません。",
     ]:
-        assert behavior in interaction
+        assert behavior in normalized_interaction
     assert "処理しています。" not in interaction
+    assert "中間音声は発しません" not in interaction
     assert "Realtime 側の自然な割り込み" not in readme
 
     privacy = readme.split("## プライバシーと観測", maxsplit=1)[1].split("## 開発", maxsplit=1)[0]
