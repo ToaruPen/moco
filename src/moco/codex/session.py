@@ -628,7 +628,7 @@ def load_realtime_prompt(settings: MocoSettings) -> str:
         msg = "realtime prompt file exceeds 64 KiB"
         raise CodexPromptError(msg)
     try:
-        prompt = payload.decode("utf-8-sig").strip()
+        prompt = payload.decode("utf-8-sig").replace("\r\n", "\n").replace("\r", "\n").strip()
     except UnicodeDecodeError as error:
         msg = "realtime prompt file must be UTF-8"
         raise CodexPromptError(msg) from error

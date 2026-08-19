@@ -860,6 +860,20 @@ async def test_reads_utf8_bom_without_forwarding_it(tmp_path: Path) -> None:
     assert await _started_prompt(FakeRpc(), settings) == "BOM persona"
 
 
+async def test_normalizes_prompt_line_endings_before_wire(tmp_path: Path) -> None:
+    prompt_file = tmp_path / "prompt.md"
+    prompt_file.write_bytes(b"First\r\n\r\nSecond\rThird\n")
+    settings = MocoSettings(
+        codex=CodexSettings(
+            command=(str(tmp_path / "unused-codex"),),
+            working_directory=tmp_path,
+            prompt_file=prompt_file,
+        ),
+    )
+
+    assert await _started_prompt(FakeRpc(), settings) == "First\n\nSecond\nThird"
+
+
 @pytest.mark.parametrize(
     ("payload", "message"),
     [
