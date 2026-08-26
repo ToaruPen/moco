@@ -233,6 +233,43 @@ def test_stream_plain_text_is_available_without_waiting_for_done() -> None:
     )
 
 
+def test_disabled_stream_preserves_split_plan_shaped_text_and_resets() -> None:
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
+    first = control_line[:24]
+    remainder = f"{control_line[24:]}\n本文です。"
+    answer = f"{first}{remainder}"
+    stream = SpeechPlanStream(max_chars=300, parse_plans=False)
+
+    assert stream.push(first) == SpeechPlanUpdate(
+        text=first,
+        delta=first,
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push(remainder) == SpeechPlanUpdate(
+        text=answer,
+        delta=remainder,
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push(answer, done=True) == SpeechPlanUpdate(
+        text=answer,
+        delta="",
+        done=True,
+        delivery_caption=None,
+        plan=None,
+    )
+    assert stream.push("次のターン") == SpeechPlanUpdate(
+        text="次のターン",
+        delta="次のターン",
+        done=False,
+        delivery_caption=None,
+        plan=None,
+    )
+
+
 def test_stream_invalid_plan_reports_once_and_keeps_body() -> None:
     stream = SpeechPlanStream(max_chars=300)
 

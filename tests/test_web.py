@@ -6064,6 +6064,36 @@ async def test_streamed_realtime_plan_never_leaks_control_line_to_display_or_spe
 
 
 @pytest.mark.asyncio
+async def test_off_mode_stream_preserves_leading_plan_shaped_json() -> None:
+    websocket = CapturingWebSocket()
+    speech = CaptionRecordingSpeech()
+    connection = web_app._BrowserConnection(  # noqa: SLF001
+        cast("WebSocket", websocket),
+        settings=MocoSettings(irodori=IrodoriSettings(caption_mode="off")),
+        global_hotkeys_active=True,
+        session_factory=lambda: cast("RealtimeSession", FakeSession()),
+        synthesizer_factory=lambda: cast("WebSynthesizer", FakeSynthesizer()),
+    )
+    connection._speech = cast("SpeechQueue", speech)  # noqa: SLF001
+    control_line = '{"type":"moco.speech_plan","version":1,"delivery_caption":"calm"}'
+    answer = f"{control_line}\n本文です。"
+
+    await connection._enqueue_transcript(  # noqa: SLF001
+        TranscriptEvent("done", "thr_test", "assistant", answer),
+    )
+
+    assert websocket.messages == [
+        {
+            "type": "transcript",
+            "role": "assistant",
+            "text": answer,
+            "done": True,
+        },
+    ]
+    assert speech.transcripts == [("assistant", answer, True, None)]
+
+
+@pytest.mark.asyncio
 async def test_auto_mode_invalid_plan_reports_once_and_speaks_body_without_caption(
     caplog: pytest.LogCaptureFixture,
 ) -> None:

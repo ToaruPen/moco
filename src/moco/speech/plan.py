@@ -44,11 +44,12 @@ class SpeechPlanUpdate:
 class SpeechPlanStream:
     """Remove an optional first-line speech plan without delaying plain speech."""
 
-    def __init__(self, *, max_chars: int) -> None:
+    def __init__(self, *, max_chars: int, parse_plans: bool = True) -> None:
         if type(max_chars) is not int or max_chars <= 0:
             message = "caption maximum must be a positive integer"
             raise ValueError(message)
         self._max_chars = max_chars
+        self._parse_plans = parse_plans
         self._raw = ""
         self._emitted = ""
         self._plan_decided = False
@@ -99,6 +100,8 @@ class SpeechPlanStream:
         self._initial_plan_reported = False
 
     def _decide(self, *, done: bool) -> SpeechPlanResult | None:
+        if not self._parse_plans:
+            return SpeechPlanResult.plain(self._raw) if self._raw or done else None
         lines = _PHYSICAL_LINE_BOUNDARY.split(self._raw)
         candidate_index = next(
             (index for index, line in enumerate(lines) if line.strip()),

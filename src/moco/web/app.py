@@ -2345,6 +2345,7 @@ class _BrowserConnection:
         if stream is None:
             stream = SpeechPlanStream(
                 max_chars=(self._delivery_caption_max_chars or _DEFAULT_DELIVERY_CAPTION_MAX_CHARS),
+                parse_plans=self._settings.irodori.caption_mode == "auto",
             )
             self._assistant_speech_plan_stream = stream
         update = stream.push(event.text, done=event.kind == "done")
