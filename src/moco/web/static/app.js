@@ -12,6 +12,7 @@ import {
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
 const CAPABILITY_STORAGE_KEY = "moco.capability";
+const CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
 
@@ -864,19 +865,22 @@ function isLoopbackHostname(hostname) {
 export function loadCapability({ location, history, persistentStorage, sessionStorage }) {
   const capabilityFromUrl = location.hash.slice(1);
   if (capabilityFromUrl) {
-    persistentStorage.setItem(CAPABILITY_STORAGE_KEY, capabilityFromUrl);
     history.replaceState(null, "", location.pathname);
-    return capabilityFromUrl;
+    if (CAPABILITY_PATTERN.test(capabilityFromUrl)) {
+      persistentStorage.setItem(CAPABILITY_STORAGE_KEY, capabilityFromUrl);
+      return capabilityFromUrl;
+    }
   }
   const persisted = persistentStorage.getItem(CAPABILITY_STORAGE_KEY);
-  if (persisted) {
+  if (persisted && CAPABILITY_PATTERN.test(persisted)) {
     return persisted;
   }
   const legacy = sessionStorage.getItem(CAPABILITY_STORAGE_KEY) ?? "";
-  if (legacy) {
+  if (CAPABILITY_PATTERN.test(legacy)) {
     persistentStorage.setItem(CAPABILITY_STORAGE_KEY, legacy);
+    return legacy;
   }
-  return legacy;
+  return "";
 }
 
 export class PairingPanel {

@@ -2624,6 +2624,7 @@ describe("browser connection timeouts", () => {
 
   it("persists a fragment capability for reloads and new tabs", () => {
     assert.equal(typeof appModule.loadCapability, "function");
+    const capability = "A".repeat(43);
     const persistentValues = new Map();
     const persistentStorage = {
       getItem: (key) => persistentValues.get(key) ?? null,
@@ -2639,11 +2640,11 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "#test-capability", pathname: "/" },
+        location: { hash: `#${capability}`, pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
-      "test-capability",
+      capability,
     );
     assert.equal(
       appModule.loadCapability({
@@ -2652,17 +2653,19 @@ describe("browser connection timeouts", () => {
         persistentStorage,
         sessionStorage,
       }),
-      "test-capability",
+      capability,
     );
   });
 
   it("migrates a legacy tab capability and lets a new fragment replace it", () => {
+    const legacyCapability = "B".repeat(43);
+    const freshCapability = "C".repeat(43);
     const values = new Map();
     const persistentStorage = {
       getItem: (key) => values.get(key) ?? null,
       setItem: (key, value) => values.set(key, value),
     };
-    const sessionStorage = { getItem: () => "legacy-capability" };
+    const sessionStorage = { getItem: () => legacyCapability };
     const history = { replaceState: () => {} };
 
     assert.equal(
@@ -2672,19 +2675,41 @@ describe("browser connection timeouts", () => {
         persistentStorage,
         sessionStorage,
       }),
-      "legacy-capability",
+      legacyCapability,
     );
-    assert.equal(values.get("moco.capability"), "legacy-capability");
+    assert.equal(values.get("moco.capability"), legacyCapability);
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "#fresh-capability", pathname: "/" },
+        location: { hash: `#${freshCapability}`, pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
-      "fresh-capability",
+      freshCapability,
     );
-    assert.equal(values.get("moco.capability"), "fresh-capability");
+    assert.equal(values.get("moco.capability"), freshCapability);
+  });
+
+  it("ignores an invalid fragment instead of replacing a persisted capability", () => {
+    const persistedCapability = "D".repeat(43);
+    const values = new Map([["moco.capability", persistedCapability]]);
+    const persistentStorage = {
+      getItem: (key) => values.get(key) ?? null,
+      setItem: (key, value) => values.set(key, value),
+    };
+    const replaced = [];
+
+    assert.equal(
+      appModule.loadCapability({
+        history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+        location: { hash: "#invalid", pathname: "/" },
+        persistentStorage,
+        sessionStorage: { getItem: () => null },
+      }),
+      persistedCapability,
+    );
+    assert.equal(values.get("moco.capability"), persistedCapability);
+    assert.deepEqual(replaced, ["/"]);
   });
 
   it("rejects ICE gathering that never completes", async () => {
