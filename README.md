@@ -92,9 +92,8 @@ uv run moco run
 `%APPDATA%\moco\moco.yaml` に作成されます。Windowsでは設定の`codex.command`が実行境界になるため、
 新規directoryとfileをcurrent user、SYSTEM、Administratorsだけのprotected DACLで作成します。既存pathの
 owner、DACL、reparse pointが安全でなければ、自動修復せず設定の作成・読み込みを拒否します。
-別のターミナルで次を実行すると、実行中
-プロセスだけが知る capability を使って操作ページが開きます。capability はターミナルへ
-表示されません。
+別のターミナルで次を実行すると、owner-private に保存した capability を使って操作ページが
+開きます。capability はターミナルへ表示されません。
 
 ```bash
 uv run moco open
@@ -246,10 +245,17 @@ Tunnel は独立したサービスです。片方が停止しても別経路へ�
 そのまま報告します。
 
 設定後に moco を再起動し、Mac で `uv run moco open` を実行します。loopback の操作画面に
-「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は現在プロセスの
-media capability を URL fragment に含み、Cloudflare の request path には載せません。同じ値の
-唯一のファイル保存先はowner-privateな `runtime.json` で、ローカルCLIが操作画面を開くために
-process lifetime中だけ使用し、終了時に削除します。daemon を再起動すると古い QR は無効になります。
+「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は現在の
+media capability を URL fragment に含み、Cloudflare の request path には載せません。同じ値は
+owner-private な `operator-capability.json` に永続化し、daemon やOSの再起動後も再利用します。
+ブラウザは同一 origin の `localStorage` に保存し、既存タブの `sessionStorage` から一度だけ
+自動移行するため、同じブラウザプロファイルなら新しいタブでもQRを読み直す必要はありません。
+`runtime.json` とReviewerのcontrol secretは引き続きprocess lifetime中だけ使用し、終了時に
+削除します。ブラウザ保存を消した場合、別プロファイルを使う場合、または明示的に失効した場合だけ
+新しいQRを登録してください。
+
+接続キーを失効する場合はmocoを停止して `uv run moco operator rotate` を実行し、mocoを再起動して
+新しいQRを登録します。daemon稼働中のrotateは拒否され、現在のキーを変更しません。
 
 スマートフォンでは「接続」を押してマイクを許可し、「入力開始」と「入力停止」で操作します。
 入力開始は押し続ける PTT ではありません。指を離しても入力は続き、入力停止はマイクだけを
@@ -383,11 +389,11 @@ MCP arguments、approval payload、reasoning、アカウント識別子はファ
 category／phase／label と時刻だけです。コンソールと任意の OTLP 出力は状態、所要時間、境界名、
 安定したエラーコード、trace ID に限定します。
 
-media capability とReviewerのcontrol secretだけは、process lifetime中にowner-privateな
-`runtime.json` へ保存し、プロセス終了時に削除します。media capability は同じタブのreload用に
-`sessionStorage`にも保持しますが、cookie、URL、`localStorage`などの永続領域には保存しません。
-Reviewerのcontrol secret、bootstrap、review capabilityはbrowser storageへ保存しません。
-いずれのcredentialもstdout、通常ログ、telemetryへ出しません。
+media capability はowner-privateな `operator-capability.json` と同一originのブラウザ
+`localStorage`へ永続化します。Reviewerのcontrol secretだけはprocess lifetime中に
+`runtime.json`へ保存し、プロセス終了時に削除します。Reviewerのcontrol secret、bootstrap、
+review capabilityはbrowser storageへ保存しません。いずれのcredentialもstdout、通常ログ、
+telemetryへ出しません。
 
 ローカル Reviewer は承認判断に必要なコマンド、cwd、path、change kind、move targetをboundedに
 一時表示しますが、patch本文は表示しません。patch本文はmetadataへの変換時に破棄します。
@@ -396,8 +402,8 @@ Reviewerのcontrol secret、bootstrap、review capabilityはbrowser storageへ�
 `sessionStorage`へ保存しません。
 
 操作サーバーは loopback にしか bind できません。WebSocket は同一 loopback origin、または
-設定した公開 HTTPS origin と Host の完全一致を要求します。どちらの経路でもプロセスごとの
-capability が必要で、同時に一つの操作クライアントだけを受け入れます。
+設定した公開 HTTPS origin と Host の完全一致を要求します。どちらの経路でも永続capability が
+必要で、同時に一つの操作クライアントだけを受け入れます。
 Reviewer は別のcontrol secretと短命bootstrapを使い、loopbackだけから接続できます。
 詳細は [SECURITY.md](SECURITY.md) を参照してください。
 

@@ -12,9 +12,11 @@ Tunnel だけをサポートします。
 - HTTP サーバーは loopback だけに bind します。
 - WebSocket は同一 loopback authority、または設定済み公開 HTTPS URL と Host の完全一致を
   要求します。wildcard、suffix match、forwarded header による推測は行いません。
-- プロセスごとの capability は URL fragment と WebSocket subprotocol で渡し、
-  HTTP path、query、通常ログへ出しません。
-- runtime state と launchd plist はユーザーだけが読める権限で原子的に書き込みます。
+- capability は URL fragment と WebSocket subprotocol で渡し、HTTP path、query、通常ログへ
+  出しません。owner-private な `operator-capability.json` と同一originの `localStorage`へ
+  永続化します。
+- runtime state、operator capability、launchd plist はユーザーだけが読める権限で原子的に
+  書き込みます。`runtime.json` とReviewer control secretはプロセス終了時に削除します。
 - スマートフォン用 QR は loopback Host、capability header、Fetch Metadata を検証して
   メモリ生成し、`no-store` で返します。公開 Host からは取得できません。
 - Irodori と OTLP の URL に埋め込まれた認証情報は設定検証で拒否します。
@@ -30,6 +32,8 @@ Tunnel だけをサポートします。
 共有 Mac では `~/Library/Application Support/moco` と `~/Library/Logs/moco` の
 所有者と権限を確認してください。`moco open` が runtime state の権限違反を報告した
 場合、そのファイルを信用せず、実行中の moco を停止してから再起動してください。
+capabilityを失効する場合はmocoを停止して `moco operator rotate` を実行し、再起動後に新しいQRを
+登録してください。daemon稼働中のrotateは失敗し、既存ファイルを変更しません。
 
 Codex Realtime は experimental API です。ChatGPT.app を更新した後は、
 `moco doctor` と前景起動で接続を再確認してください。

@@ -194,6 +194,7 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
 
 def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
     browser = readme.split("## 何が常駐するのか", maxsplit=1)[1].split("## 必要なもの", maxsplit=1)[
         0
     ]
@@ -205,8 +206,16 @@ def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> N
     mobile = readme.split("## スマートフォンから使う", maxsplit=1)[1].split(
         "## Irodori の接続先", maxsplit=1
     )[0]
+    for required in [
+        "operator-capability.json",
+        "localStorage",
+        "moco operator rotate",
+        "owner-private",
+    ]:
+        assert required in mobile
+        assert required in security
     assert "runtime.json" in mobile
-    assert "唯一のファイル" in mobile
+    assert "daemon を再起動すると古い QR は無効" not in mobile
 
 
 def test_readme_documents_stage_b_verification_without_claiming_live_acceptance() -> None:
@@ -409,3 +418,4 @@ def test_local_configuration_and_state_are_not_tracked() -> None:
 
     assert "config/moco.yaml" not in tracked
     assert not any(path.endswith("runtime.json") for path in tracked)
+    assert not any(path.endswith("operator-capability.json") for path in tracked)
