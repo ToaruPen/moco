@@ -861,14 +861,22 @@ function isLoopbackHostname(hostname) {
   );
 }
 
-export function loadCapability({ location, history, storage }) {
+export function loadCapability({ location, history, persistentStorage, sessionStorage }) {
   const capabilityFromUrl = location.hash.slice(1);
   if (capabilityFromUrl) {
-    storage.setItem(CAPABILITY_STORAGE_KEY, capabilityFromUrl);
+    persistentStorage.setItem(CAPABILITY_STORAGE_KEY, capabilityFromUrl);
     history.replaceState(null, "", location.pathname);
     return capabilityFromUrl;
   }
-  return storage.getItem(CAPABILITY_STORAGE_KEY) ?? "";
+  const persisted = persistentStorage.getItem(CAPABILITY_STORAGE_KEY);
+  if (persisted) {
+    return persisted;
+  }
+  const legacy = sessionStorage.getItem(CAPABILITY_STORAGE_KEY) ?? "";
+  if (legacy) {
+    persistentStorage.setItem(CAPABILITY_STORAGE_KEY, legacy);
+  }
+  return legacy;
 }
 
 export class PairingPanel {
@@ -1165,7 +1173,8 @@ function boot() {
   const capability = loadCapability({
     location: window.location,
     history: window.history,
-    storage: window.sessionStorage,
+    persistentStorage: window.localStorage,
+    sessionStorage: window.sessionStorage,
   });
   const pairingPanel = new PairingPanel({
     capability,
