@@ -21,8 +21,7 @@ def test_load_or_create_persists_and_reuses_owner_private_capability(
     path = tmp_path / "runtime-private" / "operator-capability.json"
     generated = iter((TOKEN_A, TOKEN_B))
     monkeypatch.setattr(
-        operator_capability.secrets,
-        "token_urlsafe",
+        "moco.runtime.operator_capability.secrets.token_urlsafe",
         lambda _size: next(generated),
     )
 
@@ -104,7 +103,10 @@ def test_private_boundary_failure_is_not_replaced(
         message = "operator capability permissions are not private"
         raise PrivateStateError(message)
 
-    monkeypatch.setattr(operator_capability.os.path, "lexists", lambda _path: True)
+    monkeypatch.setattr(
+        "moco.runtime.operator_capability.os.path.lexists",
+        lambda _path: True,
+    )
     monkeypatch.setattr(operator_capability, "read_private_state", reject_read)
     monkeypatch.setattr(
         operator_capability,

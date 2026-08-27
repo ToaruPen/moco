@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -146,11 +146,9 @@ def test_operator_rotate_refuses_to_change_state_while_runtime_is_active(
     removed: list[Path] = []
     monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
 
-    @contextmanager
-    def reject_lease(_path: Path) -> Iterator[None]:
+    def reject_lease(_path: Path) -> AbstractContextManager[None]:
         message = "runtime lease is already held"
         raise PrivateStateError(message)
-        yield
 
     monkeypatch.setattr(cli, "hold_private_runtime_lease", reject_lease)
     monkeypatch.setattr(cli, "rotate_operator_capability", removed.append, raising=False)
