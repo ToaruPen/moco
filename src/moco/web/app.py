@@ -3197,10 +3197,22 @@ def create_app(  # noqa: C901
 
     @app.websocket("/ws")
     async def operator_socket(websocket: WebSocket) -> None:
-        if not _origin_allowed(websocket, resolved.server.public_url) or not _capability_allowed(
+        origin_allowed = _origin_allowed(websocket, resolved.server.public_url)
+        capability_rejection = _capability_rejection_code(
             websocket,
             app.state.capability_token,
-        ):
+        )
+        if not origin_allowed or capability_rejection is not None:
+            rejection_code = "origin_rejected" if not origin_allowed else capability_rejection
+            assert rejection_code is not None
+            safe_event(
+                logger,
+                "operator_websocket_rejected",
+                component="web",
+                boundary="operator_websocket",
+                event_code=rejection_code,
+                result="rejected",
+            )
             await websocket.close(code=1008)
             return
         await websocket.accept(subprotocol=_WEBSOCKET_PROTOCOL)
@@ -3346,7 +3358,10 @@ def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
     return local or public
 
 
-def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
+def _capability_rejection_code(
+    websocket: WebSocket,
+    expected_token: str,
+) -> Literal["capability_missing", "capability_mismatch"] | None:
     offered = websocket.headers.get("sec-websocket-protocol", "")
     protocols = {value.strip() for value in offered.split(",")}
     candidate = next(
@@ -3357,11 +3372,11 @@ def _capability_allowed(websocket: WebSocket, expected_token: str) -> bool:
         ),
         None,
     )
-    return (
-        _WEBSOCKET_PROTOCOL in protocols
-        and candidate is not None
-        and secrets.compare_digest(candidate, expected_token)
-    )
+    if _WEBSOCKET_PROTOCOL not in protocols or not candidate:
+        return "capability_missing"
+    if not secrets.compare_digest(candidate, expected_token):
+        return "capability_mismatch"
+    return None
 
 
 def _pairing_request_allowed(request: Request, expected_token: str) -> bool:

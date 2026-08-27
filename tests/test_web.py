@@ -3462,6 +3462,35 @@ def test_rejects_non_loopback_origin_and_wrong_capability() -> None:
                 pass
 
 
+@pytest.mark.parametrize(
+    ("origin", "capability", "event_code"),
+    [
+        ("https://example.com", CAPABILITY, "origin_rejected"),
+        ("http://127.0.0.1:8765", "", "capability_missing"),
+        ("http://127.0.0.1:8765", "wrong", "capability_mismatch"),
+    ],
+)
+def test_logs_bounded_operator_websocket_rejection_reason(
+    origin: str,
+    capability: str,
+    event_code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+    app = create_app(capability_token=CAPABILITY)
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        pytest.raises(WebSocketDisconnect),
+        websocket_context(client, origin=origin, capability=capability),
+    ):
+        pass
+
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert f"event_code={event_code}" in caplog.text
+    assert "moco.capability." not in caplog.text
+
+
 def test_accepts_arbitrary_numeric_loopback_media_origin() -> None:
     app = create_app(capability_token=CAPABILITY)
     with (
