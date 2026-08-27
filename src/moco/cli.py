@@ -34,6 +34,7 @@ from moco.runtime.hotkeys import GlobalHotkeyListener, HotkeyMapper
 from moco.runtime.operator_capability import (
     load_or_create_operator_capability,
     operator_capability_path,
+    rotate_operator_capability,
 )
 from moco.runtime.private_state import (
     PrivateStateIdentity,
@@ -61,7 +62,9 @@ if TYPE_CHECKING:
 app = typer.Typer(no_args_is_help=True, help="moco local voice agent")
 config_app = typer.Typer(no_args_is_help=True, help="Manage strict YAML configuration.")
 service_app = typer.Typer(no_args_is_help=True, help="Manage the user launchd service.")
+operator_app = typer.Typer(no_args_is_help=True, help="Manage operator access.")
 app.add_typer(config_app, name="config")
+app.add_typer(operator_app, name="operator")
 app.add_typer(service_app, name="service")
 
 
@@ -201,6 +204,19 @@ def review_command() -> None:
         typer.echo("ERROR [browser]: unavailable")
         raise typer.Exit(code=1)
     typer.echo("review page opened")
+
+
+@operator_app.command("rotate")
+def operator_rotate_command() -> None:
+    """Invalidate the persistent operator capability while moco is stopped."""
+    state_path = default_runtime_state_path()
+    try:
+        with hold_private_runtime_lease(state_path):
+            rotate_operator_capability(operator_capability_path(state_path))
+    except PrivateStateError as error:
+        typer.echo("ERROR [operator_capability]: stop moco before rotating")
+        raise typer.Exit(code=1) from error
+    typer.echo("operator capability will rotate on next start")
 
 
 @service_app.command("install")

@@ -105,11 +105,61 @@ def test_config_validate_and_public_command_surface(tmp_path: Path) -> None:
 
     result = runner.invoke(app, ["config", "validate", "--path", str(path)])
     help_result = runner.invoke(app, ["--help"])
+    operator_help = runner.invoke(app, ["operator", "--help"])
 
     assert result.exit_code == 0
     assert "valid" in result.output
-    for command in ["config", "doctor", "run", "open", "service"]:
+    for command in ["config", "doctor", "run", "open", "operator", "service"]:
         assert command in help_result.output
+    assert operator_help.exit_code == 0
+    assert "rotate" in operator_help.output
+
+
+def test_operator_rotate_removes_capability_only_under_runtime_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+    capability_path = state_path.with_name("operator-capability.json")
+    capability_path.parent.mkdir(mode=0o700)
+    capability_value = "A" * 43
+    capability_path.write_text(
+        json.dumps({"version": 1, "capability": capability_value}),
+        encoding="utf-8",
+    )
+    capability_path.chmod(0o600)
+    monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
+
+    result = runner.invoke(app, ["operator", "rotate"])
+
+    assert result.exit_code == 0
+    assert result.output == "operator capability will rotate on next start\n"
+    assert not capability_path.exists()
+    assert capability_value not in result.output
+
+
+def test_operator_rotate_refuses_to_change_state_while_runtime_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+    removed: list[Path] = []
+    monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
+
+    @contextmanager
+    def reject_lease(_path: Path) -> Iterator[None]:
+        message = "runtime lease is already held"
+        raise PrivateStateError(message)
+        yield
+
+    monkeypatch.setattr(cli, "hold_private_runtime_lease", reject_lease)
+    monkeypatch.setattr(cli, "rotate_operator_capability", removed.append, raising=False)
+
+    result = runner.invoke(app, ["operator", "rotate"])
+
+    assert result.exit_code == 1
+    assert result.output == "ERROR [operator_capability]: stop moco before rotating\n"
+    assert removed == []
 
 
 def test_open_delegates_to_platform_browser_without_printing_capability(
