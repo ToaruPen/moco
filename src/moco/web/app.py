@@ -3202,18 +3202,8 @@ def create_app(  # noqa: C901
             websocket,
             app.state.capability_token,
         )
-        if not origin_allowed or capability_rejection is not None:
-            rejection_code = "origin_rejected" if not origin_allowed else capability_rejection
-            assert rejection_code is not None
-            safe_event(
-                logger,
-                "operator_websocket_rejected",
-                component="web",
-                boundary="operator_websocket",
-                event_code=rejection_code,
-                result="rejected",
-            )
-            await websocket.close(code=1008)
+        if rejection_code := ("origin_rejected" if not origin_allowed else capability_rejection):
+            await _reject_operator_socket(websocket, rejection_code)
             return
         await websocket.accept(subprotocol=_WEBSOCKET_PROTOCOL)
         connection = _BrowserConnection(
@@ -3235,6 +3225,25 @@ def create_app(  # noqa: C901
             await control_hub.unregister(connection)
 
     return app
+
+
+async def _reject_operator_socket(
+    websocket: WebSocket,
+    rejection_code: Literal[
+        "origin_rejected",
+        "capability_missing",
+        "capability_mismatch",
+    ],
+) -> None:
+    safe_event(
+        logger,
+        "operator_websocket_rejected",
+        component="web",
+        boundary="operator_websocket",
+        event_code=rejection_code,
+        result="rejected",
+    )
+    await websocket.close(code=1008)
 
 
 def _codex_session_factory(
