@@ -639,6 +639,42 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     assert state_path not in contents
 
 
+async def test_runtime_reuses_operator_capability_but_rotates_control_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, str]] = []
+    operator_app = SimpleNamespace(
+        state=SimpleNamespace(
+            control_hub=SimpleNamespace(publish=lambda _control: None),
+        ),
+    )
+
+    def create(
+        _settings: MocoSettings,
+        *,
+        capability_token: str,
+        control_secret: str,
+    ) -> SimpleNamespace:
+        observed.append((capability_token, control_secret))
+        return operator_app
+
+    monkeypatch.setattr(cli, "create_app", create)
+    monkeypatch.setattr(cli, "configure_telemetry", lambda _settings: FakeTelemetry())
+    monkeypatch.setattr(cli, "GlobalHotkeyListener", FakeHotkeyListener)
+    monkeypatch.setattr(uvicorn, "Config", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(uvicorn, "Server", lambda _config: FakeServer())
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+
+    await _run_runtime(MocoSettings(), state_path=state_path)
+    await _run_runtime(MocoSettings(), state_path=state_path)
+
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1] != observed[1][1]
+    assert not state_path.exists()
+    assert state_path.with_name("operator-capability.json").exists()
+
+
 async def test_runtime_holds_exclusive_lease_across_state_publication(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

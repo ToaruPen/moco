@@ -31,6 +31,10 @@ from moco.platform import (
     service_supported,
 )
 from moco.runtime.hotkeys import GlobalHotkeyListener, HotkeyMapper
+from moco.runtime.operator_capability import (
+    load_or_create_operator_capability,
+    operator_capability_path,
+)
 from moco.runtime.private_state import (
     PrivateStateIdentity,
     hold_private_runtime_lease,
@@ -269,12 +273,23 @@ def service_uninstall_command(
 
 async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
     with hold_private_runtime_lease(state_path):
-        await _run_owned_runtime(settings, state_path=state_path)
+        capability_value = load_or_create_operator_capability(
+            operator_capability_path(state_path),
+        )
+        await _run_owned_runtime(
+            settings,
+            state_path=state_path,
+            capability_value=capability_value,
+        )
 
 
-async def _run_owned_runtime(settings: MocoSettings, *, state_path: Path) -> None:
+async def _run_owned_runtime(
+    settings: MocoSettings,
+    *,
+    state_path: Path,
+    capability_value: str,
+) -> None:
     telemetry = configure_telemetry(settings.telemetry)
-    capability_value = secrets.token_urlsafe(32)
     control_secret = secrets.token_urlsafe(32)
     operator_app = create_app(
         settings,
