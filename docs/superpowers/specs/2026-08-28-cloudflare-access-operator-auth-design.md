@@ -126,7 +126,8 @@ moco は JWT 暗号処理を独自実装せず、検証実績のある library �
 - JWT の署名が `team_domain` の `/cdn-cgi/access/certs` にある公開鍵で検証できる。
 - `iss` が設定した `team_domain` と完全一致する。
 - `aud` が設定した application audience を含む。
-- `exp` と `nbf` を含む標準時刻 claim が現在時刻に対して有効である。
+- `exp` が存在して現在時刻に対して有効であり、`iat` / `nbf` が存在する場合も
+  現在時刻に対して有効である。
 - `email` が bounded non-empty string で、`allowed_email` と一致する。
 - 許可していない algorithm、未知 key、malformed claim、重複 header は拒否する。
 
@@ -189,7 +190,8 @@ ready になるまで、現在の公開 WebSocket capability gate を維持す�
 - team domain、audience、email の正常値と malformed / oversized 値を検査する。
 - test は設定 object と fake clock / fake JWKS client を注入し、固定 process 環境変数に依存しない。
 - 正しい署名、issuer、audience、時刻、email の JWT だけを受理する。
-- missing header、誤署名、未知 key、別 issuer、別 audience、expired / not-yet-valid token、
+- missing header、誤署名、未知 key、別 issuer、別 audience、expired / future-issued /
+  not-yet-valid token、
   email 不一致、malformed claim、JWKS failure を拒否する。
 - JWKS cache、未知 `kid` の一回 refresh、timeout、fail-closed を検査する。
 - token と identity が log、exception、telemetry に出ないことを検査する。
