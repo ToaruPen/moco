@@ -56,6 +56,7 @@ from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 from moco.speech.plan import SpeechPlanResult, SpeechPlanStream, parse_speech_plan
 from moco.speech.queue import SpeechQueue, SpeechQueueOverflowError
 from moco.speech.text import strip_control_emojis
+from moco.web.access import AccessRejectionCode, CloudflareAccessVerifier
 from moco.web.messages import (
     ClientControl,
     ControlMessage,
@@ -71,7 +72,7 @@ from moco.web.review import ReviewGate
 from moco.web.reviewer import ReviewerBroker, serve_reviewer_socket
 
 if TYPE_CHECKING:
-    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine
+    from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
 
     from irodori_tts_infra.contracts import CapabilitiesResponse
 
@@ -182,6 +183,13 @@ class _ConversationEffectSink(InteractionEffects, Protocol):
 
 class _AsyncClosable(Protocol):
     async def close(self) -> None: ...
+
+
+class _AccessVerifier(Protocol):
+    async def rejection_code(
+        self,
+        assertions: Sequence[str],
+    ) -> AccessRejectionCode | None: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -3096,7 +3104,7 @@ class _BrowserConnection:
             await self._websocket.send_json(message)
 
 
-def create_app(  # noqa: C901
+def create_app(  # noqa: C901, PLR0915
     settings: MocoSettings | None = None,
     *,
     session_factory: SessionFactory | None = None,
@@ -3134,11 +3142,25 @@ def create_app(  # noqa: C901
     app.state.global_hotkeys_active = (
         resolved.hotkeys.enabled if global_hotkeys_active is None else global_hotkeys_active
     )
+    if resolved.server.cloudflare_access is not None:
+        app.state.access_verifier = CloudflareAccessVerifier(
+            resolved.server.cloudflare_access,
+        )
+
+    _install_access_middleware(app, resolved.server.public_url)
+
     app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
 
     @app.get("/", include_in_schema=False)
     async def index() -> FileResponse:
         return FileResponse(STATIC_DIR / "index.html")
+
+    @app.get("/auth/status", include_in_schema=False)
+    async def auth_status() -> Response:
+        return Response(
+            status_code=204,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
     @app.get("/review", include_in_schema=False)
     async def review_page() -> FileResponse:
@@ -3197,12 +3219,23 @@ def create_app(  # noqa: C901
 
     @app.websocket("/ws")
     async def operator_socket(websocket: WebSocket) -> None:
-        origin_allowed = _origin_allowed(websocket, resolved.server.public_url)
-        capability_rejection = _capability_rejection_code(
-            websocket,
-            app.state.capability_token,
+        if not _origin_allowed(websocket, resolved.server.public_url):
+            await _reject_operator_socket(websocket, "origin_rejected")
+            return
+        rejection_code: (
+            AccessRejectionCode | Literal["capability_missing", "capability_mismatch"] | None
         )
-        if rejection_code := ("origin_rejected" if not origin_allowed else capability_rejection):
+        if _is_public_host(websocket.headers.get("host"), resolved.server.public_url):
+            rejection_code = await _access_rejection_code(
+                getattr(app.state, "access_verifier", None),
+                websocket.headers.getlist("cf-access-jwt-assertion"),
+            )
+        else:
+            rejection_code = _capability_rejection_code(
+                websocket,
+                app.state.capability_token,
+            )
+        if rejection_code is not None:
             await _reject_operator_socket(websocket, rejection_code)
             return
         await websocket.accept(subprotocol=_WEBSOCKET_PROTOCOL)
@@ -3233,7 +3266,8 @@ async def _reject_operator_socket(
         "origin_rejected",
         "capability_missing",
         "capability_mismatch",
-    ],
+    ]
+    | AccessRejectionCode,
 ) -> None:
     safe_event(
         logger,
@@ -3244,6 +3278,35 @@ async def _reject_operator_socket(
         result="rejected",
     )
     await websocket.close(code=1008)
+
+
+def _install_access_middleware(app: FastAPI, public_url: str | None) -> None:
+    @app.middleware("http")
+    async def authorize_public_operator(
+        request: Request,
+        call_next: Callable[[Request], Awaitable[Response]],
+    ) -> Response:
+        if not _is_public_host(request.headers.get("host"), public_url):
+            return await call_next(request)
+        rejection_code = await _access_rejection_code(
+            getattr(app.state, "access_verifier", None),
+            request.headers.getlist("cf-access-jwt-assertion"),
+        )
+        if rejection_code is None:
+            return await call_next(request)
+        safe_event(
+            logger,
+            "operator_http_rejected",
+            component="web",
+            boundary="operator_http",
+            event_code=rejection_code,
+            result="rejected",
+        )
+        return JSONResponse(
+            {"code": "access_auth_failed"},
+            status_code=403,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
 
 
 def _codex_session_factory(
@@ -3365,6 +3428,25 @@ def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
         and host.casefold() == urlsplit(public_url).netloc.casefold()
     )
     return local or public
+
+
+def _is_public_host(host: str | None, public_url: str | None) -> bool:
+    if host is None or public_url is None:
+        return False
+    expected_host = urlsplit(public_url).netloc
+    return bool(expected_host) and host.casefold() == expected_host.casefold()
+
+
+async def _access_rejection_code(
+    verifier: object | None,
+    assertions: Sequence[str],
+) -> AccessRejectionCode | None:
+    if verifier is None:
+        return "access_keys_unavailable"
+    try:
+        return await cast("_AccessVerifier", verifier).rejection_code(assertions)
+    except Exception:  # noqa: BLE001 - Access authentication must fail closed.
+        return "access_keys_unavailable"
 
 
 def _capability_rejection_code(
