@@ -69,7 +69,7 @@ Computer Useのようにホスト側実装を要する能力は、Codex Desktop�
 - 長期記憶、会話をまたぐRealtime Thread永続化、transcript保存
 - Windows ServiceまたはScheduled Taskによる自動起動
 - 音声だけによる破壊的操作の承認
-- `danger-full-access`と`approvalPolicy=never`を組み合わせた音声起動turn
+- `inherit_codex` が global 設定から `danger-full-access` と `approvalPolicy=never` を継承する音声起動turn
 - app-serverの内部tool catalogをmoco設定へ複製すること
 
 BrowserとComputer Useのホストアダプターは後続段階で扱う。本設計には境界と導入条件を記すが、
@@ -221,23 +221,27 @@ path、MCP/appを独自allowlistで再判定しない。一方、音声からRea
 admission safety ceilingはmocoが所有する。この上限は操作を許可せず、危険な組み合わせのturn開始を
 拒否するだけである。
 
-mocoのAgent profile modeは次の三つに限定する。
+mocoのAgent profile modeは次の四つに限定する。
 
 - `read_only`: 新規設定の既定値。生成schemaに対応するread-only semantic profileをapp-serverへ渡す。
-- `workspace_write`: 利用者がローカルOperator UIで明示選択した場合だけ、対応するsemantic profileを渡す。
+- `workspace_write`: 利用者がowner-privateなローカル設定で明示選択した場合だけ、対応するsemantic profileを渡す。
+- `danger_full_access_no_approval`: owner-privateなローカル設定で明示選択した場合だけ、`danger-full-access`と`approvalPolicy=never`をapp-serverへ渡す。
 - `inherit_codex`: sandbox、approval policy、permission profileを上書きせず、Codexの有効設定をそのまま使う。
 
-profile modeの変更はローカルOperator UIの信頼済みcontrolと設定fileだけから受け付ける。音声、通常hotkey、
-公開画面からは変更できない。mode未設定時は`read_only`であり、Codex設定のprovenanceを推測して自動的に
+profile modeの変更はowner-privateなローカル設定fileだけから受け付ける。音声、通常hotkey、
+公開画面、operator WebSocketからは変更できない。mode未設定時は`read_only`であり、Codex設定のprovenanceを推測して自動的に
 `inherit_codex`へ切り替えない。利用者が「Codex側で許可した能力をmocoでもそのまま使う」場合の正式な
 選択肢は`inherit_codex`である。
+
+`danger_full_access_no_approval`の詳細な権限、リスク、ロールバックは
+[Danger Full Access No Approval Design](2026-08-28-danger-full-access-no-approval-design.md)で定める。
 
 選択modeの範囲でCodexがpromptなしに許可した操作はmocoでもpromptなしで進む。Codexがpromptを返せば
 mocoはReviewerへ運び、Codexが拒否すればmocoも拒否を表示する。設定を読み直して独自に同じ判断を
 再実装しない。
 
 Capability discovery は global effective policy を観測結果として保持するが、明示 profile の
-admission 条件には使わない。`read_only` と `workspace_write` は thread 作成時に各 profile の
+admission 条件には使わない。`read_only`、`workspace_write`、`danger_full_access_no_approval` は thread 作成時に各 profile の
 policy を明示し、`inherit_codex` だけが global effective policy を継承する。`inherit_codex` で
 effective policy を正規化できない場合、または `danger-full-access` かつ `approvalPolicy=never`
 の場合は admission safety ceiling で拒否する。
@@ -556,7 +560,7 @@ errorはstable codeと安全な説明を持つ。外部error本文、command、p
 ### 段階B: 最初に使えるdelegated Codex作業
 
 - Realtime v3のserver-managed delegationを接続し、manual handoffを製品経路へ入れない。
-- 現行の固定`read-only`/`approvalPolicy=never`指定を、三つのprofile modeとeffective policy表示へ
+- 現行の固定`read-only`/`approvalPolicy=never`指定を、四つのprofile modeとeffective policy表示へ
   置き換える。
 - commandとfile changeのone-shot approvalをBrokerとlocal Reviewerで扱う。
 - delegation acknowledgement、safe speakable progress、final、interruptを接続する。
@@ -665,7 +669,7 @@ macOSとWindowsで次を確認する。
 4. read-only taskが同じRealtime Threadのdelegated Codex作業として完了する。
 5. command/file approvalがlocal Reviewerだけへ出る。
 6. voiceの「はい」や公開画面から承認できない。
-7. `workspace_write`または`inherit_codex`をローカルで明示選択し、Codexが許可した場合だけ変更taskが進む。
+7. `workspace_write`、`danger_full_access_no_approval`、または`inherit_codex`をowner-privateなローカル設定で明示選択し、Codexが許可した場合だけ変更taskが進む。
 8. interruptでturnと古いspeech generationが止まる。
 9. app-server切断後に実行中turnを再送しない。
 10. acknowledgement、speakable progress、finalが重複せずIrodoriで読み上げられる。
@@ -695,7 +699,7 @@ app-server stderrはdrainするが、通常ログへそのまま転送しない�
 - Codexのcommentaryとfinalが同じRealtime会話へ返り、後続依頼も同じ文脈で解決できる。
 - active Codex configで許可されたapp-server内蔵能力にmoco独自allowlistが介在しない。
 - profile mode未設定時は`read_only`になり、`inherit_codex`をローカルで選ぶとCodex設定を上書きしない。
-- `read_only`と`workspace_write`はglobal effective policyをadmission条件にせず、`inherit_codex`で
+- `read_only`、`workspace_write`、`danger_full_access_no_approval`はglobal effective policyをadmission条件にせず、`inherit_codex`で
   effective policyを正規化できない場合、または`danger-full-access`かつ`approvalPolicy=never`の場合に
   音声からRealtime turnを開始しない。
 - app-serverがpromptを要求しない操作に追加Reviewerを出さない。

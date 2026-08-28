@@ -339,10 +339,11 @@ def test_codex_prompt_file_rejects_unusable_path(
         load_config(path)
 
 
-def test_agent_profile_modes_are_exactly_three() -> None:
+def test_agent_profile_modes_are_exactly_four() -> None:
     assert [mode.value for mode in AgentProfileMode] == [
         "read_only",
         "workspace_write",
+        "danger_full_access_no_approval",
         "inherit_codex",
     ]
 
@@ -354,7 +355,15 @@ def test_agent_profile_defaults_to_read_only(tmp_path: Path) -> None:
     assert load_config(path).agent.profile == "read_only"
 
 
-@pytest.mark.parametrize("profile", ["read_only", "workspace_write", "inherit_codex"])
+@pytest.mark.parametrize(
+    "profile",
+    [
+        "read_only",
+        "workspace_write",
+        "danger_full_access_no_approval",
+        "inherit_codex",
+    ],
+)
 def test_agent_profile_accepts_supported_modes(tmp_path: Path, profile: str) -> None:
     path = tmp_path / "moco.yaml"
     path.write_text(f"agent:\n  profile: {profile}\n", encoding="utf-8")
@@ -364,7 +373,7 @@ def test_agent_profile_accepts_supported_modes(tmp_path: Path, profile: str) -> 
 
 def test_agent_profile_rejects_unknown_mode(tmp_path: Path) -> None:
     path = tmp_path / "moco.yaml"
-    rejected_profile = "danger_full_access"
+    rejected_profile = "unknown_agent_profile"
     path.write_text(f"agent:\n  profile: {rejected_profile}\n", encoding="utf-8")
 
     with pytest.raises(ConfigError, match=r"agent\.profile") as caught:

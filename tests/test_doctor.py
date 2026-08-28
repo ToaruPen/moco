@@ -386,6 +386,10 @@ async def test_doctor_projects_local_review_readiness_with_bounded_codes(
             DoctorCheck("codex_agent_admission", "ok", "allowed"),
         ),
         (
+            AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL,
+            DoctorCheck("codex_agent_admission", "ok", "allowed"),
+        ),
+        (
             AgentProfileMode.INHERIT_CODEX,
             DoctorCheck("codex_agent_admission", "error", "unsafe_voice_policy"),
         ),

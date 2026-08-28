@@ -1564,6 +1564,73 @@ def test_thread_start_requires_read_only_never_profile_witness(tmp_path: Path) -
     assert SemanticMethod.THREAD_START in contract.missing_methods
 
 
+def test_thread_start_requires_danger_full_access_without_approval_pair(
+    tmp_path: Path,
+) -> None:
+    variant = thread_start_variant()
+    params_schema = variant_params_schema(variant)
+    params_schema["anyOf"] = [
+        {
+            "type": "object",
+            "properties": {
+                "sandbox": {"type": "string", "const": "read-only"},
+                "approvalPolicy": {"type": "string", "const": "never"},
+            },
+        },
+        {
+            "type": "object",
+            "properties": {
+                "sandbox": {"type": "string", "const": "workspace-write"},
+                "approvalPolicy": {"type": "string", "const": "on-request"},
+            },
+        },
+    ]
+    write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.method(SemanticMethod.THREAD_START) is None
+    assert SemanticMethod.THREAD_START in contract.missing_methods
+
+
+def test_thread_start_accepts_exact_supported_profile_pairs(tmp_path: Path) -> None:
+    variant = thread_start_variant()
+    params_schema = variant_params_schema(variant)
+    base_properties: dict[str, JsonValue] = {
+        "cwd": {"type": "string"},
+        "ephemeral": {"type": "boolean", "const": True},
+    }
+    profiles: list[dict[str, JsonValue]] = [
+        {},
+        {
+            "sandbox": {"type": "string", "const": "read-only"},
+            "approvalPolicy": {"type": "string", "const": "never"},
+        },
+        {
+            "sandbox": {"type": "string", "const": "workspace-write"},
+            "approvalPolicy": {"type": "string", "const": "on-request"},
+        },
+        {
+            "sandbox": {"type": "string", "const": "danger-full-access"},
+            "approvalPolicy": {"type": "string", "const": "never"},
+        },
+    ]
+    params_schema["anyOf"] = [
+        {
+            "type": "object",
+            "required": [*base_properties, *profile],
+            "properties": {**base_properties, **profile},
+            "additionalProperties": False,
+        }
+        for profile in profiles
+    ]
+    write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.require_method(SemanticMethod.THREAD_START).name == "alias-thread-start"
+
+
 @pytest.mark.parametrize(
     "narrowed",
     [

@@ -277,6 +277,7 @@ class CodexRealtimeSession:
 
         try:
             _require_voice_readiness(self._capabilities)
+            thread_params = self._thread_params()
             self._sdp_future = asyncio.get_running_loop().create_future()
             notifications = self._connection.notifications()
             self._notification_task = asyncio.create_task(
@@ -286,7 +287,7 @@ class CodexRealtimeSession:
             if self._thread_id is None:
                 thread_result = await self._connection.request(
                     self._thread_start_method,
-                    self._thread_params(),
+                    thread_params,
                 )
                 self._thread_id = _thread_id_from_result(thread_result)
             await self._connection.request(
@@ -592,13 +593,21 @@ class CodexRealtimeSession:
             "cwd": str(self._working_directory),
             "ephemeral": True,
         }
-        profile = self._settings.agent.profile
+        profile: object = self._settings.agent.profile
         if profile is AgentProfileMode.READ_ONLY:
             params["sandbox"] = "read-only"
             params["approvalPolicy"] = "never"
         elif profile is AgentProfileMode.WORKSPACE_WRITE:
             params["sandbox"] = "workspace-write"
             params["approvalPolicy"] = "on-request"
+        elif profile is AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL:
+            params["sandbox"] = "danger-full-access"
+            params["approvalPolicy"] = "never"
+        elif profile is AgentProfileMode.INHERIT_CODEX:
+            pass
+        else:
+            msg = "Codex Realtime agent profile is invalid"
+            raise CodexRpcError(msg)
         return params
 
 

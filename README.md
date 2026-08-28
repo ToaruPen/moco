@@ -65,12 +65,22 @@ Windows で `moco service` を実行すると `unsupported_platform` になり�
 `uv run moco run` による foreground 実行です。ブラウザのマイク許可とグローバルホットキーの
 利用可否は、対話デスクトップ上で利用者が確認してください。
 
-Agent profile は設定ファイルの `agent.profile` で選びます。既定の `read_only`、明示的な
-`workspace_write`、Codex の有効設定を上書きしない `inherit_codex` の3種類です。音声や
-公開画面から profile は変更できません。`read_only` と `workspace_write` は global Codex policy を admission 条件にしません。
-`read_only` と `workspace_write` は sandbox と approval policy を thread 作成時に明示します。`inherit_codex` だけが global Codex policy を継承します。
-この profile で有効 policy を確認できない場合、または `danger-full-access` と approval policy
-`never` の組み合わせになる場合は、音声からCodex作業を開始しません。承認が発生し得る依頼を始める前に、
+Agent profile は owner-private なローカル設定ファイルの `agent.profile` だけで選びます。既定の
+`read_only`、明示的な `workspace_write`、専用の `danger_full_access_no_approval`、Codex の有効設定を
+上書きしない `inherit_codex` の4種類です。公開画面、音声、hotkey、通常の operator WebSocket から
+profile を選択・変更することはできません。`read_only`、`workspace_write`、`danger_full_access_no_approval` は global Codex policy を admission 条件にしません。
+これらの明示 profile は sandbox と approval policy を thread 作成時に指定し、`inherit_codex` だけが global Codex policy を継承します。
+`inherit_codex` では、有効 policy を確認できない場合、または継承した policy が
+`danger-full-access` と approval policy `never` の組み合わせになる場合、音声から Codex 作業を開始しません。
+
+`danger_full_access_no_approval` は `danger-full-access` と approval policy `never` を明示します。
+これは sandbox なし・承認なしで、各ホストで moco を実行するユーザーアカウントがアクセスできる
+全ファイルを読み書きし、コマンドを実行し、ネットワークを利用できます。資格情報の露出・外部送信、
+破壊的コマンドによるデータ削除、外部への書き込み、launchd、Windows の自動起動設定、shell 設定などの
+永続化につながる高リスク設定です。
+停止するには owner-private なローカル設定で `read_only` または `workspace_write` へ戻し、moco を再起動します。
+
+承認が発生し得る依頼を始める前に、
 同じホストの別ターミナルで `uv run moco review` を実行してローカル Reviewer を接続します。
 Reviewer が未接続のまま承認要求を受けると fail-closed になります。公開画面は待機状態と
 turn 全体の取消だけを扱い、操作詳細の閲覧や decision はできません。音声の「はい」も承認に
@@ -359,7 +369,7 @@ uninstall はラベルと実行ファイルが moco のものと一致する pli
 | `operator_public_url` | スマートフォン用固定 HTTPS hostname の設定状態。hostname 自体は表示しません |
 | `cloudflared_binary` | `cloudflared` の実行可否 |
 | `cloudflared_service` | moco 専用 LaunchAgent が running かどうか |
-| `codex_profile` | 選択した `read_only` / `workspace_write` / `inherit_codex` |
+| `codex_profile` | 選択した `read_only` / `workspace_write` / `danger_full_access_no_approval` / `inherit_codex` |
 | `codex_command` | 設定または自動解決した公開 Codex CLI の実行可否 |
 | `codex_schema` | 実行中の CLI から生成したprotocol schemaとの互換性 |
 | `codex_account` | 認証済みかどうか。メールアドレス等は表示しません |

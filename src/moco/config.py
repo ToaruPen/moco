@@ -222,6 +222,7 @@ class AgentProfileMode(StrEnum):
 
     READ_ONLY = "read_only"
     WORKSPACE_WRITE = "workspace_write"
+    DANGER_FULL_ACCESS_NO_APPROVAL = "danger_full_access_no_approval"
     INHERIT_CODEX = "inherit_codex"
 
 

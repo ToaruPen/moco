@@ -676,6 +676,9 @@ class AgentSession:
         elif self._profile is AgentProfileMode.WORKSPACE_WRITE:
             params["sandbox"] = "workspace-write"
             params["approvalPolicy"] = "on-request"
+        elif self._profile is AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL:
+            params["sandbox"] = "danger-full-access"
+            params["approvalPolicy"] = "never"
         elif self._profile is not AgentProfileMode.INHERIT_CODEX:
             raise _stable_error(_CONTRACT_INVALID)
         return params

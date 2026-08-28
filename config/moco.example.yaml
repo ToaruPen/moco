@@ -25,9 +25,10 @@ codex:
 
 agent:
   # Capability profile moco requests for delegated Codex turns. Default: read_only.
-  #   read_only:       request Codex's read-only profile.
-  #   workspace_write: request Codex's workspace-write profile.
-  #   inherit_codex:   send no override and keep Codex's own effective settings.
+  #   read_only:                      request Codex's read-only profile.
+  #   workspace_write:                request Codex's workspace-write profile.
+  #   danger_full_access_no_approval: request full access without approval prompts.
+  #   inherit_codex:                  send no override and keep Codex's own effective settings.
   # This file is the only way to set the profile today, and it is read at startup.
   profile: read_only
 
