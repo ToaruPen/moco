@@ -84,7 +84,9 @@ def canonical_public_https_origin(value: str) -> str | None:
         port = parsed.port
     except ValueError:
         return None
-    canonical_hostname = (hostname or "").rstrip(".").casefold()
+    if not parsed.netloc.isascii() or hostname is None or not hostname.isascii():
+        return None
+    canonical_hostname = hostname.rstrip(".").casefold()
     labels = canonical_hostname.split(".")
     labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
         label.isascii()
@@ -101,7 +103,6 @@ def canonical_public_https_origin(value: str) -> str | None:
         address = None
     if (
         parsed.scheme.casefold() != "https"
-        or hostname is None
         or parsed.netloc.casefold().rstrip(".") != canonical_hostname
         or address is not None
         or not labels_valid

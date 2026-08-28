@@ -285,6 +285,10 @@ def test_mobile_url_validation_accepts_bare_public_url(url: str) -> None:
         "https://127..1",
         "https://1.4294967296",
         "https://xn--a.com",
+        "https://faß.example",
+        "https://straße.example",
+        "https://K.example",
+        "https://ſ.example",
     ],
 )
 def test_mobile_url_validation_rejects_non_bare_public_urls(url: str) -> None:
