@@ -3897,9 +3897,13 @@ def test_public_operator_is_closed_and_unregistered_when_lease_refresh_stops() -
         ) as first:
             assert first.receive_json()["state"] == "ready"
             assert first.receive_json()["type"] == "access_lease"
-            first.receive_json()  # Initial voice catalog can race the deadline close.
-            with pytest.raises(WebSocketDisconnect):
+            try:
                 first.receive_json()
+            except WebSocketDisconnect:
+                pass
+            else:
+                with pytest.raises(WebSocketDisconnect):
+                    first.receive_json()
 
         with websocket_context(
             client,
