@@ -414,6 +414,7 @@ source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "idna" },
     { name = "irodori-tts-infra" },
     { name = "opentelemetry-api" },
     { name = "opentelemetry-exporter-otlp-proto-http" },
@@ -444,6 +445,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.116,<1" },
     { name = "httpx", specifier = ">=0.28,<1" },
+    { name = "idna", specifier = ">=3.10,<4" },
     { name = "irodori-tts-infra", git = "https://github.com/ToaruPen/irodori-tts-infra.git?rev=2f169719a6491c83bd08e6d3bd58dafc825eb11d" },
     { name = "opentelemetry-api", specifier = ">=1.36,<2" },
     { name = "opentelemetry-exporter-otlp-proto-http", specifier = ">=1.36,<2" },

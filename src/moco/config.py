@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 from urllib.parse import urlsplit
 
+import idna
 import yaml
 from pydantic import (
     BaseModel,
@@ -57,11 +58,11 @@ def _is_valid_ace_label(label: str) -> bool:
     if not label.casefold().startswith("xn--"):
         return True
     try:
-        decoded = label.encode("ascii").decode("idna")
-        round_trip = decoded.encode("idna").decode("ascii")
-    except UnicodeError:
+        decoded = idna.decode(label, uts46=True, std3_rules=True)
+        round_trip = idna.encode(decoded, uts46=True, std3_rules=True).decode("ascii")
+    except idna.IDNAError:
         return False
-    return round_trip.casefold() == label.casefold()
+    return round_trip == label
 
 
 def _is_whatwg_ipv4_number(value: str) -> bool:

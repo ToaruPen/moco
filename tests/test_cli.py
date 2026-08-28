@@ -249,7 +249,12 @@ def test_operator_url_validation_rejects_unsafe_urls(url: str) -> None:
 
 @pytest.mark.parametrize(
     "url",
-    ["https://voice.example.com", "https://xn--bcher-kva.example"],
+    [
+        "https://voice.example.com",
+        "https://xn--bcher-kva.example",
+        "https://xn--fa-hia.example",
+        "https://xn--strae-oqa.example",
+    ],
 )
 def test_mobile_url_validation_accepts_bare_public_url(url: str) -> None:
     assert _is_safe_mobile_url(url)

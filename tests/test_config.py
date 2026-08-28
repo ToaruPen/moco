@@ -191,10 +191,18 @@ def test_public_operator_url_is_normalized() -> None:
     assert settings.cloudflare_access.allowed_email == "Owner@Example.COM"
 
 
-def test_public_operator_url_accepts_valid_ace_hostname() -> None:
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "https://xn--bcher-kva.example",
+        "https://xn--fa-hia.example",
+        "https://xn--strae-oqa.example",
+    ],
+)
+def test_public_operator_url_accepts_valid_ace_hostname(public_url: str) -> None:
     settings = ServerSettings.model_validate(
         {
-            "public_url": "https://xn--bcher-kva.example",
+            "public_url": public_url,
             "cloudflare_access": {
                 "team_domain": "https://example-team.cloudflareaccess.com",
                 "audience": "audience_123-ABC",
@@ -203,7 +211,7 @@ def test_public_operator_url_accepts_valid_ace_hostname() -> None:
         },
     )
 
-    assert settings.public_url == "https://xn--bcher-kva.example"
+    assert settings.public_url == public_url
 
 
 @pytest.mark.parametrize(
