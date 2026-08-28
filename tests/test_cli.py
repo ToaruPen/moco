@@ -670,7 +670,14 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     settings = MocoSettings.model_validate(
         {
             "hotkeys": {"enabled": False},
-            "server": {"public_url": "https://voice.example.com"},
+            "server": {
+                "public_url": "https://voice.example.com",
+                "cloudflare_access": {
+                    "team_domain": "https://example-team.cloudflareaccess.com",
+                    "audience": "audience_123-ABC",
+                    "allowed_email": "owner@example.com",
+                },
+            },
         },
     )
     await _run_runtime(settings, state_path=state_path)

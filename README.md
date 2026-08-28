@@ -228,34 +228,47 @@ loopback origin へ接続します。スマートフォン側に Tailscale ア�
 同じ hostname を self-hosted Access application として登録し、利用者本人だけを allow
 してください。bypass policy や Access を通らない予備 hostname は作りません。
 
-moco の設定には固定 hostname だけを追加します。Tunnel token、credentials file、Access
-identity はこの YAML に書きません。
+moco の設定には固定 hostname と、その hostname を保護する Access application の設定を必ず
+一緒に追加します。`team_domain` は Cloudflare Zero Trust の team domain、`audience` は
+Access application の AUD tag、`allowed_email` は許可する本人のメールアドレスです。いずれも
+検証用の非 secret 値であり、Tunnel token、credentials file、Access session はこの YAML に
+書きません。
 
 ```yaml
 server:
   host: 127.0.0.1
   port: 8765
   public_url: https://voice.example.com
+  cloudflare_access:
+    team_domain: https://example-team.cloudflareaccess.com
+    audience: example-access-application-aud
+    allowed_email: owner@example.com
 ```
+
+Access policy の session duration は必要に応じて1か月にできます。期間が満了した場合や
+Cloudflare 側で session が失効した場合は、本人確認を行って再ログインします。
 
 `cloudflared` はリポジトリ外のユーザー LaunchAgent
 `dev.toarupen.moco-cloudflared` として常駐させます。Tunnel ingress は上記 hostname だけを
-loopback origin へ送り、最後を `http_status:404` の catch-all にしてください。moco と
-Tunnel は独立したサービスです。片方が停止しても別経路へ切り替えず、`doctor` が部分失敗を
-そのまま報告します。
+loopback origin へ送り、最後を `http_status:404` の catch-all にしてください。Cloudflare edge
+の Access policy だけでなく、cloudflared から届く request の Access assertion も moco が
+`team_domain`、`audience`、`allowed_email` に対して origin で検証します。moco と Tunnel は
+独立したサービスです。片方が停止しても別経路へ切り替えず、`doctor` が部分失敗をそのまま
+報告します。
 
 設定後に moco を再起動し、Mac で `uv run moco open` を実行します。loopback の操作画面に
-「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は現在の
-media capability を URL fragment に含み、Cloudflare の request path には載せません。同じ値は
-owner-private な `operator-capability.json` に永続化し、daemon やOSの再起動後も再利用します。
-ブラウザは同一 origin の `localStorage` に保存し、既存タブの `sessionStorage` から一度だけ
-自動移行するため、同じブラウザプロファイルなら新しいタブでもQRを読み直す必要はありません。
-`runtime.json` とReviewerのcontrol secretは引き続きprocess lifetime中だけ使用し、終了時に
-削除します。ブラウザ保存を消した場合、別プロファイルを使う場合、または明示的に失効した場合だけ
-新しいQRを登録してください。
+「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は固定 public URL
+だけを含む convenience link で、moco の capability を fragment、query、path のいずれにも
+含めません。public origin は Cloudflare Access session と origin で検証する assertion に依存し、
+moco の capability をスマートフォンの storage に保存しません。Access session の期限が切れたら
+Cloudflare へ再ログインします。
 
-接続キーを失効する場合はmocoを停止して `uv run moco operator rotate` を実行し、mocoを再起動して
-新しいQRを登録します。daemon稼働中のrotateは拒否され、現在のキーを変更しません。
+一方、Mac の loopback 操作画面は引き続き owner-private な `operator-capability.json` の
+capability を使い、同一 loopback origin の `localStorage` に保存します。この loopback 接続キーを
+失効する場合は moco を停止して `uv run moco operator rotate` を実行し、moco を再起動して新しい
+キーを登録します。daemon 稼働中の rotate は拒否され、現在のキーを変更しません。
+`runtime.json` と Reviewer の control secret は引き続き process lifetime 中だけ使用し、終了時に
+削除します。
 
 スマートフォンでは「接続」を押してマイクを許可し、「入力開始」と「入力停止」で操作します。
 入力開始は押し続ける PTT ではありません。指を離しても入力は続き、入力停止はマイクだけを
@@ -389,8 +402,9 @@ MCP arguments、approval payload、reasoning、アカウント識別子はファ
 category／phase／label と時刻だけです。コンソールと任意の OTLP 出力は状態、所要時間、境界名、
 安定したエラーコード、trace ID に限定します。
 
-media capability はowner-privateな `operator-capability.json` と同一originのブラウザ
-`localStorage`へ永続化します。Reviewerのcontrol secretだけはprocess lifetime中に
+media capability はowner-privateな `operator-capability.json` とloopback originのブラウザ
+`localStorage`へ永続化します。public origin は Cloudflare Access で認証し、moco capability を
+browser storageへ保存しません。Reviewerのcontrol secretだけはprocess lifetime中に
 `runtime.json`へ保存し、プロセス終了時に削除します。Reviewerのcontrol secret、bootstrap、
 review capabilityはbrowser storageへ保存しません。いずれのcredentialもstdout、通常ログ、
 telemetryへ出しません。
@@ -402,8 +416,9 @@ telemetryへ出しません。
 `sessionStorage`へ保存しません。
 
 操作サーバーは loopback にしか bind できません。WebSocket は同一 loopback origin、または
-設定した公開 HTTPS origin と Host の完全一致を要求します。どちらの経路でも永続capability が
-必要で、同時に一つの操作クライアントだけを受け入れます。
+設定した公開 HTTPS origin と Host の完全一致を要求します。loopback 経路では永続capability、
+公開経路では有効な Cloudflare Access assertion と許可済み identity を要求し、同時に一つの
+操作クライアントだけを受け入れます。
 Reviewer は別のcontrol secretと短命bootstrapを使い、loopbackだけから接続できます。
 詳細は [SECURITY.md](SECURITY.md) を参照してください。
 

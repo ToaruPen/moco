@@ -2,9 +2,11 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import stat
 import sys
 import tempfile
+import unicodedata
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
@@ -39,6 +41,9 @@ VadThreshold = Annotated[float, Field(gt=0.0, le=1.0)]
 IrodoriNumSteps = Annotated[int, Field(gt=0, le=64)]
 _MIN_PUBLIC_DNS_LABELS = 2
 _MAX_DNS_LABEL_LENGTH = 63
+_MAX_ACCESS_AUDIENCE_LENGTH = 256
+_MAX_EMAIL_LENGTH = 254
+_TEAM_DOMAIN_LABEL_COUNT = 3
 _IPV4_VERSION = 4
 _IPV6_VERSION = 6
 _IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
@@ -81,10 +86,91 @@ class StrictSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class CloudflareAccessSettings(StrictSettings):
+    team_domain: str
+    audience: str
+    allowed_email: str
+
+    @field_validator("team_domain")
+    @classmethod
+    def _normalize_team_domain(cls, value: str) -> str:
+        candidate = value.strip()
+        try:
+            parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+        except ValueError as error:
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg) from error
+        labels = (hostname or "").split(".")
+        team = labels[0] if len(labels) == _TEAM_DOMAIN_LABEL_COUNT else ""
+        valid_team = (
+            team.isascii()
+            and 1 <= len(team) <= _MAX_DNS_LABEL_LENGTH
+            and team[0].isalnum()
+            and team[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in team)
+        )
+        if (
+            parsed.scheme.casefold() != "https"
+            or hostname is None
+            or parsed.netloc.casefold() != hostname.casefold()
+            or [label.casefold() for label in labels[1:]] != ["cloudflareaccess", "com"]
+            or not valid_team
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg)
+        return f"https://{team.casefold()}.cloudflareaccess.com"
+
+    @field_validator("audience")
+    @classmethod
+    def _validate_audience(cls, value: str) -> str:
+        audience = value.strip()
+        if (
+            any(unicodedata.category(character) == "Cc" for character in value)
+            or re.fullmatch(
+                rf"[A-Za-z0-9_-]{{1,{_MAX_ACCESS_AUDIENCE_LENGTH}}}",
+                audience,
+            )
+            is None
+        ):
+            msg = "Cloudflare Access audience must use 1-256 ASCII token characters"
+            raise ValueError(msg)
+        return audience
+
+    @field_validator("allowed_email")
+    @classmethod
+    def _validate_allowed_email(cls, value: str) -> str:
+        email = value.strip()
+        local, separator, domain = email.partition("@")
+        contains_control_character = any(
+            unicodedata.category(character) == "Cc" for character in value
+        )
+        contains_forbidden_character = any(
+            character.isspace() or character in "<>,;" for character in email
+        )
+        if (
+            not email
+            or len(email) > _MAX_EMAIL_LENGTH
+            or separator != "@"
+            or not local
+            or not domain
+            or "@" in domain
+            or contains_control_character
+            or contains_forbidden_character
+        ):
+            msg = "Cloudflare Access allowed email must be one bounded nonempty address"
+            raise ValueError(msg)
+        return email
+
+
 class ServerSettings(StrictSettings):
     host: str = "127.0.0.1"
     port: Port = 8765
     public_url: str | None = None
+    cloudflare_access: CloudflareAccessSettings | None = None
 
     @field_validator("host")
     @classmethod
@@ -140,6 +226,13 @@ class ServerSettings(StrictSettings):
             msg = "operator public URL must be a portless HTTPS FQDN"
             raise ValueError(msg)
         return f"https://{hostname.rstrip('.').casefold()}"
+
+    @model_validator(mode="after")
+    def _require_public_url_and_cloudflare_access_together(self) -> Self:
+        if (self.public_url is None) != (self.cloudflare_access is None):
+            msg = "public_url and cloudflare_access must be configured together"
+            raise ValueError(msg)
+        return self
 
 
 class HotkeySettings(StrictSettings):

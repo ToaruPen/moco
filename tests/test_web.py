@@ -58,6 +58,7 @@ from moco.codex.session import (
 )
 from moco.config import (
     AgentProfileMode,
+    CloudflareAccessSettings,
     CodexSettings,
     IrodoriSettings,
     MocoSettings,
@@ -115,6 +116,11 @@ from test_coordinator import (
 )
 
 CAPABILITY = "test-capability"
+CLOUDFLARE_ACCESS = CloudflareAccessSettings(
+    team_domain="https://example-team.cloudflareaccess.com",
+    audience="audience_123-ABC",
+    allowed_email="owner@example.com",
+)
 
 
 @pytest.mark.asyncio
@@ -3550,7 +3556,10 @@ def test_rejects_mapped_or_scoped_media_authority(authority: str) -> None:
 
 def test_accepts_exact_configured_public_origin() -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with (
@@ -3576,7 +3585,10 @@ def test_accepts_exact_configured_public_origin() -> None:
 )
 def test_rejects_public_origin_variants(origin: str, host: str) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with (
@@ -3589,7 +3601,10 @@ def test_rejects_public_origin_variants(origin: str, host: str) -> None:
 
 def test_pairing_svg_is_private_and_not_cached() -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
@@ -3611,7 +3626,10 @@ def test_pairing_svg_is_private_and_not_cached() -> None:
 
 def test_pairing_svg_accepts_arbitrary_numeric_loopback_host() -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3630,7 +3648,10 @@ def test_pairing_svg_accepts_arbitrary_numeric_loopback_host() -> None:
 @pytest.mark.parametrize("host", ["192.0.2.1:8765", "127.0.0.42.evil:8765"])
 def test_pairing_svg_rejects_non_loopback_or_hostname_trick(host: str) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3657,7 +3678,10 @@ def test_pairing_svg_rejects_non_loopback_or_hostname_trick(host: str) -> None:
 )
 def test_pairing_svg_rejects_mapped_or_scoped_loopback_host(host: str) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3688,7 +3712,10 @@ def test_pairing_svg_rejects_mapped_or_scoped_loopback_host(host: str) -> None:
 )
 def test_pairing_svg_rejects_untrusted_requests(headers: dict[str, str]) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
