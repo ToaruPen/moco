@@ -228,6 +228,7 @@ class CloudflareAccessSettings(StrictSettings):
         )
         if (
             not email
+            or not email.isascii()
             or len(email) > _MAX_EMAIL_LENGTH
             or separator != "@"
             or not local
@@ -236,7 +237,7 @@ class CloudflareAccessSettings(StrictSettings):
             or contains_control_character
             or contains_forbidden_character
         ):
-            msg = "Cloudflare Access allowed email must be one bounded nonempty address"
+            msg = "Cloudflare Access allowed email must be one bounded nonempty ASCII address"
             raise ValueError(msg)
         return email
 

@@ -13,7 +13,7 @@ from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.asymmetric import padding, rsa
 
 from moco.config import CloudflareAccessSettings
-from moco.web.access import CloudflareAccessVerifier
+from moco.web.access import AccessAuthorization, CloudflareAccessVerifier
 
 TEAM_DOMAIN = "https://example-team.cloudflareaccess.com"
 AUDIENCE = "audience_123-ABC"
@@ -130,6 +130,72 @@ async def test_accepts_valid_rs256_assertion_and_casefolds_email(
 
     assert await verifier.rejection_code([_token(private_key, claims=_claims(email=email))]) is None
     assert fetcher.calls == 1
+
+
+async def test_returns_verified_ascii_identity_and_expiry(
+    private_key: rsa.RSAPrivateKey,
+) -> None:
+    expires_at = int(time.time()) + 120
+    token = _token(private_key, claims=_claims(email="OWNER@EXAMPLE.COM", exp=expires_at))
+    verifier = CloudflareAccessVerifier(
+        _settings(),
+        fetch_jwks=FakeFetcher({"keys": [_jwk(private_key)]}),
+    )
+
+    rejection, authorization = await verifier.authorization([token])
+
+    assert rejection is None
+    assert authorization == AccessAuthorization(
+        identity="owner@example.com",
+        expires_at=expires_at,
+    )
+
+
+@pytest.mark.parametrize("email", ["straße@example.com", "STRAßE@example.com"])
+async def test_rejects_non_ascii_jwt_email_without_casefold_collision(
+    private_key: rsa.RSAPrivateKey,
+    email: str,
+) -> None:
+    settings = CloudflareAccessSettings(
+        team_domain=TEAM_DOMAIN,
+        audience=AUDIENCE,
+        allowed_email="strasse@example.com",
+    )
+    verifier = CloudflareAccessVerifier(
+        settings,
+        fetch_jwks=FakeFetcher({"keys": [_jwk(private_key)]}),
+    )
+
+    assert (
+        await verifier.rejection_code([_token(private_key, claims=_claims(email=email))])
+        == "access_token_invalid"
+    )
+
+
+@pytest.mark.parametrize(
+    "email",
+    [
+        "owner.example.com",
+        "@example.com",
+        "owner@",
+        "owner@@example.com",
+        "owner\n@example.com",
+        "Owner <owner@example.com>",
+    ],
+)
+async def test_rejects_ascii_jwt_email_that_is_not_mailbox_text(
+    private_key: rsa.RSAPrivateKey,
+    email: str,
+) -> None:
+    verifier = CloudflareAccessVerifier(
+        _settings(),
+        fetch_jwks=FakeFetcher({"keys": [_jwk(private_key)]}),
+    )
+
+    assert (
+        await verifier.rejection_code([_token(private_key, claims=_claims(email=email))])
+        == "access_token_invalid"
+    )
 
 
 @pytest.mark.parametrize(

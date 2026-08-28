@@ -348,6 +348,23 @@ def test_cloudflare_access_accepts_maximum_email_length_and_preserves_exact_case
 @pytest.mark.parametrize(
     "allowed_email",
     [
+        "straße@example.com",
+        "owner@exämple.com",
+        "オーナー@example.com",
+    ],
+)
+def test_cloudflare_access_rejects_non_ascii_allowed_email(allowed_email: str) -> None:
+    with pytest.raises(ValidationError, match="allowed email"):
+        CloudflareAccessSettings(
+            team_domain="https://example-team.cloudflareaccess.com",
+            audience="audience_123-ABC",
+            allowed_email=allowed_email,
+        )
+
+
+@pytest.mark.parametrize(
+    "allowed_email",
+    [
         "",
         "   ",
         "owner.example.com",

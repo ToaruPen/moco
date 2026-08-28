@@ -1701,6 +1701,7 @@ async function bootConversationHarness({
   accessStatus = 204,
   answerStarts = [],
   initialCapability,
+  leaseStatus = 204,
   pendingAccessProbes = [],
   pendingEnumerations = [],
   pendingOffers = [],
@@ -1740,6 +1741,23 @@ async function bootConversationHarness({
 
   const connectionOrder = [];
   const fetchCalls = [];
+  const leaseIntervals = new Map();
+  let leaseIntervalId = 0;
+  const realSetInterval = dom.window.setInterval.bind(dom.window);
+  const realClearInterval = dom.window.clearInterval.bind(dom.window);
+  dom.window.setInterval = (callback, delayMs, ...args) => {
+    if (delayMs !== 20_000) {
+      return realSetInterval(callback, delayMs, ...args);
+    }
+    const id = ++leaseIntervalId;
+    leaseIntervals.set(id, callback);
+    return id;
+  };
+  dom.window.clearInterval = (id) => {
+    if (!leaseIntervals.delete(id)) {
+      realClearInterval(id);
+    }
+  };
   const accessResolvers = new Map();
   let accessIndex = 0;
   dom.window.fetch = async (requestUrl, options = {}) => {
@@ -1752,6 +1770,9 @@ async function bootConversationHarness({
         await new Promise((resolve) => accessResolvers.set(index, resolve));
       }
       return { redirected: false, status: accessStatus, type: "basic" };
+    }
+    if (requestUrl === "/auth/lease") {
+      return { redirected: false, status: leaseStatus, type: "basic" };
     }
     return { ok: false, status: 404, type: "basic" };
   };
@@ -2048,6 +2069,7 @@ async function bootConversationHarness({
     disconnect: (index = 0) => sockets[index].close(),
     dom,
     fetchCalls,
+    leaseIntervals,
     mediaDevices,
     peers,
     receive: (message) => sockets[0].receive(message),
@@ -2057,6 +2079,11 @@ async function bootConversationHarness({
       assert.ok(resolve, `Access probe ${index} must be pending`);
       accessResolvers.delete(index);
       resolve();
+    },
+    runLeaseRefresh: async () => {
+      assert.equal(leaseIntervals.size, 1, "one Access lease timer must be active");
+      await [...leaseIntervals.values()][0]();
+      await new Promise((resolve) => setImmediate(resolve));
     },
     retryListening: () => dom.window.document.querySelector("#listen-start").click(),
     sent,
@@ -2069,7 +2096,10 @@ async function bootConversationHarness({
 
 describe("operator Access browser connection", () => {
   it("activates audio and requests microphone permission before probing Access and opening a socket", async () => {
-    const connection = await bootConversationHarness({ answerStarts: [0] });
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      url: "https://operator.example.com/",
+    });
     try {
       await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
 
@@ -2210,6 +2240,58 @@ describe("operator Access browser connection", () => {
       assert.deepEqual(unhandled, []);
     } finally {
       process.off("unhandledRejection", onUnhandled);
+      await connection.close();
+    }
+  });
+
+  it("silently refreshes a server-issued lease without interrupting active media", async () => {
+    const token = "V".repeat(43);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.receive({ type: "access_lease", token });
+      await connection.waitFor(() => connection.leaseIntervals.size === 1);
+
+      await connection.runLeaseRefresh();
+
+      const refresh = connection.fetchCalls.find(({ url }) => url === "/auth/lease");
+      assert.deepEqual(refresh.options, {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Moco-Access-Lease": token },
+        method: "POST",
+        redirect: "manual",
+      });
+      assert.equal(connection.sockets[0].readyState, connection.sockets[0].constructor.OPEN);
+      assert.equal(connection.tracks[0].readyState, "live");
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("closes the operator and shows Access auth failure when lease refresh is rejected", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      leaseStatus: 403,
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.receive({ type: "access_lease", token: "W".repeat(43) });
+      await connection.waitFor(() => connection.leaseIntervals.size === 1);
+
+      await connection.runLeaseRefresh();
+      await connection.waitFor(() => connection.sockets[0].readyState === 3);
+
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "access_auth_failed — Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+      );
+      assert.equal(connection.leaseIntervals.size, 0);
+    } finally {
       await connection.close();
     }
   });
@@ -3096,6 +3178,67 @@ describe("browser connection timeouts", () => {
       }),
       (error) => error.name === "access_auth_failed",
     );
+  });
+
+  it("refreshes an opaque Access lease every 20 seconds without a request body", async () => {
+    const calls = [];
+    const scheduled = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: async (...args) => {
+        calls.push(args);
+        return { redirected: false, status: 204, type: "basic" };
+      },
+      onFailure: () => assert.fail("valid lease refresh must stay invisible"),
+      timers: {
+        clear: () => {},
+        set: (callback, delayMs) => {
+          scheduled.push({ callback, delayMs });
+          return 17;
+        },
+      },
+    });
+    const token = "T".repeat(43);
+
+    refresher.start(token);
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delayMs, 20_000);
+    await scheduled[0].callback();
+
+    assert.deepEqual(calls, [
+      [
+        "/auth/lease",
+        {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Moco-Access-Lease": token },
+          method: "POST",
+          redirect: "manual",
+        },
+      ],
+    ]);
+  });
+
+  it("fails closed and stops scheduling when an Access lease refresh is rejected", async () => {
+    const cleared = [];
+    const failures = [];
+    let callback;
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: async () => ({ redirected: false, status: 403, type: "basic" }),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (scheduled) => {
+          callback = scheduled;
+          return 23;
+        },
+      },
+    });
+
+    refresher.start("U".repeat(43));
+    await callback();
+
+    assert.deepEqual(cleared, [23]);
+    assert.deepEqual(failures, ["access_auth_failed"]);
   });
 
   it("rejects ICE gathering that never completes", async () => {

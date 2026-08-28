@@ -81,7 +81,8 @@ server:
 - `team_domain` は HTTPS の `*.cloudflareaccess.com` origin だけを受け入れ、credentials、
   port、path、query、fragment を拒否する。
 - `audience` は空文字、空白、制御文字、過大な値を拒否する。
-- `allowed_email` は単一の email address とし、比較時だけ Unicode case folding する。
+- `allowed_email` は 254 byte 以下の ASCII mailbox text 一件だけとし、比較時は ASCII の
+  大文字小文字だけを区別しない。Unicode case folding は使わない。
 - これらは秘密値ではないが、doctor や通常ログへ値そのものを表示しない。
 - 値は moco YAML から注入する。process 環境変数の固定値や test 専用 fallback を
   source of truth にしない。
@@ -106,6 +107,8 @@ server:
 6. JWT が有効で email が `allowed_email` と一致する場合だけ operator page と
    WebSocket upgrade を許可する。
 7. Browser は moco capability なしで WebSocket を開始する。
+8. 単一オペレーター登録成功後、moco はその公開 WebSocket だけに短命な connection lease を
+   発行し、browser が同一 origin の Access 認証付き request で自動更新する。
 
 公開 request では capability を認証 fallback に使わない。有効な capability が付いていても
 Access JWT が欠落・不正なら拒否する。これにより古い QR や browser storage に残った
@@ -128,19 +131,53 @@ moco は JWT 暗号処理を独自実装せず、検証実績のある library �
 - `aud` が設定した application audience を含む。
 - `exp` が存在して現在時刻に対して有効であり、`iat` / `nbf` が存在する場合も
   現在時刻に対して有効である。
-- `email` が bounded non-empty string で、`allowed_email` と一致する。
+- `email` が 254 byte 以下の non-empty ASCII string で、`allowed_email` と ASCII-only の
+  case-insensitive 比較で一致する。`straße` と `strasse` のような Unicode casefold collision は
+  検証前に拒否する。
 - 許可していない algorithm、未知 key、malformed claim、重複 header は拒否する。
 
 JWKS は process memory だけに bounded TTL で cache する。未知の `kid` を受けた場合は一度だけ
 bounded timeout で再取得し、それでも検証できなければ拒否する。JWKS の取得失敗や期限切れ
-cache しかない状態では public access を fail closed にする。JWT と検証済み identity は
-disk、browser storage、runtime state に保存しない。
+cache しかない状態では public access を fail closed にする。JWT は保存せず、検証済み
+identity は短命 lease の同一性確認のためだけ process memory に保持する。いずれも disk、
+browser storage、永続 runtime state に保存しない。
+
+## 公開 WebSocket の継続認可 lease
+
+WebSocket upgrade 時の JWT 検証だけでは、接続後の Access logout、session revoke、policy 変更を
+origin が観測できない。このため、公開 WebSocket には moco process memory 内だけで管理する
+短命な connection lease を追加する。これは公開 URL へ入るための認証 fallback ではなく、既に
+Access 認証済みの単一接続を継続認可するための失効機構である。
+
+- lease は単一オペレーター登録が成功した後だけ発行する。
+- token は CSPRNG で生成した opaque 256-bit 値とし、WebSocket で一度だけ browser へ渡す。
+- browser は約 20 秒ごとに `POST /auth/lease` を same-origin credentials、`no-store`、manual
+  redirect で送り、token を bounded な単一 `X-Moco-Access-Lease` header にだけ入れる。URL、body、
+  storage、DOM、log には入れない。
+- endpoint は設定済み public Host と exact same Origin の request だけを受け、毎回新しい
+  `Cf-Access-Jwt-Assertion` の署名、claim、ASCII identity を検証する。初回と同じ identity の
+  token にだけ constant-time 比較後の更新を許可する。
+- 初回・更新後の server deadline は
+  `min(monotonic now + 60 seconds, verified JWT exp remaining)` とする。browser timer の成否ではなく
+  server の monotonic deadline が強制切断を決める。
+- refresh、期限切れ、close、unregister は同じ lock/state を更新する。期限切れ後の token は復活
+  できず、WebSocket close 時は直ちに無効化する。
+- deadline 到達時は server が WebSocket を close し、単一オペレーター登録を解除する。event loop
+  stall 後に client message を処理する場合も、各 privileged message の直前に deadline を再確認する。
+- loopback WebSocket は capability-only のままで lease を発行・更新しない。
+
+iOS Safari が background で timer を停止した場合、更新 request が止まるため公開 WebSocket は
+安全側に約 60 秒以内で切断される。foreground 復帰後は、Access session が有効なら通常の「接続」
+操作で新しい WebSocket と lease を取得できる。
 
 ## Browser と pairing の変更
 
 - 公開ページは URL fragment や `localStorage` から moco capability を読み込まない。
 - 公開 origin に残る旧 `moco.capability` storage は起動時に削除する。
 - 公開 WebSocket は capability subprotocol を送らない。
+- 公開 WebSocket が受けた connection lease は memory 内だけに保持し、約 20 秒ごとに自動更新する。
+- lease 更新が拒否、redirect、network failure になった場合は現在の socket を閉じて
+  `access_auth_failed` を表示する。更新成功時は microphone、WebRTC、audio playback を触らない。
 - loopback ページだけが capability を読み、既存 subprotocol を送る。
 - runtime state の `mobile_url` は capability fragment のない `server.public_url` とする。
 - 「スマホ接続」QR を維持する場合、その内容は秘密を含まない固定公開 URL だけにする。
@@ -162,6 +199,7 @@ microphone や speaker を自動起動することは成功条件に含めない
 - `access_token_invalid`: 署名、issuer、audience、時刻 claim、形式の検証に失敗した。
 - `access_identity_mismatch`: 検証済み email が許可 identity と一致しない。
 - `access_keys_unavailable`: JWKS を安全に取得・更新できない。
+- `access_lease_invalid`: 外部には `access_auth_failed` として正規化する継続認可失敗。
 - 既存の `origin_rejected`、`single_operator_only`、音声系 error code は維持する。
 
 ログには request path、JWT、claim、email、audience、team domain、capability を含めない。
@@ -195,6 +233,7 @@ ready になるまで、現在の公開 WebSocket capability gate を維持す�
   email 不一致、malformed claim、JWKS failure を拒否する。
 - JWKS cache、未知 `kid` の一回 refresh、timeout、fail-closed を検査する。
 - token と identity が log、exception、telemetry に出ないことを検査する。
+- ASCII identity、lease deadline の JWT `exp` cap、refresh、expiry、release 後の復活拒否を検査する。
 
 ### Web / integration
 
@@ -203,6 +242,10 @@ ready になるまで、現在の公開 WebSocket capability gate を維持す�
 - loopback WebSocket は capability を引き続き要求し、JWT だけでは接続できない。
 - 公開・loopback の Host / Origin 交差、forwarded header 偽装を拒否する。
 - 公開 browser は capability subprotocol を送らず、旧 local storage を削除する。
+- 公開 WebSocket だけが opaque lease を受け、browser が約 20 秒ごとに body-free header request で
+  更新する。refresh 停止・失敗時は server deadline で close/unregister される。
+- malformed / duplicate lease header、別 Origin、loopback lease request、別 identity を拒否し、
+  token が URL、body、response、log に出ない。
 - loopback browser は capability を保持して送る。
 - mobile URL と QR に capability、JWT、email が含まれない。
 - 単一オペレーター制約、接続、入力開始・停止、Irodori 再生の既存 test を維持する。
@@ -211,7 +254,8 @@ ready になるまで、現在の公開 WebSocket capability gate を維持す�
 
 - iPhone Safari で Cloudflare Access に login 後、固定公開 URL を直接開いて接続する。
 - page reload、新しい tab、Safari 再起動後も Access session 有効中は QR なしで接続する。
-- Access logout 後は拒否または login redirect になり、moco WebSocket へ到達しない。
+- 接続中に Access logout した場合も lease refresh が成功せず、約 60 秒以内に既存 WebSocket が
+  server から切断される。再接続は login redirect または認証拒否になる。
 - 別 identity、期限切れ session、Tunnel 停止、moco 停止を区別して確認する。
 - 実機 iPhone で microphone permission、音声入力、Irodori 音声再生を確認する。
 - 通常 gate として `just check` を通す。

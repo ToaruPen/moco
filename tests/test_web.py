@@ -109,6 +109,7 @@ from moco.speech.irodori import (
 )
 from moco.speech.queue import SpeechQueue
 from moco.web import app as web_app
+from moco.web.access import AccessAuthorization
 from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import ClientControl, StartMessage
 from moco.web.pairing import mobile_operator_url, render_pairing_svg
@@ -3467,13 +3468,91 @@ def websocket_context(
 
 
 class FakeAccessVerifier:
-    def __init__(self, result: str | None = None) -> None:
+    def __init__(
+        self,
+        result: str | None = None,
+        *,
+        identity: str = "owner@example.com",
+        expires_at: float | None = None,
+    ) -> None:
         self.result = result
+        self.identity = identity
+        self.expires_at = expires_at or time.time() + 300
         self.assertions: list[list[str]] = []
 
     async def rejection_code(self, assertions: Sequence[str]) -> str | None:
         self.assertions.append(list(assertions))
         return self.result
+
+    async def authorization(
+        self,
+        assertions: Sequence[str],
+    ) -> tuple[str | None, AccessAuthorization | None]:
+        self.assertions.append(list(assertions))
+        if self.result is not None:
+            return self.result, None
+        return None, AccessAuthorization(
+            identity=self.identity,
+            expires_at=self.expires_at,
+        )
+
+
+class ExpiringLeaseConnection:
+    def __init__(self) -> None:
+        self.expired = asyncio.Event()
+        self.expire_calls = 0
+
+    async def expire(self) -> None:
+        self.expire_calls += 1
+        self.expired.set()
+
+
+@pytest.mark.asyncio
+async def test_access_lease_deadline_expires_and_cannot_be_revived() -> None:
+    authority = web_app._AccessLeaseAuthority(max_seconds=0.02)  # noqa: SLF001
+    connection = ExpiringLeaseConnection()
+    authorization = AccessAuthorization("owner@example.com", time.time() + 300)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+    assert token is not None
+    await asyncio.wait_for(connection.expired.wait(), timeout=0.5)
+
+    assert not await authority.refresh(token, authorization)
+    assert not await authority.authorized(connection)
+    assert connection.expire_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_access_lease_refresh_extends_deadline_and_release_invalidates_token() -> None:
+    authority = web_app._AccessLeaseAuthority(max_seconds=0.08)  # noqa: SLF001
+    connection = ExpiringLeaseConnection()
+    authorization = AccessAuthorization("owner@example.com", time.time() + 300)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+    assert token is not None
+    await asyncio.sleep(0.05)
+    assert await authority.refresh(token, authorization)
+    await asyncio.sleep(0.05)
+    assert await authority.authorized(connection)
+
+    await authority.release(connection)
+    assert not await authority.refresh(token, authorization)
+    assert not await authority.authorized(connection)
+    await asyncio.sleep(0.05)
+    assert connection.expire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_access_lease_is_capped_by_verified_jwt_expiry() -> None:
+    connection = ExpiringLeaseConnection()
+    authority = web_app._AccessLeaseAuthority(max_seconds=60)  # noqa: SLF001
+    authorization = AccessAuthorization("owner@example.com", time.time() + 0.02)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+
+    assert token is not None
+    await asyncio.wait_for(connection.expired.wait(), timeout=0.5)
+    assert not await authority.authorized(connection)
 
 
 async def raw_http_response(
@@ -3695,6 +3774,160 @@ def test_accepts_exact_configured_public_origin() -> None:
         assert socket.receive_json()["state"] == "ready"
         assert cast("Any", socket).accepted_subprotocol == "moco"
         assert verifier.assertions == [["assertion-one", "assertion-two"]]
+
+
+def test_public_websocket_issues_refreshable_access_lease_without_leaking_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="https://voice.example.com") as client,
+        websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["socket-assertion"],
+        ) as socket,
+    ):
+        assert socket.receive_json()["state"] == "ready"
+        lease_message = socket.receive_json()
+        token = lease_message["token"]
+        assert lease_message["type"] == "access_lease"
+        assert isinstance(token, str)
+        assert len(token) == 43
+
+        response = client.post(
+            "/auth/lease",
+            headers={
+                "host": "voice.example.com",
+                "origin": "https://voice.example.com",
+                "cf-access-jwt-assertion": "refresh-assertion",
+                "x-moco-access-lease": token,
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.content == b""
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
+        assert token not in caplog.text
+        assert token not in str(response.headers)
+
+    assert verifier.assertions == [["socket-assertion"], ["refresh-assertion"]]
+
+
+@pytest.mark.parametrize(
+    "lease_headers",
+    [
+        [],
+        [("x-moco-access-lease", "")],
+        [("x-moco-access-lease", "malformed")],
+        [("x-moco-access-lease", "x" * 129)],
+        [("x-moco-access-lease", "one"), ("x-moco-access-lease", "two")],
+    ],
+)
+def test_public_access_lease_rejects_missing_malformed_or_duplicate_header(
+    lease_headers: list[tuple[str, str]],
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = Headers(
+        [
+            ("host", "voice.example.com"),
+            ("origin", "https://voice.example.com"),
+            ("cf-access-jwt-assertion", "refresh-assertion"),
+            *lease_headers,
+        ],
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.post("/auth/lease", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "host", "origin"),
+    [
+        ("https://voice.example.com", "voice.example.com", "https://evil.example.com"),
+        ("https://voice.example.com", "voice.example.com", ""),
+        ("http://127.0.0.1:8765", "127.0.0.1:8765", "http://127.0.0.1:8765"),
+    ],
+)
+def test_access_lease_endpoint_is_exact_public_same_origin_only(
+    base_url: str,
+    host: str,
+    origin: str,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = {
+        "host": host,
+        "cf-access-jwt-assertion": "refresh-assertion",
+        "x-moco-access-lease": "x" * 43,
+    }
+    if origin:
+        headers["origin"] = origin
+
+    with TestClient(app, base_url=base_url) as client:
+        response = client.post("/auth/lease", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_public_operator_is_closed_and_unregistered_when_lease_refresh_stops() -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    app.state.access_lease_authority = web_app._AccessLeaseAuthority(  # noqa: SLF001
+        max_seconds=0.02,
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        with websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["first-assertion"],
+        ) as first:
+            assert first.receive_json()["state"] == "ready"
+            assert first.receive_json()["type"] == "access_lease"
+            first.receive_json()  # Initial voice catalog can race the deadline close.
+            with pytest.raises(WebSocketDisconnect):
+                first.receive_json()
+
+        with websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["second-assertion"],
+        ) as second:
+            assert second.receive_json()["state"] == "ready"
+
+
+def test_loopback_operator_does_not_issue_or_consult_access_lease() -> None:
+    class UnexpectedLeaseAuthority:
+        async def issue(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError
+
+    app = create_app(capability_token=CAPABILITY)
+    app.state.access_lease_authority = UnexpectedLeaseAuthority()
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        assert socket.receive_json()["state"] == "ready"
 
 
 def test_public_http_auth_status_passes_all_access_assertions_without_caching() -> None:

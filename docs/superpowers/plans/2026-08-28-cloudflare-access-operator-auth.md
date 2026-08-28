@@ -4,7 +4,7 @@
 
 **Goal:** Cloudflare Access session が有効な本人だけが、moco capability なしで固定公開 URL から operator HTTP / WebSocket を利用できるようにする。
 
-**Architecture:** 公開 Host は Cloudflare が付与する Access JWT を moco の独立した verifier で検証し、loopback Host は既存 capability を検証する。JWT verifier は strict configuration、bounded JWKS fetch、in-memory cache を所有し、FastAPI は Host / Origin に応じて二つの認証境界を明示的に分岐する。公開 browser は capability を保存・送信せず、QR と runtime mobile URL も秘密を含まない固定公開 URL にする。
+**Architecture:** 公開 Host は Cloudflare が付与する Access JWT を moco の独立した verifier で検証し、loopback Host は既存 capability を検証する。JWT verifier は strict configuration、bounded JWKS fetch、in-memory cache を所有し、FastAPI は Host / Origin に応じて二つの認証境界を明示的に分岐する。登録済み公開 WebSocket は server-enforced の最大 60 秒 connection lease を browser の Access 認証付き same-origin POST で約 20 秒ごとに更新し、logout / revoke / JWT expiry 後に既存接続を残さない。公開 browser は capability を保存・送信せず、QR と runtime mobile URL も秘密を含まない固定公開 URL にする。
 
 **Tech Stack:** Python 3.13、FastAPI / Starlette、Pydantic v2、httpx、PyJWT + cryptography、Node.js test runner / JSDOM、Cloudflare Tunnel / Access、uv / just
 
@@ -13,11 +13,11 @@
 ## 実装前提とファイル責務
 
 - `src/moco/config.py`: Cloudflare Access の非秘密設定と public URL との strict な組み合わせだけを所有する。
-- `src/moco/web/access.py`: Access assertion、JWKS 取得・cache、JWT claim 検証を所有する。FastAPI の routing や moco capability は知らない。
-- `src/moco/web/app.py`: HTTP / WebSocket の Host / Origin を分類し、公開 request は Access verifier、loopback request は capability へ委譲する。
+- `src/moco/web/access.py`: Access assertion、JWKS 取得・cache、JWT claim 検証、ASCII identity と JWT expiry の検証結果を所有する。FastAPI の routing や moco capability は知らない。
+- `src/moco/web/app.py`: HTTP / WebSocket の Host / Origin を分類し、公開 request は Access verifier、loopback request は capability へ委譲する。公開 WebSocket の opaque connection lease、更新 endpoint、server deadline、close/unregister を同一 state で所有する。
 - `src/moco/web/pairing.py`: capability を含まない公開 URL の QR だけを生成する。
 - `src/moco/cli.py`: runtime state の local owner URL と bare mobile URL を安全に直列化・検証する。
-- `src/moco/web/static/app.js`: loopback だけで capability を読み、公開 origin の旧 capability を消し、接続前に認証状態を確認する。
+- `src/moco/web/static/app.js`: loopback だけで capability を読み、公開 origin の旧 capability を消し、接続前に認証状態を確認する。公開接続では lease token を memory 内だけに保持し、約 20 秒ごとに Access 認証付き same-origin POST で更新する。
 - `tests/test_cloudflare_access.py`: JWT / JWKS 境界の unit test。実 Cloudflare や process 環境変数へ依存しない。
 - `tests/test_config.py`、`tests/test_web.py`、`tests/test_cli.py`、`tests/js/app.test.js`: 各既存境界の回帰 test。
 - `config/moco.example.yaml`、`README.md`: 新しい設定・運用契約。
@@ -1006,6 +1006,63 @@ git commit -m "fix: harden Access operator authentication"
 
 Expected: gate 修正がなければこの commit step は実行しない。
 
+### Task 6.5: Ongoing Access authorization lease security fix
+
+**Files:**
+- Modify: `src/moco/config.py`
+- Modify: `src/moco/web/access.py`
+- Modify: `src/moco/web/app.py`
+- Modify: `src/moco/web/static/app.js`
+- Test: `tests/test_config.py`
+- Test: `tests/test_cloudflare_access.py`
+- Test: `tests/test_web.py`
+- Test: `tests/js/app.test.js`
+- Modify: `docs/superpowers/specs/2026-08-28-cloudflare-access-operator-auth-design.md`
+- Modify: `docs/superpowers/plans/2026-08-28-cloudflare-access-operator-auth.md`
+
+- [ ] **Step 1: ASCII identity と verified expiry の RED test を追加する**
+
+`allowed_email` と JWT `email` の non-ASCII 値を拒否し、ASCII 大文字小文字だけを同一視する。
+verifier は認証成功時に正規化済み ASCII identity と verified JWT `exp` を返す。test は fake JWKS
+と inline settings を使い、process 環境変数へ固定値を入れない。
+
+- [ ] **Step 2: server-enforced lease の RED test を追加する**
+
+公開 WebSocket の単一オペレーター登録成功後だけ opaque 256-bit token を発行する。初回・refresh
+deadline は `min(monotonic now + 60 seconds, JWT exp remaining)`。refresh、expiry、close/release を
+同じ lock/state で直列化し、期限切れ後の復活を拒否する。refresh 停止で server が WebSocket を
+close して operator を unregister し、各 privileged message 処理直前にも deadline を確認する。
+loopback は lease authority を一切呼ばない。
+
+- [ ] **Step 3: `/auth/lease` trust boundary の RED test を追加する**
+
+設定済み public Host、exact same Origin、fresh Access JWT、同一 ASCII identity、bounded single
+`X-Moco-Access-Lease` header をすべて要求する。duplicate / malformed header、別 Origin、loopback、
+別 identity、expired token は generic no-store 403。成功は body-free no-store 204。token、JWT、email
+は URL、body、response、log、telemetry に出さず token 比較には `secrets.compare_digest` を使う。
+
+- [ ] **Step 4: browser refresh の RED test を追加する**
+
+公開 browser は WebSocket から受けた lease token を memory 内だけに保持し、約 20 秒ごとに
+same-origin credentials、manual redirect、no-store の body-free POST header で更新する。成功中は
+microphone / WebRTC / audio を変更しない。403、redirect、network error では timer を止め、現在の
+socket を閉じて `access_auth_failed` を表示する。socket close 時は timer と token を即時破棄する。
+
+- [ ] **Step 5: GREEN implementation と全 gate を確認する**
+
+Run:
+
+```bash
+uv run pytest tests/test_config.py tests/test_cloudflare_access.py tests/test_web.py -q
+npm run test:frontend
+just check
+git diff --check
+```
+
+Expected: Access/JWT/lease/browser の RED が GREEN、既存 loopback・単一オペレーター・media lifecycle
+回帰を含む全 gate PASS。Safari が background で timer を停止した場合は、安全側に約 60 秒で公開
+WebSocket が切断される契約を design と運用確認へ反映する。
+
 ### Task 7: Owner-only Cloudflare rollout and physical iPhone verification
 
 **Files:**
@@ -1136,7 +1193,8 @@ Expected: 新しい iPhone 接続に `operator_connected` と会話開始 eviden
 - [ ] **Step 8: Access logout の fail-closed を確認して再 login する**
 
 iPhone Safari で `https://moco.toarupen.org/cdn-cgi/access/logout` を一度開き、固定 URL への
-再訪が Cloudflare login を要求し、未認証 WebSocket が moco へ到達しないことを確認する。
+再訪が Cloudflare login を要求し、既存の公開 WebSocket も lease refresh を継続できず約 60 秒以内に
+moco server から切断され、未認証 WebSocket が moco へ到達しないことを確認する。
 その後 owner identity で再 login し、接続を復元する。
 
 Expected: logout 中は拒否、再 login 後は QR なしで成功。session duration は一か月のまま。

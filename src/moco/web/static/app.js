@@ -12,6 +12,8 @@ import {
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
 const CAPABILITY_STORAGE_KEY = "moco.capability";
+const ACCESS_LEASE_REFRESH_MS = 20_000;
+const ACCESS_LEASE_TOKEN_PATTERN = /^[\x21-\x7e]{1,128}$/;
 const CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
@@ -991,6 +993,60 @@ export async function probeOperatorAccess(fetch) {
   }
 }
 
+export class AccessLeaseRefresher {
+  constructor({ fetch, onFailure, timers }) {
+    this.fetch = fetch;
+    this.onFailure = onFailure;
+    this.timers = timers;
+    this.timer = undefined;
+    this.token = undefined;
+  }
+
+  start(token) {
+    this.stop();
+    if (typeof token !== "string" || !ACCESS_LEASE_TOKEN_PATTERN.test(token)) {
+      this.onFailure("access_auth_failed");
+      return;
+    }
+    this.token = token;
+    this.timer = this.timers.set(() => this.#refresh(), ACCESS_LEASE_REFRESH_MS);
+  }
+
+  stop() {
+    if (this.timer !== undefined) {
+      this.timers.clear(this.timer);
+    }
+    this.timer = undefined;
+    this.token = undefined;
+  }
+
+  async #refresh() {
+    const token = this.token;
+    if (!token) {
+      return;
+    }
+    try {
+      const response = await this.fetch("/auth/lease", {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Moco-Access-Lease": token },
+        method: "POST",
+        redirect: "manual",
+      });
+      if (
+        response.redirected === true ||
+        response.type === "opaqueredirect" ||
+        response.status !== 204
+      ) {
+        throw new Error("access lease rejected");
+      }
+    } catch {
+      this.stop();
+      this.onFailure("access_auth_failed");
+    }
+  }
+}
+
 export class PairingPanel {
   constructor({
     capability,
@@ -1329,6 +1385,20 @@ function boot() {
   let stopPeerWatch;
   let socketCloseError;
   let connectionAttemptGeneration = 0;
+  const accessLeaseRefresher = new AccessLeaseRefresher({
+    fetch: operatorFetch,
+    onFailure: (code) => {
+      if (!socket) {
+        return;
+      }
+      socketCloseError = { code, displayed: false };
+      socket.close();
+    },
+    timers: {
+      clear: (timer) => window.clearInterval(timer),
+      set: (callback, delayMs) => window.setInterval(callback, delayMs),
+    },
+  });
   const hotkeyMapper = new BrowserHotkeyMapper({
     globalHotkeysEnabled: true,
     startKey: "",
@@ -1375,6 +1445,7 @@ function boot() {
       const disconnectCode = disconnectError?.code;
       socketCloseError = undefined;
       connectionAttemptGeneration += 1;
+      accessLeaseRefresher.stop();
       setTransportOffline(dom);
       clearInterval(progressTimer);
       progressTimer = undefined;
@@ -1425,6 +1496,12 @@ function boot() {
         message = JSON.parse(event.data);
       } catch {
         operatorStatus.showError("invalid_message");
+        return;
+      }
+      if (message.type === "access_lease") {
+        if (!isLoopbackHostname(window.location.hostname) && socket === nextSocket) {
+          accessLeaseRefresher.start(message.token);
+        }
         return;
       }
       if (

@@ -8,6 +8,7 @@ import math
 import re
 import time
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Literal, cast
 
 import httpx
@@ -40,6 +41,12 @@ _JWK_EXPONENT_MAX_BYTES = 16
 _BASE64URL_PATTERN = re.compile(r"[A-Za-z0-9_-]+")
 _PRIVATE_RSA_FIELDS = frozenset({"d", "p", "q", "dp", "dq", "qi", "oth"})
 _JWT_SEGMENT_COUNT = 3
+
+
+@dataclass(frozen=True, slots=True)
+class AccessAuthorization:
+    identity: str
+    expires_at: float
 
 
 class _KeysUnavailableError(Exception):
@@ -175,6 +182,24 @@ def _valid_audience(value: object, expected: str) -> bool:
     return all(_valid_bounded_string(item, max_bytes=256) for item in value) and expected in value
 
 
+def _valid_ascii_mailbox_text(value: object) -> bool:
+    if not _valid_bounded_string(value, max_bytes=_EMAIL_MAX_BYTES):
+        return False
+    email = cast("str", value)
+    local, separator, domain = email.partition("@")
+    return (
+        email.isascii()
+        and separator == "@"
+        and bool(local)
+        and bool(domain)
+        and "@" not in domain
+        and not any(
+            not character.isprintable() or character.isspace() or character in "<>,;"
+            for character in email
+        )
+    )
+
+
 def _valid_claims(claims: Mapping[str, object], settings: CloudflareAccessSettings) -> bool:
     if claims.get("iss") != settings.team_domain or not isinstance(claims.get("iss"), str):
         return False
@@ -187,7 +212,7 @@ def _valid_claims(claims: Mapping[str, object], settings: CloudflareAccessSettin
             claims[optional_numeric_date]
         ):
             return False
-    return _valid_bounded_string(claims.get("email"), max_bytes=_EMAIL_MAX_BYTES)
+    return _valid_ascii_mailbox_text(claims.get("email"))
 
 
 def _bounded_jwk_mapping(item: Mapping[str, object]) -> bool:
@@ -268,21 +293,31 @@ class CloudflareAccessVerifier:
         self._cache_generation = 0
 
     async def rejection_code(self, assertions: Sequence[str]) -> AccessRejectionCode | None:
+        rejection_code, _authorization = await self.authorization(assertions)
+        return rejection_code
+
+    async def authorization(
+        self,
+        assertions: Sequence[str],
+    ) -> tuple[AccessRejectionCode | None, AccessAuthorization | None]:
         rejection_code, token = _extract_assertion(assertions)
         if rejection_code is not None or token is None:
-            return rejection_code
+            return rejection_code, None
         try:
             claims = await self._verified_claims(token)
         except _UnknownKeyError:
-            return "access_token_invalid"
+            return "access_token_invalid", None
         except _KeysUnavailableError:
-            return "access_keys_unavailable"
+            return "access_keys_unavailable", None
         except Exception:  # noqa: BLE001 - malformed assertions must fail closed.
-            return "access_token_invalid"
+            return "access_token_invalid", None
         email = cast("str", claims["email"])
-        if email.casefold() != self._settings.allowed_email.casefold():
-            return "access_identity_mismatch"
-        return None
+        if email.lower() != self._settings.allowed_email.lower():
+            return "access_identity_mismatch", None
+        return None, AccessAuthorization(
+            identity=email.lower(),
+            expires_at=cast("float", claims["exp"]),
+        )
 
     async def _verified_claims(self, token: str) -> Mapping[str, object]:
         kid = _preflight_token(token)

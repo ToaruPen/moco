@@ -56,7 +56,7 @@ from moco.speech.irodori import IrodoriError, IrodoriSynthesizer
 from moco.speech.plan import SpeechPlanResult, SpeechPlanStream, parse_speech_plan
 from moco.speech.queue import SpeechQueue, SpeechQueueOverflowError
 from moco.speech.text import strip_control_emojis
-from moco.web.access import AccessRejectionCode, CloudflareAccessVerifier
+from moco.web.access import AccessAuthorization, AccessRejectionCode, CloudflareAccessVerifier
 from moco.web.messages import (
     ClientControl,
     ControlMessage,
@@ -95,6 +95,9 @@ _MAX_ASSISTANT_TRANSCRIPT_BYTES = 16_384
 _MAX_ASSISTANT_TRANSCRIPT_PARTS = 256
 _MAX_TERMINAL_TURNS = 64
 _DEFAULT_DELIVERY_CAPTION_MAX_CHARS = 300
+_ACCESS_LEASE_MAX_SECONDS = 60.0
+_ACCESS_LEASE_HEADER = "x-moco-access-lease"
+_ACCESS_LEASE_TOKEN_MAX_BYTES = 128
 
 
 _CAPABILITY_MISMATCH = "capability_mismatch"
@@ -186,10 +189,145 @@ class _AsyncClosable(Protocol):
 
 
 class _AccessVerifier(Protocol):
-    async def rejection_code(
+    async def authorization(
         self,
         assertions: Sequence[str],
-    ) -> AccessRejectionCode | None: ...
+    ) -> tuple[AccessRejectionCode | None, AccessAuthorization | None]: ...
+
+
+@dataclass(slots=True)
+class _AccessLeaseRecord:
+    connection: object
+    token: str
+    identity: str
+    deadline: float
+    on_expire: Callable[[], Awaitable[None]]
+    changed: asyncio.Event
+    monitor: asyncio.Task[None] | None = None
+
+
+class _AccessLeaseAuthority:
+    def __init__(
+        self,
+        *,
+        max_seconds: float = _ACCESS_LEASE_MAX_SECONDS,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_time: Callable[[], float] = time.time,
+    ) -> None:
+        self._max_seconds = max_seconds
+        self._monotonic = monotonic
+        self._wall_time = wall_time
+        self._lock = asyncio.Lock()
+        self._active: _AccessLeaseRecord | None = None
+
+    async def issue(
+        self,
+        connection: object,
+        authorization: AccessAuthorization,
+        *,
+        on_expire: Callable[[], Awaitable[None]],
+    ) -> str | None:
+        now = self._monotonic()
+        deadline = self._deadline(now, authorization)
+        if deadline <= now:
+            return None
+        token = secrets.token_urlsafe(32)
+        async with self._lock:
+            if self._active is not None:
+                return None
+            record = _AccessLeaseRecord(
+                connection=connection,
+                token=token,
+                identity=authorization.identity,
+                deadline=deadline,
+                on_expire=on_expire,
+                changed=asyncio.Event(),
+            )
+            self._active = record
+            record.monitor = asyncio.create_task(
+                self._monitor(record),
+                name="moco-access-lease",
+            )
+        return token
+
+    async def refresh(self, token: str, authorization: AccessAuthorization) -> bool:
+        on_expire: Callable[[], Awaitable[None]] | None = None
+        async with self._lock:
+            record = self._active
+            now = self._monotonic()
+            if (
+                record is None
+                or not _valid_access_lease_token(token)
+                or not secrets.compare_digest(token, record.token)
+                or not secrets.compare_digest(authorization.identity, record.identity)
+            ):
+                return False
+            if now >= record.deadline:
+                self._active = None
+                record.changed.set()
+                on_expire = record.on_expire
+            else:
+                deadline = self._deadline(now, authorization)
+                if deadline <= now:
+                    self._active = None
+                    record.changed.set()
+                    on_expire = record.on_expire
+                else:
+                    record.deadline = deadline
+                    record.changed.set()
+                    return True
+        if on_expire is not None:
+            await on_expire()
+        return False
+
+    async def authorized(self, connection: object) -> bool:
+        on_expire: Callable[[], Awaitable[None]] | None = None
+        async with self._lock:
+            record = self._active
+            if record is None or record.connection is not connection:
+                return False
+            if self._monotonic() < record.deadline:
+                return True
+            self._active = None
+            record.changed.set()
+            on_expire = record.on_expire
+        if on_expire is not None:
+            await on_expire()
+        return False
+
+    async def release(self, connection: object) -> None:
+        monitor: asyncio.Task[None] | None = None
+        async with self._lock:
+            record = self._active
+            if record is None or record.connection is not connection:
+                return
+            self._active = None
+            record.changed.set()
+            monitor = record.monitor
+        current = asyncio.current_task()
+        if monitor is not None and monitor is not current:
+            monitor.cancel()
+            with suppress(asyncio.CancelledError):
+                await monitor
+
+    def _deadline(self, now: float, authorization: AccessAuthorization) -> float:
+        jwt_remaining = authorization.expires_at - self._wall_time()
+        return now + min(self._max_seconds, max(0.0, jwt_remaining))
+
+    async def _monitor(self, record: _AccessLeaseRecord) -> None:
+        while True:
+            async with self._lock:
+                if self._active is not record:
+                    return
+                delay = record.deadline - self._monotonic()
+                if delay <= 0:
+                    self._active = None
+                    on_expire = record.on_expire
+                    break
+                record.changed.clear()
+            with suppress(TimeoutError):
+                await asyncio.wait_for(record.changed.wait(), timeout=delay)
+        await on_expire()
 
 
 @dataclass(frozen=True, slots=True)
@@ -976,6 +1114,8 @@ class _BrowserConnection:
         self._turn_result_claimed = False
         self._terminal_speech_delivery: tuple[SpeechQueue, asyncio.Task[None]] | None = None
         self._connection_loss_task: asyncio.Task[None] | None = None
+        self._access_lease_authority: _AccessLeaseAuthority | None = None
+        self._access_lease_token: str | None = None
 
     def _init_voice_capability_state(self) -> None:
         self._voice_options: tuple[dict[str, object], ...] = ()
@@ -1019,6 +1159,10 @@ class _BrowserConnection:
             state="ready",
         )
         await self._send_state()
+        if self._access_lease_token is not None:
+            await self._send_json(
+                {"type": "access_lease", "token": self._access_lease_token},
+            )
         self._capability_task = asyncio.create_task(
             self._capability_loop(),
             name="moco-irodori-capabilities",
@@ -1027,12 +1171,25 @@ class _BrowserConnection:
         try:
             while True:
                 payload = await self._websocket.receive_text()
+                if (
+                    self._access_lease_authority is not None
+                    and not await self._access_lease_authority.authorized(self)
+                ):
+                    return
                 if not await self._handle(payload):
                     return
         except WebSocketDisconnect:
             return
         finally:
             await self.close()
+
+    def bind_access_lease(
+        self,
+        authority: _AccessLeaseAuthority,
+        token: str,
+    ) -> None:
+        self._access_lease_authority = authority
+        self._access_lease_token = token
 
     async def send_control(self, control: Control) -> None:
         await self._send_json({"type": "control", "control": control.value})
@@ -3137,6 +3294,7 @@ def create_app(  # noqa: C901, PLR0915
     app = FastAPI(title="moco", docs_url=None, redoc_url=None)
     app.state.capability_token = media_token
     app.state.control_hub = control_hub
+    app.state.access_lease_authority = _AccessLeaseAuthority()
     app.state.review_gate = review_gate
     app.state.review_broker = review_broker or reviewer_slot
     app.state.global_hotkeys_active = (
@@ -3157,6 +3315,26 @@ def create_app(  # noqa: C901, PLR0915
 
     @app.get("/auth/status", include_in_schema=False)
     async def auth_status() -> Response:
+        return Response(
+            status_code=204,
+            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+        )
+
+    @app.post("/auth/lease", include_in_schema=False)
+    async def refresh_access_lease(request: Request) -> Response:
+        authorization = getattr(request.state, "access_authorization", None)
+        lease_tokens = request.headers.getlist(_ACCESS_LEASE_HEADER)
+        if (
+            not _public_http_origin_allowed(request, resolved.server.public_url)
+            or not isinstance(authorization, AccessAuthorization)
+            or len(lease_tokens) != 1
+            or not _valid_access_lease_token(lease_tokens[0])
+            or not await app.state.access_lease_authority.refresh(
+                lease_tokens[0],
+                authorization,
+            )
+        ):
+            return _operator_http_rejection("access_lease_invalid")
         return Response(
             status_code=204,
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
@@ -3229,8 +3407,9 @@ def create_app(  # noqa: C901, PLR0915
         rejection_code: (
             AccessRejectionCode | Literal["capability_missing", "capability_mismatch"] | None
         )
+        authorization: AccessAuthorization | None = None
         if _is_public_host(host, resolved.server.public_url):
-            rejection_code = await _access_rejection_code(
+            rejection_code, authorization = await _access_authorization(
                 getattr(app.state, "access_verifier", None),
                 websocket.headers.getlist("cf-access-jwt-assertion"),
             )
@@ -3256,9 +3435,31 @@ def create_app(  # noqa: C901, PLR0915
             )
             await websocket.close(code=1008)
             return
+        lease_authority: _AccessLeaseAuthority | None = None
+        if authorization is not None:
+            lease_authority = app.state.access_lease_authority
+
+            async def expire_public_operator() -> None:
+                await control_hub.unregister(connection)
+                with suppress(RuntimeError):
+                    await websocket.close(code=1008)
+                await connection.close()
+
+            lease_token = await lease_authority.issue(
+                connection,
+                authorization,
+                on_expire=expire_public_operator,
+            )
+            if lease_token is None:
+                await control_hub.unregister(connection)
+                await websocket.close(code=1008)
+                return
+            connection.bind_access_lease(lease_authority, lease_token)
         try:
             await connection.run()
         finally:
+            if lease_authority is not None:
+                await lease_authority.release(connection)
             await control_hub.unregister(connection)
 
     return app
@@ -3295,17 +3496,19 @@ def _install_access_middleware(app: FastAPI, public_url: str | None) -> None:
             return _operator_http_rejection("operator_authority_invalid")
         if not _is_public_host(host, public_url):
             return await call_next(request)
-        rejection_code = await _access_rejection_code(
+        rejection_code, authorization = await _access_authorization(
             getattr(app.state, "access_verifier", None),
             request.headers.getlist("cf-access-jwt-assertion"),
         )
-        if rejection_code is None:
-            return await call_next(request)
-        return _operator_http_rejection(rejection_code)
+        if rejection_code is not None or authorization is None:
+            return _operator_http_rejection(rejection_code or "access_keys_unavailable")
+        request.state.access_authorization = authorization
+        return await call_next(request)
 
 
 def _operator_http_rejection(
-    rejection_code: AccessRejectionCode | Literal["operator_authority_invalid"],
+    rejection_code: AccessRejectionCode
+    | Literal["access_lease_invalid", "operator_authority_invalid"],
 ) -> JSONResponse:
     safe_event(
         logger,
@@ -3463,6 +3666,27 @@ def _is_public_host(host: str | None, public_url: str | None) -> bool:
     return bool(expected_host) and host.casefold() == expected_host.casefold()
 
 
+def _public_http_origin_allowed(request: Request, public_url: str | None) -> bool:
+    origins = request.headers.getlist("origin")
+    hosts = request.headers.getlist("host")
+    return (
+        public_url is not None
+        and len(origins) == 1
+        and origins[0] == public_url
+        and len(hosts) == 1
+        and hosts[0] == urlsplit(public_url).netloc
+    )
+
+
+def _valid_access_lease_token(value: object) -> bool:
+    if not isinstance(value, str) or not value or not value.isascii():
+        return False
+    try:
+        return len(value.encode("ascii")) <= _ACCESS_LEASE_TOKEN_MAX_BYTES
+    except UnicodeError:
+        return False
+
+
 def _single_valid_authority(values: Sequence[str]) -> str | None:
     if len(values) != 1 or _parse_authority(values[0]) is None:
         return None
@@ -3496,16 +3720,16 @@ def _safe_url_text(value: str) -> bool:
     )
 
 
-async def _access_rejection_code(
+async def _access_authorization(
     verifier: object | None,
     assertions: Sequence[str],
-) -> AccessRejectionCode | None:
+) -> tuple[AccessRejectionCode | None, AccessAuthorization | None]:
     if verifier is None:
-        return "access_keys_unavailable"
+        return "access_keys_unavailable", None
     try:
-        return await cast("_AccessVerifier", verifier).rejection_code(assertions)
+        return await cast("_AccessVerifier", verifier).authorization(assertions)
     except Exception:  # noqa: BLE001 - Access authentication must fail closed.
-        return "access_keys_unavailable"
+        return "access_keys_unavailable", None
 
 
 def _capability_rejection_code(
