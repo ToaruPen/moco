@@ -652,6 +652,14 @@ async def test_default_fetcher_has_an_absolute_streaming_deadline(
         (200, "application/json", b"not-json"),
         (200, "application/json", b'{"keys":[],"keys":[]}'),
     ],
+    ids=(
+        "redirect",
+        "non-json-content-type",
+        "oversized-body",
+        "non-object-json",
+        "malformed-json",
+        "duplicate-json-key",
+    ),
 )
 async def test_default_fetcher_rejects_unsafe_or_malformed_responses(
     private_key: rsa.RSAPrivateKey,

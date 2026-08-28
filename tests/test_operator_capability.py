@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import stat
 from pathlib import Path
 
 import pytest
@@ -9,6 +8,11 @@ import pytest
 from moco.errors import PrivateStateError
 from moco.platform import default_runtime_state_path
 from moco.runtime import operator_capability
+from moco.runtime.private_state import (
+    validate_private_runtime_directory,
+    validate_private_state_file,
+    write_private_state,
+)
 
 TOKEN_A = "A" * 43
 TOKEN_B = "B" * 43
@@ -27,7 +31,8 @@ def test_load_or_create_persists_and_reuses_owner_private_capability(
 
     assert operator_capability.load_or_create_operator_capability(path) == TOKEN_A
     assert operator_capability.load_or_create_operator_capability(path) == TOKEN_A
-    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    validate_private_runtime_directory(path.parent)
+    validate_private_state_file(path)
     assert json.loads(path.read_bytes()) == {"version": 1, "capability": TOKEN_A}
 
 
@@ -81,9 +86,7 @@ def test_existing_invalid_document_fails_closed_without_secret_in_error(
     payload: bytes,
 ) -> None:
     path = tmp_path / "runtime-private" / "operator-capability.json"
-    path.parent.mkdir(mode=0o700)
-    path.write_bytes(payload)
-    path.chmod(0o600)
+    write_private_state(path, payload)
 
     with pytest.raises(PrivateStateError) as caught:
         operator_capability.load_or_create_operator_capability(path)

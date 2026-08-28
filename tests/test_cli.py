@@ -22,6 +22,7 @@ from moco.doctor import DoctorCheck
 from moco.errors import PrivateStateError
 from moco.runtime.private_state import (
     PrivateStateIdentity,
+    write_private_state,
 )
 from moco.service.launchd import LaunchdError, ServiceStatus
 
@@ -121,13 +122,11 @@ def test_operator_rotate_removes_capability_only_under_runtime_lease(
 ) -> None:
     state_path = tmp_path / "runtime-private" / "runtime.json"
     capability_path = state_path.with_name("operator-capability.json")
-    capability_path.parent.mkdir(mode=0o700)
     capability_value = "A" * 43
-    capability_path.write_text(
-        json.dumps({"version": 1, "capability": capability_value}),
-        encoding="utf-8",
+    write_private_state(
+        capability_path,
+        json.dumps({"version": 1, "capability": capability_value}).encode(),
     )
-    capability_path.chmod(0o600)
     monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
 
     result = runner.invoke(app, ["operator", "rotate"])
