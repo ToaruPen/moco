@@ -3720,12 +3720,28 @@ def test_create_app_constructs_access_verifier_only_when_configured(
         "access_keys_unavailable",
     ],
 )
-def test_public_websocket_rejects_access_even_with_correct_capability(
+def test_public_websocket_access_rejection_logs_only_stable_code(
     result: str,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    assertion_value = "assertion-log-sentinel.private.jwt"
+    capability_value = "capability-log-sentinel"
+    access_settings = CloudflareAccessSettings(
+        team_domain="https://team-log-sentinel.cloudflareaccess.com",
+        audience="audience-log-sentinel",
+        allowed_email="owner-log-sentinel@example.com",
+    )
     verifier = FakeAccessVerifier(result)
-    app = public_app(verifier)
+    app = create_app(
+        MocoSettings(
+            server=ServerSettings(
+                public_url="https://voice.example.com",
+                cloudflare_access=access_settings,
+            ),
+        ),
+        capability_token=capability_value,
+    )
+    app.state.access_verifier = verifier
     caplog.set_level(logging.INFO, logger=web_app.logger.name)
 
     with (
@@ -3733,15 +3749,23 @@ def test_public_websocket_rejects_access_even_with_correct_capability(
         pytest.raises(WebSocketDisconnect),
         websocket_context(
             client,
-            capability=CAPABILITY,
+            capability=capability_value,
             origin="https://voice.example.com",
             host="voice.example.com",
+            access_assertions=[assertion_value],
         ),
     ):
         pass
 
-    assert verifier.assertions == [[]]
+    assert verifier.assertions == [[assertion_value]]
+    assert "event=operator_websocket_rejected" in caplog.text
     assert f"event_code={result}" in caplog.text
+    assert assertion_value not in caplog.text
+    assert access_settings.allowed_email not in caplog.text
+    assert access_settings.audience not in caplog.text
+    assert access_settings.team_domain not in caplog.text
+    assert capability_value not in caplog.text
+    assert "moco.capability." not in caplog.text
 
 
 def test_loopback_websocket_access_cannot_replace_missing_capability(
