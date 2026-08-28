@@ -11,6 +11,20 @@ from pathlib import Path
 import yaml
 
 ROOT = Path(__file__).parents[1]
+AGENT_PROFILES = {
+    "read_only",
+    "workspace_write",
+    "danger_full_access_no_approval",
+    "inherit_codex",
+}
+
+
+def _compact_prose(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def _assert_exact_profile_set(text: str) -> None:
+    assert set(re.findall(r"`([a-z_]+)`", text)) == AGENT_PROFILES
 
 
 def test_global_test_fixtures_do_not_disable_windows_config_acl_validation() -> None:
@@ -90,6 +104,7 @@ def test_readme_documents_golden_path_and_browser_boundary() -> None:
         "foreground",
         "read_only",
         "workspace_write",
+        "danger_full_access_no_approval",
         "inherit_codex",
         "moco review",
     ]:
@@ -141,6 +156,7 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
         "foreground",
         "read_only",
         "workspace_write",
+        "danger_full_access_no_approval",
         "inherit_codex",
         "moco review",
         "ローカル",
@@ -148,6 +164,40 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
         "fail-closed",
     ]:
         assert boundary in stage_b
+    compact_stage_b = _compact_prose(stage_b)
+    profile_choice = compact_stage_b.split("Agentprofile", maxsplit=1)[1].split(
+        "公開画面", maxsplit=1
+    )[0]
+    _assert_exact_profile_set(profile_choice)
+    assert "4種類" in profile_choice
+    for safety_clause in [
+        "Agentprofileはowner-privateなローカル設定ファイルの`agent.profile`だけで選びます。",
+        (
+            "公開画面、音声、hotkey、通常のoperatorWebSocketからprofileを選択・変更することは"
+            "できません。"
+        ),
+        (
+            "`inherit_codex`では、有効policyを確認できない場合、または継承したpolicyが"
+            "`danger-full-access`とapprovalpolicy`never`の組み合わせになる場合、"
+            "音声からCodex作業を開始しません。"
+        ),
+        (
+            "`danger_full_access_no_approval`は`danger-full-access`とapprovalpolicy`never`を"
+            "明示します。"
+        ),
+        ("各ホストでmocoを実行するユーザーアカウントがアクセスできる全ファイルを読み書き"),
+        "コマンドを実行し、ネットワークを利用できます。",
+        "資格情報の露出・外部送信",
+        "破壊的コマンドによるデータ削除",
+        "外部への書き込み",
+        "永続化につながる高リスク設定です。",
+    ]:
+        assert safety_clause in compact_stage_b
+    assert re.search(
+        r"停止するにはowner-privateなローカル設定で`read_only`または`workspace_write`へ戻し、"
+        r"mocoを再起動します。",
+        compact_stage_b,
+    )
 
     interaction = readme.split("### Codex作業、取消、再接続", maxsplit=1)[1].split(
         "### GPTの応答スタイルを変更する", maxsplit=1
@@ -192,8 +242,52 @@ def test_readme_documents_stage_b_interaction_and_privacy_boundaries() -> None:
     assert "コマンド、cwd、path、change kind、move target" in privacy
 
 
+def test_authoritative_specs_document_each_four_profile_contract() -> None:
+    specs = ROOT / "docs" / "superpowers" / "specs"
+    rich_agent = _compact_prose(
+        (specs / "2026-08-07-codex-rich-agent-client-design.md").read_text(encoding="utf-8")
+    )
+    rich_profiles = rich_agent.split("mocoのAgentprofilemodeは", maxsplit=1)[1].split(
+        "profilemodeの変更", maxsplit=1
+    )[0]
+    assert "次の四つに限定する。" in rich_profiles
+    _assert_exact_profile_set(rich_profiles)
+    assert re.search(
+        r"`danger_full_access_no_approval`:[^。]+`danger-full-access`と"
+        r"`approvalPolicy=never`[^。]+。",
+        rich_profiles,
+    )
+    assert "`inherit_codex`だけがglobaleffectivepolicyを継承する。" in rich_agent
+    assert re.search(
+        r"`inherit_codex`で[^。]+`danger-full-access`かつ`approvalPolicy=never`[^。]+拒否する。",
+        rich_agent,
+    )
+
+    profile_aware = _compact_prose(
+        (specs / "2026-08-17-profile-aware-agent-admission-design.md").read_text(encoding="utf-8")
+    )
+    profile_aware_set = re.search(r"Agentprofileは.+?四つに限定する。", profile_aware)
+    assert profile_aware_set is not None
+    _assert_exact_profile_set(profile_aware_set.group())
+    assert (
+        "`danger_full_access_no_approval`:`sandbox:danger-full-access`、"
+        "`approvalPolicy:never`を送る。" in profile_aware
+    )
+    assert re.search(
+        r"`inherit_codex`はglobalpolicy[^。]+`danger-full-access\+never`[^。]+拒否する。",
+        profile_aware,
+    )
+
+    approved_design_link = (
+        "[DangerFullAccessNoApprovalDesign](2026-08-28-danger-full-access-no-approval-design.md)"
+    )
+    assert approved_design_link in rich_agent
+    assert approved_design_link in profile_aware
+
+
 def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    security = (ROOT / "SECURITY.md").read_text(encoding="utf-8")
     browser = readme.split("## 何が常駐するのか", maxsplit=1)[1].split("## 必要なもの", maxsplit=1)[
         0
     ]
@@ -205,8 +299,72 @@ def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> N
     mobile = readme.split("## スマートフォンから使う", maxsplit=1)[1].split(
         "## Irodori の接続先", maxsplit=1
     )[0]
+    for required in [
+        "operator-capability.json",
+        "localStorage",
+        "moco operator rotate",
+        "owner-private",
+    ]:
+        assert required in mobile
+        assert required in security
     assert "runtime.json" in mobile
-    assert "唯一のファイル" in mobile
+    assert "daemon を再起動すると古い QR は無効" not in mobile
+
+
+def test_security_docs_distinguish_public_access_from_loopback_capability() -> None:
+    security = _compact_prose((ROOT / "SECURITY.md").read_text(encoding="utf-8"))
+    persistent_design = _compact_prose(
+        (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-27-persistent-operator-capability-design.md"
+        ).read_text(encoding="utf-8")
+    )
+    danger_design = _compact_prose(
+        (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-28-danger-full-access-no-approval-design.md"
+        ).read_text(encoding="utf-8")
+    )
+
+    for contract in [
+        (
+            "公開経路では、CloudflareAccessidentityだけをオペレーター認証に使い、"
+            "mococapabilityをURL、browserstorage、WebSocketへ渡しません。"
+        ),
+        (
+            "loopback経路では、persistentoperatorcapabilityをowner-privateな"
+            "`operator-capability.json`と同一originの`localStorage`へ永続化し、"
+            "WebSocketsubprotocolで渡します。"
+        ),
+        ("公開URLとスマートフォン用QRは変わらず、再登録は不要です。"),
+    ]:
+        assert contract in security
+
+    assert (
+        "公開operatorendpointはCloudflareAccessidentityだけで利用者を認証する。"
+        "persistentoperatorcapabilityはloopbackoperatorendpointだけを保護する。"
+    ) in danger_design
+    assert (
+        "iPhoneはCloudflareAccessidentityの検証を通過してoperatorWebSocketへ接続する。"
+    ) in danger_design
+    assert "iPhoneはCloudflareAccessとoperatorcapabilityを通過" not in danger_design
+
+    assert (
+        "persistentoperatorcapabilityはloopbackoperatorendpointだけの認証境界とする。"
+        "公開operatorendpointの認証は後続のCloudflareAccess設計へ移管する。"
+    ) in persistent_design
+    assert (
+        "公開hostではCloudflareAccessidentityだけを検証し、loopbackhostでは正しい"
+        "mococapabilityを要求する。"
+    ) in persistent_design
+    assert "公開hostnameに対する独立したdefense-in-depth" not in persistent_design
+    assert "CloudflareAccessを通過しても正しいmococapability" not in persistent_design
 
 
 def test_readme_documents_stage_b_verification_without_claiming_live_acceptance() -> None:
@@ -270,10 +428,11 @@ def test_readme_documents_current_codex_requirements_and_doctor_codes() -> None:
         "## 最短の起動手順", maxsplit=1
     )[0]
     assert (
-        "`read_only` と `workspace_write` は global Codex policy を admission 条件にしません"
-        in stage_b
+        "`read_only`、`workspace_write`、`danger_full_access_no_approval` は global Codex policy "
+        "を admission 条件にしません" in stage_b
     )
     assert "`inherit_codex` だけが global Codex policy を継承します" in stage_b
+    assert "`danger-full-access` と approval policy `never`" in stage_b
 
     hotkeys_row = next(line for line in doctor.splitlines() if "`hotkeys`" in line)
     assert "macOS Input Monitoring" in hotkeys_row
@@ -409,3 +568,4 @@ def test_local_configuration_and_state_are_not_tracked() -> None:
 
     assert "config/moco.yaml" not in tracked
     assert not any(path.endswith("runtime.json") for path in tracked)
+    assert not any(path.endswith("operator-capability.json") for path in tracked)

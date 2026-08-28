@@ -4,7 +4,7 @@ import json
 import os
 import sys
 from collections.abc import Callable, Iterator
-from contextlib import contextmanager
+from contextlib import AbstractContextManager, contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 from typing import cast
@@ -16,12 +16,13 @@ from typer.testing import CliRunner
 
 from moco import cli
 from moco import config as config_module
-from moco.cli import _is_safe_operator_url, _run_runtime, app
+from moco.cli import _is_safe_mobile_url, _is_safe_operator_url, _run_runtime, app
 from moco.config import MocoSettings, load_config
 from moco.doctor import DoctorCheck
 from moco.errors import PrivateStateError
 from moco.runtime.private_state import (
     PrivateStateIdentity,
+    write_private_state,
 )
 from moco.service.launchd import LaunchdError, ServiceStatus
 
@@ -105,11 +106,57 @@ def test_config_validate_and_public_command_surface(tmp_path: Path) -> None:
 
     result = runner.invoke(app, ["config", "validate", "--path", str(path)])
     help_result = runner.invoke(app, ["--help"])
+    operator_help = runner.invoke(app, ["operator", "--help"])
 
     assert result.exit_code == 0
     assert "valid" in result.output
-    for command in ["config", "doctor", "run", "open", "service"]:
+    for command in ["config", "doctor", "run", "open", "operator", "service"]:
         assert command in help_result.output
+    assert operator_help.exit_code == 0
+    assert "rotate" in operator_help.output
+
+
+def test_operator_rotate_removes_capability_only_under_runtime_lease(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+    capability_path = state_path.with_name("operator-capability.json")
+    capability_value = "A" * 43
+    write_private_state(
+        capability_path,
+        json.dumps({"version": 1, "capability": capability_value}).encode(),
+    )
+    monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
+
+    result = runner.invoke(app, ["operator", "rotate"])
+
+    assert result.exit_code == 0
+    assert result.output == "operator capability will rotate on next start\n"
+    assert not capability_path.exists()
+    assert capability_value not in result.output
+
+
+def test_operator_rotate_refuses_to_change_state_while_runtime_is_active(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+    removed: list[Path] = []
+    monkeypatch.setattr(cli, "default_runtime_state_path", lambda: state_path)
+
+    def reject_lease(_path: Path) -> AbstractContextManager[None]:
+        message = "runtime lease is already held"
+        raise PrivateStateError(message)
+
+    monkeypatch.setattr(cli, "hold_private_runtime_lease", reject_lease)
+    monkeypatch.setattr(cli, "rotate_operator_capability", removed.append, raising=False)
+
+    result = runner.invoke(app, ["operator", "rotate"])
+
+    assert result.exit_code == 1
+    assert result.output == "ERROR [operator_capability]: stop moco before rotating\n"
+    assert removed == []
 
 
 def test_open_delegates_to_platform_browser_without_printing_capability(
@@ -122,7 +169,7 @@ def test_open_delegates_to_platform_browser_without_printing_capability(
         {
             "version": 1,
             "url": f"http://127.0.0.1:8765/#{capability_value}",
-            "mobile_url": f"https://voice.example.com/#{capability_value}",
+            "mobile_url": "https://voice.example.com",
             "control_secret": "private-control-secret",
         }
     ).encode()
@@ -197,6 +244,54 @@ def test_config_validate_reports_invalid_yaml(tmp_path: Path) -> None:
 )
 def test_operator_url_validation_rejects_unsafe_urls(url: str) -> None:
     assert not _is_safe_operator_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://voice.example.com",
+        "https://xn--bcher-kva.example",
+        "https://xn--fa-hia.example",
+        "https://xn--strae-oqa.example",
+    ],
+)
+def test_mobile_url_validation_accepts_bare_public_url(url: str) -> None:
+    assert _is_safe_mobile_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://voice.example.com#",
+        "https://voice.example.com/#token",
+        "https://voice.example.com#token",
+        "https://voice.example.com?",
+        "https://voice.example.com?mode=mobile",
+        "https://voice.example.com:",
+        "https://voice.example.com:443",
+        "https://voice.example.com/path",
+        "https://voice.example.com/",
+        "https://user@voice.example.com",
+        "https://localhost",
+        "https://127.0.0.1",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://127.0.0.01",
+        "https://1.2",
+        "https://0x7f.1",
+        "https://0177.1",
+        "https://2130706433",
+        "https://127..1",
+        "https://1.4294967296",
+        "https://xn--a.com",
+        "https://faß.example",
+        "https://straße.example",
+        "https://K.example",
+        "https://ſ.example",
+    ],
+)
+def test_mobile_url_validation_rejects_non_bare_public_urls(url: str) -> None:
+    assert not _is_safe_mobile_url(url)
 
 
 @pytest.mark.parametrize(
@@ -622,7 +717,14 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     settings = MocoSettings.model_validate(
         {
             "hotkeys": {"enabled": False},
-            "server": {"public_url": "https://voice.example.com"},
+            "server": {
+                "public_url": "https://voice.example.com",
+                "cloudflare_access": {
+                    "team_domain": "https://example-team.cloudflareaccess.com",
+                    "audience": "audience_123-ABC",
+                    "allowed_email": "owner@example.com",
+                },
+            },
         },
     )
     await _run_runtime(settings, state_path=state_path)
@@ -631,12 +733,49 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     local_url = cast("str", removed_payloads[0]["url"])
     mobile_url = cast("str", removed_payloads[0]["mobile_url"])
     assert local_url.startswith("http://127.0.0.1:")
-    assert mobile_url.startswith("https://voice.example.com/#")
-    assert local_url.split("#", 1)[1] == mobile_url.split("#", 1)[1]
+    assert mobile_url == "https://voice.example.com"
+    assert "#" not in mobile_url
+    assert local_url.split("#", 1)[1] not in mobile_url
     assert _is_safe_operator_url(local_url)
     assert telemetry.closed
     assert listener.stopped
     assert state_path not in contents
+
+
+async def test_runtime_reuses_operator_capability_but_rotates_control_secret(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[tuple[str, str]] = []
+    operator_app = SimpleNamespace(
+        state=SimpleNamespace(
+            control_hub=SimpleNamespace(publish=lambda _control: None),
+        ),
+    )
+
+    def create(
+        _settings: MocoSettings,
+        *,
+        capability_token: str,
+        control_secret: str,
+    ) -> SimpleNamespace:
+        observed.append((capability_token, control_secret))
+        return operator_app
+
+    monkeypatch.setattr(cli, "create_app", create)
+    monkeypatch.setattr(cli, "configure_telemetry", lambda _settings: FakeTelemetry())
+    monkeypatch.setattr(cli, "GlobalHotkeyListener", FakeHotkeyListener)
+    monkeypatch.setattr(uvicorn, "Config", lambda *_args, **_kwargs: object())
+    monkeypatch.setattr(uvicorn, "Server", lambda _config: FakeServer())
+    state_path = tmp_path / "runtime-private" / "runtime.json"
+
+    await _run_runtime(MocoSettings(), state_path=state_path)
+    await _run_runtime(MocoSettings(), state_path=state_path)
+
+    assert observed[0][0] == observed[1][0]
+    assert observed[0][1] != observed[1][1]
+    assert not state_path.exists()
+    assert state_path.with_name("operator-capability.json").exists()
 
 
 async def test_runtime_holds_exclusive_lease_across_state_publication(

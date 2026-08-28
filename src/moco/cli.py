@@ -18,6 +18,7 @@ from moco.config import (
     ConfigError,
     MocoSettings,
     canonical_browser_loopback_host,
+    canonical_public_https_origin,
     default_config_path,
     load_config,
     write_config,
@@ -31,6 +32,11 @@ from moco.platform import (
     service_supported,
 )
 from moco.runtime.hotkeys import GlobalHotkeyListener, HotkeyMapper
+from moco.runtime.operator_capability import (
+    load_or_create_operator_capability,
+    operator_capability_path,
+    rotate_operator_capability,
+)
 from moco.runtime.private_state import (
     PrivateStateIdentity,
     hold_private_runtime_lease,
@@ -57,7 +63,9 @@ if TYPE_CHECKING:
 app = typer.Typer(no_args_is_help=True, help="moco local voice agent")
 config_app = typer.Typer(no_args_is_help=True, help="Manage strict YAML configuration.")
 service_app = typer.Typer(no_args_is_help=True, help="Manage the user launchd service.")
+operator_app = typer.Typer(no_args_is_help=True, help="Manage operator access.")
 app.add_typer(config_app, name="config")
+app.add_typer(operator_app, name="operator")
 app.add_typer(service_app, name="service")
 
 
@@ -199,6 +207,19 @@ def review_command() -> None:
     typer.echo("review page opened")
 
 
+@operator_app.command("rotate")
+def operator_rotate_command() -> None:
+    """Invalidate the persistent operator capability while moco is stopped."""
+    state_path = default_runtime_state_path()
+    try:
+        with hold_private_runtime_lease(state_path):
+            rotate_operator_capability(operator_capability_path(state_path))
+    except PrivateStateError as error:
+        typer.echo("ERROR [operator_capability]: stop moco before rotating")
+        raise typer.Exit(code=1) from error
+    typer.echo("operator capability will rotate on next start")
+
+
 @service_app.command("install")
 def service_install_command(
     *,
@@ -269,12 +290,23 @@ def service_uninstall_command(
 
 async def _run_runtime(settings: MocoSettings, *, state_path: Path) -> None:
     with hold_private_runtime_lease(state_path):
-        await _run_owned_runtime(settings, state_path=state_path)
+        capability_value = load_or_create_operator_capability(
+            operator_capability_path(state_path),
+        )
+        await _run_owned_runtime(
+            settings,
+            state_path=state_path,
+            capability_value=capability_value,
+        )
 
 
-async def _run_owned_runtime(settings: MocoSettings, *, state_path: Path) -> None:
+async def _run_owned_runtime(
+    settings: MocoSettings,
+    *,
+    state_path: Path,
+    capability_value: str,
+) -> None:
     telemetry = configure_telemetry(settings.telemetry)
-    capability_value = secrets.token_urlsafe(32)
     control_secret = secrets.token_urlsafe(32)
     operator_app = create_app(
         settings,
@@ -368,21 +400,7 @@ def _is_numeric_loopback_host(hostname: str | None) -> bool:
 
 
 def _is_safe_mobile_url(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname is not None
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path in {"", "/"}
-        and bool(parsed.fragment)
-        and not parsed.query
-        and port is None
-    )
+    return canonical_public_https_origin(url) == url
 
 
 def _raise_review_unavailable() -> NoReturn:
@@ -405,7 +423,7 @@ def _runtime_state_payload(
         "control_secret": control_secret,
     }
     if settings.server.public_url is not None:
-        payload["mobile_url"] = mobile_operator_url(settings.server.public_url, capability)
+        payload["mobile_url"] = mobile_operator_url(settings.server.public_url)
     return payload
 
 

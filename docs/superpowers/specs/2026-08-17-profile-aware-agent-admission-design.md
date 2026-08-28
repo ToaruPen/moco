@@ -2,13 +2,15 @@
 
 ## 背景
 
-moco は Codex の有効設定から sandbox と approval policy を読み取り、`danger-full-access`
-と `never` の組み合わせを音声 Agent turn の開始前に拒否している。この判定は安全側だが、
+moco の `inherit_codex` は Codex の有効設定から sandbox と approval policy を読み取り、
+`danger-full-access` と `never` の組み合わせを音声 Agent turn の開始前に拒否する。この判定は安全側だが、
 `agent.profile: read_only` や `workspace_write` が thread 作成時に明示する policy まで、global
 Codex policy によって止めてしまう。
 
-明示 profile の実行条件は global policy では決まらない。`read_only` は `read-only` と
-`never`、`workspace_write` は `workspace-write` と `on-request` を `thread/start` へ渡す。
+Agent profile は `read_only`、`workspace_write`、`danger_full_access_no_approval`、`inherit_codex` の
+四つに限定する。明示 profile の実行条件は global policy では決まらない。`read_only` は `read-only` と
+`never`、`workspace_write` は `workspace-write` と `on-request`、`danger_full_access_no_approval` は
+`danger-full-access` と `never` を `thread/start` へ渡す。
 global policy を継承するのは `inherit_codex` だけである。
 
 ## 決定
@@ -19,7 +21,7 @@ Agent admission を二つの責務に分ける。
    category など、profile に依存しない実行準備を判定する。
 2. Agent session と doctor は、選択された profile の境界で policy を判定する。
 
-`read_only` と `workspace_write` は global Codex policy を admission 条件にしない。
+`read_only`、`workspace_write`、`danger_full_access_no_approval` は global Codex policy を admission 条件にしない。
 `inherit_codex` は global policy をそのまま使うため、policy が取得できない場合と
 `danger-full-access + never` の場合を引き続き拒否する。
 
@@ -33,6 +35,7 @@ Agent session は turn 開始前に profile を確認する。
 
 - `read_only`: `sandbox: read-only`、`approvalPolicy: never` を送る。
 - `workspace_write`: `sandbox: workspace-write`、`approvalPolicy: on-request` を送る。
+- `danger_full_access_no_approval`: `sandbox: danger-full-access`、`approvalPolicy: never` を送る。
 - `inherit_codex`: sandbox と approval policy を送らず、観測済み global policy を検査する。
 
 `inherit_codex` で policy が不明または危険な組み合わせなら、既存の安定した admission error
@@ -44,7 +47,8 @@ Agent session は turn 開始前に profile を確認する。
 `codex_policy` は global Codex policy の観測結果として表示を残す。これは診断情報であり、
 明示 profile の admission 結果を決めない。
 
-`codex_agent_admission` は選択 profile を反映する。`read_only` と `workspace_write` では、
+`codex_agent_admission` は選択 profile を反映する。`read_only`、`workspace_write`、
+`danger_full_access_no_approval` では、
 profile 非依存の準備が整っていれば available とする。`inherit_codex` では global policy を
 加味し、`danger-full-access + never` を `unsafe_voice_policy` として報告する。
 
@@ -56,8 +60,9 @@ profile 非依存の準備が整っていれば available とする。`inherit_c
   回帰テストで固定する。
 - README の policy 説明を profile-aware な契約へ更新する。
 
-Codex の global config、moco の `codex.command`、sandbox 名、approval policy 名は変更しない。
-`danger-full-access` を moco の明示 profile として追加しない。
+Codex の global config、moco の `codex.command`、既存 profile の sandbox 名と approval policy 名は変更しない。
+専用 explicit profile の詳細は
+[Danger Full Access No Approval Design](2026-08-28-danger-full-access-no-approval-design.md)で定める。
 
 ## 検証
 
@@ -65,7 +70,7 @@ Codex の global config、moco の `codex.command`、sandbox 名、approval poli
 
 - Capability discovery は global policy が `danger-full-access + never` でも、他の準備が揃えば
   profile 非依存 admission を available とする。
-- Doctor は `read_only` と `workspace_write` で global unsafe policy を情報として表示しつつ、
+- Doctor は `read_only`、`workspace_write`、`danger_full_access_no_approval` で global unsafe policy を情報として表示しつつ、
   Agent admission を available とする。
 - Doctor は `inherit_codex` で同じ policy を `unsafe_voice_policy` として拒否する。
 - Agent session は明示 profile の policy を `thread/start` に送り、`inherit_codex` だけ global

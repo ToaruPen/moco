@@ -673,6 +673,33 @@ async def test_starts_realtime_thread_with_workspace_write_profile(tmp_path: Pat
     await session.close()
 
 
+async def test_starts_realtime_thread_with_danger_full_access_no_approval_profile(
+    tmp_path: Path,
+) -> None:
+    rpc = FakeRpc()
+    settings = make_settings(tmp_path).model_copy(
+        update={"agent": AgentSettings(profile=AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL)}
+    )
+    session = make_session(
+        rpc,
+        settings=settings,
+        capabilities=make_snapshot(),
+    )
+
+    await session.start("offer-sdp")
+
+    assert rpc.requests[0] == (
+        "thread/start",
+        {
+            "ephemeral": True,
+            "sandbox": "danger-full-access",
+            "approvalPolicy": "never",
+            "cwd": str(tmp_path),
+        },
+    )
+    await session.close()
+
+
 async def test_starts_realtime_thread_with_inherited_codex_profile(tmp_path: Path) -> None:
     rpc = FakeRpc()
     settings = make_settings(tmp_path).model_copy(
@@ -691,6 +718,41 @@ async def test_starts_realtime_thread_with_inherited_codex_profile(tmp_path: Pat
         {"ephemeral": True, "cwd": str(tmp_path)},
     )
     await session.close()
+
+
+async def test_rejects_unknown_realtime_profile_before_thread_start(tmp_path: Path) -> None:
+    unsafe_agent = AgentSettings.model_construct(profile="future_profile")
+    settings = make_settings(tmp_path).model_copy(update={"agent": unsafe_agent})
+    rpc = FakeRpc()
+    session = make_session(
+        rpc,
+        settings=settings,
+        capabilities=make_snapshot(),
+    )
+
+    with pytest.raises(CodexRpcError, match="Codex Realtime agent profile is invalid"):
+        await session.start("offer-sdp")
+
+    assert rpc.requests == []
+
+
+async def test_rejects_unknown_realtime_profile_before_reusing_thread(tmp_path: Path) -> None:
+    unsafe_agent = AgentSettings.model_construct(profile="future_profile")
+    settings = make_settings(tmp_path).model_copy(update={"agent": unsafe_agent})
+    event_log: list[str] = []
+    rpc = FakeRpc(event_log)
+    session = make_session(
+        rpc,
+        settings=settings,
+        capabilities=make_snapshot(),
+        existing_thread_id="thr_existing",
+    )
+
+    with pytest.raises(CodexRpcError, match="Codex Realtime agent profile is invalid"):
+        await session.start("offer-sdp")
+
+    assert event_log == []
+    assert rpc.requests == []
 
 
 async def test_reoffer_reuses_existing_realtime_thread_without_starting_another(

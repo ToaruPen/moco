@@ -984,6 +984,11 @@ async def test_turn_outcome_code_maps_connection_loss_to_unknown_without_payload
     [
         (AgentProfileMode.READ_ONLY, "read-only", "never"),
         (AgentProfileMode.WORKSPACE_WRITE, "workspace-write", "on-request"),
+        (
+            AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL,
+            "danger-full-access",
+            "never",
+        ),
     ],
 )
 async def test_thread_start_uses_explicit_profile_policy(

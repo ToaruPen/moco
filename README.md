@@ -65,12 +65,22 @@ Windows で `moco service` を実行すると `unsupported_platform` になり�
 `uv run moco run` による foreground 実行です。ブラウザのマイク許可とグローバルホットキーの
 利用可否は、対話デスクトップ上で利用者が確認してください。
 
-Agent profile は設定ファイルの `agent.profile` で選びます。既定の `read_only`、明示的な
-`workspace_write`、Codex の有効設定を上書きしない `inherit_codex` の3種類です。音声や
-公開画面から profile は変更できません。`read_only` と `workspace_write` は global Codex policy を admission 条件にしません。
-`read_only` と `workspace_write` は sandbox と approval policy を thread 作成時に明示します。`inherit_codex` だけが global Codex policy を継承します。
-この profile で有効 policy を確認できない場合、または `danger-full-access` と approval policy
-`never` の組み合わせになる場合は、音声からCodex作業を開始しません。承認が発生し得る依頼を始める前に、
+Agent profile は owner-private なローカル設定ファイルの `agent.profile` だけで選びます。既定の
+`read_only`、明示的な `workspace_write`、専用の `danger_full_access_no_approval`、Codex の有効設定を
+上書きしない `inherit_codex` の4種類です。公開画面、音声、hotkey、通常の operator WebSocket から
+profile を選択・変更することはできません。`read_only`、`workspace_write`、`danger_full_access_no_approval` は global Codex policy を admission 条件にしません。
+これらの明示 profile は sandbox と approval policy を thread 作成時に指定し、`inherit_codex` だけが global Codex policy を継承します。
+`inherit_codex` では、有効 policy を確認できない場合、または継承した policy が
+`danger-full-access` と approval policy `never` の組み合わせになる場合、音声から Codex 作業を開始しません。
+
+`danger_full_access_no_approval` は `danger-full-access` と approval policy `never` を明示します。
+これは sandbox なし・承認なしで、各ホストで moco を実行するユーザーアカウントがアクセスできる
+全ファイルを読み書きし、コマンドを実行し、ネットワークを利用できます。資格情報の露出・外部送信、
+破壊的コマンドによるデータ削除、外部への書き込み、launchd、Windows の自動起動設定、shell 設定などの
+永続化につながる高リスク設定です。
+停止するには owner-private なローカル設定で `read_only` または `workspace_write` へ戻し、moco を再起動します。
+
+承認が発生し得る依頼を始める前に、
 同じホストの別ターミナルで `uv run moco review` を実行してローカル Reviewer を接続します。
 Reviewer が未接続のまま承認要求を受けると fail-closed になります。公開画面は待機状態と
 turn 全体の取消だけを扱い、操作詳細の閲覧や decision はできません。音声の「はい」も承認に
@@ -92,9 +102,8 @@ uv run moco run
 `%APPDATA%\moco\moco.yaml` に作成されます。Windowsでは設定の`codex.command`が実行境界になるため、
 新規directoryとfileをcurrent user、SYSTEM、Administratorsだけのprotected DACLで作成します。既存pathの
 owner、DACL、reparse pointが安全でなければ、自動修復せず設定の作成・読み込みを拒否します。
-別のターミナルで次を実行すると、実行中
-プロセスだけが知る capability を使って操作ページが開きます。capability はターミナルへ
-表示されません。
+別のターミナルで次を実行すると、owner-private に保存した capability を使って操作ページが
+開きます。capability はターミナルへ表示されません。
 
 ```bash
 uv run moco open
@@ -229,27 +238,50 @@ loopback origin へ接続します。スマートフォン側に Tailscale ア�
 同じ hostname を self-hosted Access application として登録し、利用者本人だけを allow
 してください。bypass policy や Access を通らない予備 hostname は作りません。
 
-moco の設定には固定 hostname だけを追加します。Tunnel token、credentials file、Access
-identity はこの YAML に書きません。
+moco の設定には固定 hostname と、その hostname を保護する Access application の設定を必ず
+一緒に追加します。`team_domain` は Cloudflare Zero Trust の team domain、`audience` は
+Access application の AUD tag、`allowed_email` は許可する本人のメールアドレスです。いずれも
+検証用の非 secret 値であり、Tunnel token、credentials file、Access session はこの YAML に
+書きません。
 
 ```yaml
 server:
   host: 127.0.0.1
   port: 8765
   public_url: https://voice.example.com
+  cloudflare_access:
+    team_domain: https://example-team.cloudflareaccess.com
+    audience: example-access-application-aud
+    allowed_email: owner@example.com
 ```
+
+Access policy の session duration は必要に応じて1か月にできます。期間が満了した場合や
+Cloudflare 側で session が失効した場合は、本人確認を行って再ログインします。
 
 `cloudflared` はリポジトリ外のユーザー LaunchAgent
 `dev.toarupen.moco-cloudflared` として常駐させます。Tunnel ingress は上記 hostname だけを
-loopback origin へ送り、最後を `http_status:404` の catch-all にしてください。moco と
-Tunnel は独立したサービスです。片方が停止しても別経路へ切り替えず、`doctor` が部分失敗を
-そのまま報告します。
+loopback origin へ送り、最後を `http_status:404` の catch-all にしてください。Cloudflare edge
+の Access policy だけでなく、cloudflared ingress の Access JWT 検証も
+`access.required: true` で必須にし、team と audience を moco の `team_domain`、`audience` に
+一致させてください。さらに、cloudflared から届く request の Access assertion を moco が
+`team_domain`、`audience`、`allowed_email` に対して origin で検証します。moco と Tunnel は
+独立したサービスです。片方が停止しても別経路へ切り替えず、`doctor` が部分失敗をそのまま
+報告します。
 
 設定後に moco を再起動し、Mac で `uv run moco open` を実行します。loopback の操作画面に
-「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は現在プロセスの
-media capability を URL fragment に含み、Cloudflare の request path には載せません。同じ値の
-唯一のファイル保存先はowner-privateな `runtime.json` で、ローカルCLIが操作画面を開くために
-process lifetime中だけ使用し、終了時に削除します。daemon を再起動すると古い QR は無効になります。
+「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は固定 public URL
+だけを含む convenience link で、moco の capability を fragment、query、path のいずれにも
+含めません。public origin は Cloudflare Access session と origin で検証する assertion に依存し、
+moco の capability をスマートフォンの storage に保存しません。QR は入力の手間を省くだけで、
+Access session が有効な間は bare な固定 public URL を直接開いて利用できます。Access session の
+期限が切れたら Cloudflare へ再ログインします。
+
+一方、Mac の loopback 操作画面は引き続き owner-private な `operator-capability.json` の
+capability を使い、同一 loopback origin の `localStorage` に保存します。この loopback 接続キーを
+失効する場合は moco を停止して `uv run moco operator rotate` を実行し、moco を再起動して新しい
+キーを登録します。daemon 稼働中の rotate は拒否され、現在のキーを変更しません。
+`runtime.json` と Reviewer の control secret は引き続き process lifetime 中だけ使用し、終了時に
+削除します。
 
 スマートフォンでは「接続」を押してマイクを許可し、「入力開始」と「入力停止」で操作します。
 入力開始は押し続ける PTT ではありません。指を離しても入力は続き、入力停止はマイクだけを
@@ -353,7 +385,7 @@ uninstall はラベルと実行ファイルが moco のものと一致する pli
 | `operator_public_url` | スマートフォン用固定 HTTPS hostname の設定状態。hostname 自体は表示しません |
 | `cloudflared_binary` | `cloudflared` の実行可否 |
 | `cloudflared_service` | moco 専用 LaunchAgent が running かどうか |
-| `codex_profile` | 選択した `read_only` / `workspace_write` / `inherit_codex` |
+| `codex_profile` | 選択した `read_only` / `workspace_write` / `danger_full_access_no_approval` / `inherit_codex` |
 | `codex_command` | 設定または自動解決した公開 Codex CLI の実行可否 |
 | `codex_schema` | 実行中の CLI から生成したprotocol schemaとの互換性 |
 | `codex_account` | 認証済みかどうか。メールアドレス等は表示しません |
@@ -383,11 +415,12 @@ MCP arguments、approval payload、reasoning、アカウント識別子はファ
 category／phase／label と時刻だけです。コンソールと任意の OTLP 出力は状態、所要時間、境界名、
 安定したエラーコード、trace ID に限定します。
 
-media capability とReviewerのcontrol secretだけは、process lifetime中にowner-privateな
-`runtime.json` へ保存し、プロセス終了時に削除します。media capability は同じタブのreload用に
-`sessionStorage`にも保持しますが、cookie、URL、`localStorage`などの永続領域には保存しません。
-Reviewerのcontrol secret、bootstrap、review capabilityはbrowser storageへ保存しません。
-いずれのcredentialもstdout、通常ログ、telemetryへ出しません。
+media capability はowner-privateな `operator-capability.json` とloopback originのブラウザ
+`localStorage`へ永続化します。public origin は Cloudflare Access で認証し、moco capability を
+browser storageへ保存しません。Reviewerのcontrol secretだけはprocess lifetime中に
+`runtime.json`へ保存し、プロセス終了時に削除します。Reviewerのcontrol secret、bootstrap、
+review capabilityはbrowser storageへ保存しません。いずれのcredentialもstdout、通常ログ、
+telemetryへ出しません。
 
 ローカル Reviewer は承認判断に必要なコマンド、cwd、path、change kind、move targetをboundedに
 一時表示しますが、patch本文は表示しません。patch本文はmetadataへの変換時に破棄します。
@@ -396,8 +429,9 @@ Reviewerのcontrol secret、bootstrap、review capabilityはbrowser storageへ�
 `sessionStorage`へ保存しません。
 
 操作サーバーは loopback にしか bind できません。WebSocket は同一 loopback origin、または
-設定した公開 HTTPS origin と Host の完全一致を要求します。どちらの経路でもプロセスごとの
-capability が必要で、同時に一つの操作クライアントだけを受け入れます。
+設定した公開 HTTPS origin と Host の完全一致を要求します。loopback 経路では永続capability、
+公開経路では有効な Cloudflare Access assertion と許可済み identity を要求し、同時に一つの
+操作クライアントだけを受け入れます。
 Reviewer は別のcontrol secretと短命bootstrapを使い、loopbackだけから接続できます。
 詳細は [SECURITY.md](SECURITY.md) を参照してください。
 

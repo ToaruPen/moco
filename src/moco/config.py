@@ -2,15 +2,18 @@ from __future__ import annotations
 
 import ipaddress
 import os
+import re
 import stat
 import sys
 import tempfile
+import unicodedata
 from contextlib import contextmanager
 from enum import StrEnum
 from pathlib import Path
 from typing import TYPE_CHECKING, Annotated, Literal, Self
 from urllib.parse import urlsplit
 
+import idna
 import yaml
 from pydantic import (
     BaseModel,
@@ -39,12 +42,83 @@ VadThreshold = Annotated[float, Field(gt=0.0, le=1.0)]
 IrodoriNumSteps = Annotated[int, Field(gt=0, le=64)]
 _MIN_PUBLIC_DNS_LABELS = 2
 _MAX_DNS_LABEL_LENGTH = 63
+_MAX_ACCESS_AUDIENCE_LENGTH = 256
+_MAX_EMAIL_LENGTH = 254
+_TEAM_DOMAIN_LABEL_COUNT = 3
 _IPV4_VERSION = 4
 _IPV6_VERSION = 6
 _IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
+_HEX_PREFIX_LENGTH = len("0x")
 _CONFIG_DIRECTORY_MODE = 0o700
 _CONFIG_FILE_MODE = 0o600
 _CONFIG_SECURITY_ERROR = "configuration path does not satisfy host security requirements"
+
+
+def _is_valid_ace_label(label: str) -> bool:
+    if not label.casefold().startswith("xn--"):
+        return True
+    try:
+        decoded = idna.decode(label, uts46=True, std3_rules=True)
+        round_trip = idna.encode(decoded, uts46=True, std3_rules=True).decode("ascii")
+    except idna.IDNAError:
+        return False
+    return round_trip == label
+
+
+def _is_whatwg_ipv4_number(value: str) -> bool:
+    if value.isascii() and value.isdigit():
+        return True
+    return (
+        value[:_HEX_PREFIX_LENGTH].casefold() == "0x"
+        and len(value) > _HEX_PREFIX_LENGTH
+        and all(character in "0123456789abcdefABCDEF" for character in value[_HEX_PREFIX_LENGTH:])
+    )
+
+
+def canonical_public_https_origin(value: str) -> str | None:
+    """Return the canonical browser-safe public HTTPS origin, if valid."""
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    if not parsed.netloc.isascii() or hostname is None or not hostname.isascii():
+        return None
+    canonical_hostname = hostname.rstrip(".").casefold()
+    labels = canonical_hostname.split(".")
+    labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
+        label.isascii()
+        and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        and _is_valid_ace_label(label)
+        for label in labels
+    )
+    try:
+        address = ipaddress.ip_address(canonical_hostname)
+    except ValueError:
+        address = None
+    if (
+        parsed.scheme.casefold() != "https"
+        or parsed.netloc.casefold().rstrip(".") != canonical_hostname
+        or address is not None
+        or not labels_valid
+        or _is_whatwg_ipv4_number(labels[-1])
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or "?" in candidate
+        or "#" in candidate
+        or "*" in candidate
+    ):
+        return None
+    return f"https://{canonical_hostname}"
 
 
 def canonical_browser_loopback_host(
@@ -81,10 +155,98 @@ class StrictSettings(BaseModel):
     model_config = ConfigDict(extra="forbid", frozen=True)
 
 
+class CloudflareAccessSettings(StrictSettings):
+    team_domain: str
+    audience: str
+    allowed_email: str
+
+    @field_validator("team_domain")
+    @classmethod
+    def _normalize_team_domain(cls, value: str) -> str:
+        candidate = value.strip(" ")
+        if any(
+            character.isspace() or unicodedata.category(character).startswith("C")
+            for character in candidate
+        ):
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg)
+        try:
+            parsed = urlsplit(candidate)
+            hostname = parsed.hostname
+        except ValueError as error:
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg) from error
+        labels = (hostname or "").split(".")
+        team = labels[0] if len(labels) == _TEAM_DOMAIN_LABEL_COUNT else ""
+        valid_team = (
+            team.isascii()
+            and 1 <= len(team) <= _MAX_DNS_LABEL_LENGTH
+            and team[0].isalnum()
+            and team[-1].isalnum()
+            and all(character.isalnum() or character == "-" for character in team)
+        )
+        if (
+            parsed.scheme.casefold() != "https"
+            or hostname is None
+            or parsed.netloc.casefold() != hostname.casefold()
+            or [label.casefold() for label in labels[1:]] != ["cloudflareaccess", "com"]
+            or not valid_team
+            or parsed.path not in {"", "/"}
+            or parsed.query
+            or parsed.fragment
+        ):
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg)
+        return f"https://{team.casefold()}.cloudflareaccess.com"
+
+    @field_validator("audience")
+    @classmethod
+    def _validate_audience(cls, value: str) -> str:
+        audience = value.strip()
+        if (
+            any(unicodedata.category(character) == "Cc" for character in value)
+            or re.fullmatch(
+                rf"[A-Za-z0-9_-]{{1,{_MAX_ACCESS_AUDIENCE_LENGTH}}}",
+                audience,
+            )
+            is None
+        ):
+            msg = "Cloudflare Access audience must use 1-256 ASCII token characters"
+            raise ValueError(msg)
+        return audience
+
+    @field_validator("allowed_email")
+    @classmethod
+    def _validate_allowed_email(cls, value: str) -> str:
+        email = value
+        local, separator, domain = email.partition("@")
+        contains_control_character = any(
+            unicodedata.category(character).startswith("C") for character in email
+        )
+        contains_forbidden_character = any(
+            character.isspace() or character in "<>,;" for character in email
+        )
+        if (
+            not email
+            or not email.isascii()
+            or len(email) > _MAX_EMAIL_LENGTH
+            or separator != "@"
+            or not local
+            or not domain
+            or "@" in domain
+            or contains_control_character
+            or contains_forbidden_character
+        ):
+            msg = "Cloudflare Access allowed email must be one bounded nonempty ASCII address"
+            raise ValueError(msg)
+        return email
+
+
 class ServerSettings(StrictSettings):
     host: str = "127.0.0.1"
     port: Port = 8765
     public_url: str | None = None
+    cloudflare_access: CloudflareAccessSettings | None = None
 
     @field_validator("host")
     @classmethod
@@ -103,43 +265,18 @@ class ServerSettings(StrictSettings):
     def _validate_public_url(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        candidate = value.strip()
-        parsed = urlsplit(candidate)
-        hostname = parsed.hostname
-        try:
-            address = ipaddress.ip_address(hostname or "")
-        except ValueError:
-            address = None
-        try:
-            port = parsed.port
-        except ValueError as error:
-            msg = "operator public URL must be a portless HTTPS FQDN"
-            raise ValueError(msg) from error
-        labels = (hostname or "").rstrip(".").split(".")
-        labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
-            label.isascii()
-            and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and all(character.isalnum() or character == "-" for character in label)
-            for label in labels
-        )
-        if (
-            parsed.scheme.casefold() != "https"
-            or hostname is None
-            or address is not None
-            or not labels_valid
-            or parsed.username is not None
-            or parsed.password is not None
-            or port is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-            or "*" in candidate
-        ):
+        canonical = canonical_public_https_origin(value)
+        if canonical is None:
             msg = "operator public URL must be a portless HTTPS FQDN"
             raise ValueError(msg)
-        return f"https://{hostname.rstrip('.').casefold()}"
+        return canonical
+
+    @model_validator(mode="after")
+    def _require_public_url_and_cloudflare_access_together(self) -> Self:
+        if (self.public_url is None) != (self.cloudflare_access is None):
+            msg = "public_url and cloudflare_access must be configured together"
+            raise ValueError(msg)
+        return self
 
 
 class HotkeySettings(StrictSettings):
@@ -222,6 +359,7 @@ class AgentProfileMode(StrEnum):
 
     READ_ONLY = "read_only"
     WORKSPACE_WRITE = "workspace_write"
+    DANGER_FULL_ACCESS_NO_APPROVAL = "danger_full_access_no_approval"
     INHERIT_CODEX = "inherit_codex"
 
 

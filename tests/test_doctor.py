@@ -386,6 +386,10 @@ async def test_doctor_projects_local_review_readiness_with_bounded_codes(
             DoctorCheck("codex_agent_admission", "ok", "allowed"),
         ),
         (
+            AgentProfileMode.DANGER_FULL_ACCESS_NO_APPROVAL,
+            DoctorCheck("codex_agent_admission", "ok", "allowed"),
+        ),
+        (
             AgentProfileMode.INHERIT_CODEX,
             DoctorCheck("codex_agent_admission", "error", "unsafe_voice_policy"),
         ),
@@ -874,7 +878,14 @@ async def test_doctor_reports_stable_checks_without_sensitive_values(
 async def test_doctor_reports_public_operator_boundary(tmp_path: Path) -> None:
     settings = MocoSettings.model_validate(
         {
-            "server": {"public_url": "https://voice.example.com"},
+            "server": {
+                "public_url": "https://voice.example.com",
+                "cloudflare_access": {
+                    "team_domain": "https://example-team.cloudflareaccess.com",
+                    "audience": "audience_123-ABC",
+                    "allowed_email": "owner@example.com",
+                },
+            },
             "codex": {
                 "command": [str(tmp_path / "missing")],
                 "working_directory": str(tmp_path),
@@ -938,7 +949,14 @@ async def test_doctor_distinguishes_cloudflared_failures(
 ) -> None:
     settings = MocoSettings.model_validate(
         {
-            "server": {"public_url": "https://voice.example.com"},
+            "server": {
+                "public_url": "https://voice.example.com",
+                "cloudflare_access": {
+                    "team_domain": "https://example-team.cloudflareaccess.com",
+                    "audience": "audience_123-ABC",
+                    "allowed_email": "owner@example.com",
+                },
+            },
             "codex": {
                 "command": [str(tmp_path / "missing")],
                 "working_directory": str(tmp_path),

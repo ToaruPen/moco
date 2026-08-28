@@ -1729,6 +1729,7 @@ _CLIENT_INVOCATIONS: dict[SemanticMethod, _InvocationSpec] = {
             _object_value(_THREAD_START_BASE),
             _explicit_thread_start("read-only", "never"),
             _explicit_thread_start("workspace-write", "on-request"),
+            _explicit_thread_start("danger-full-access", "never"),
         ),
     ),
     SemanticMethod.THREAD_REALTIME_START: _InvocationSpec(
