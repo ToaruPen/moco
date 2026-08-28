@@ -1000,6 +1000,8 @@ export class AccessLeaseRefresher {
     this.timers = timers;
     this.timer = undefined;
     this.token = undefined;
+    this.generation = 0;
+    this.inFlight = undefined;
   }
 
   start(token) {
@@ -1009,22 +1011,39 @@ export class AccessLeaseRefresher {
       return;
     }
     this.token = token;
-    this.timer = this.timers.set(() => this.#refresh(), ACCESS_LEASE_REFRESH_MS);
+    const generation = this.generation;
+    this.timer = this.timers.set(() => this.#refresh(generation, token), ACCESS_LEASE_REFRESH_MS);
   }
 
   stop() {
+    this.generation += 1;
     if (this.timer !== undefined) {
       this.timers.clear(this.timer);
     }
     this.timer = undefined;
     this.token = undefined;
+    this.inFlight = undefined;
   }
 
-  async #refresh() {
-    const token = this.token;
-    if (!token) {
+  async #refresh(generation, token) {
+    if (generation !== this.generation || token !== this.token) {
       return;
     }
+    if (this.inFlight?.generation === generation) {
+      return this.inFlight.promise;
+    }
+    const promise = this.#performRefresh(generation, token);
+    this.inFlight = { generation, promise };
+    try {
+      await promise;
+    } finally {
+      if (this.inFlight?.promise === promise) {
+        this.inFlight = undefined;
+      }
+    }
+  }
+
+  async #performRefresh(generation, token) {
     try {
       const response = await this.fetch("/auth/lease", {
         cache: "no-store",
@@ -1041,6 +1060,9 @@ export class AccessLeaseRefresher {
         throw new Error("access lease rejected");
       }
     } catch {
+      if (generation !== this.generation || token !== this.token) {
+        return;
+      }
       this.stop();
       this.onFailure("access_auth_failed");
     }

@@ -3241,6 +3241,81 @@ describe("browser connection timeouts", () => {
     assert.deepEqual(failures, ["access_auth_failed"]);
   });
 
+  it("ignores a late rejected refresh after a new lease generation starts", async () => {
+    const pending = [];
+    const callbacks = [];
+    const cleared = [];
+    const failures = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: (...args) => new Promise((resolve, reject) => pending.push({ args, reject, resolve })),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (callback) => {
+          callbacks.push(callback);
+          return callbacks.length;
+        },
+      },
+    });
+    const firstToken = "A".repeat(43);
+    const secondToken = "B".repeat(43);
+
+    refresher.start(firstToken);
+    const firstRefresh = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    refresher.stop();
+    refresher.start(secondToken);
+    const secondRefresh = callbacks[1]();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    pending[1].resolve({ redirected: false, status: 204, type: "basic" });
+    await secondRefresh;
+    pending[0].reject(new Error("old Access session rejected"));
+    await firstRefresh;
+
+    assert.deepEqual(
+      pending.map(({ args }) => args[1].headers["X-Moco-Access-Lease"]),
+      [firstToken, secondToken],
+    );
+    assert.deepEqual(cleared, [1]);
+    assert.deepEqual(failures, []);
+  });
+
+  it("serializes overlapping refresh callbacks and applies only the current failure", async () => {
+    const pending = [];
+    const callbacks = [];
+    const cleared = [];
+    const failures = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: () => new Promise((resolve) => pending.push(resolve)),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (callback) => {
+          callbacks.push(callback);
+          return 31;
+        },
+      },
+    });
+
+    refresher.start("C".repeat(43));
+    const first = callbacks[0]();
+    const overlapping = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 1);
+
+    pending[0]({ redirected: false, status: 204, type: "basic" });
+    await Promise.all([first, overlapping]);
+    const currentFailure = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 2);
+    pending[1]({ redirected: false, status: 403, type: "basic" });
+    await currentFailure;
+
+    assert.deepEqual(cleared, [31]);
+    assert.deepEqual(failures, ["access_auth_failed"]);
+  });
+
   it("rejects ICE gathering that never completes", async () => {
     const peer = new EventTarget();
     peer.iceGatheringState = "gathering";
