@@ -1698,19 +1698,44 @@ describe("VoiceModelController", () => {
 let bootHarnessSequence = 0;
 
 async function bootConversationHarness({
+  accessStatus = 204,
   answerStarts = [],
+  initialCapability,
   pendingEnumerations = [],
   pendingOffers = [],
   pendingSenderReplacements = [],
+  storageRemovalThrows = false,
+  url = "http://127.0.0.1:8765/?capability=test-capability",
 } = {}) {
   const html = await readFile(
     new URL("../../src/moco/web/static/index.html", import.meta.url),
     "utf8",
   );
-  const dom = new JSDOM(html, { url: "http://127.0.0.1:8765/?capability=test-capability" });
+  const dom = new JSDOM(html, { url });
+  if (initialCapability) {
+    dom.window.localStorage.setItem("moco.capability", initialCapability);
+    dom.window.sessionStorage.setItem("moco.capability", initialCapability);
+  }
+  if (storageRemovalThrows) {
+    Object.defineProperty(dom.window.Storage.prototype, "removeItem", {
+      configurable: true,
+      value: () => {
+        throw new Error("storage unavailable");
+      },
+    });
+  }
   dom.window.matchMedia = () => ({ matches: false, addEventListener() {} });
-  dom.window.fetch = async () => ({ ok: false });
 
+  const connectionOrder = [];
+  const fetchCalls = [];
+  dom.window.fetch = async (requestUrl, options = {}) => {
+    fetchCalls.push({ url: requestUrl, options });
+    if (requestUrl === "/auth/status") {
+      connectionOrder.push("access");
+      return { redirected: false, status: accessStatus, type: "basic" };
+    }
+    return { ok: false, status: 404, type: "basic" };
+  };
   const sent = [];
   const sockets = [];
   const peers = [];
@@ -1724,8 +1749,11 @@ async function bootConversationHarness({
     static OPEN = 1;
     static CLOSED = 3;
 
-    constructor() {
+    constructor(socketUrl, protocols) {
       super();
+      connectionOrder.push("socket");
+      this.protocols = protocols;
+      this.url = socketUrl.toString();
       this.readyState = FakeSocket.CONNECTING;
       sockets.push(this);
       queueMicrotask(() => {
@@ -1830,6 +1858,7 @@ async function bootConversationHarness({
 
   class FakeAudioContext {
     constructor() {
+      connectionOrder.push("audio-context");
       this.state = "running";
       this.currentTime = 0;
       this.destination = {};
@@ -1837,7 +1866,9 @@ async function bootConversationHarness({
       audioContexts.push(this);
     }
 
-    async resume() {}
+    async resume() {
+      connectionOrder.push("audio-resume");
+    }
 
     async setSinkId(deviceId) {
       this.sinkIds.push(deviceId);
@@ -1880,6 +1911,7 @@ async function bootConversationHarness({
     }
 
     async getUserMedia(constraints) {
+      connectionOrder.push("microphone");
       this.requests.push(constraints);
       const exact = constraints.audio?.deviceId?.exact;
       const deviceId = exact || "mic-1";
@@ -1992,8 +2024,10 @@ async function bootConversationHarness({
   return {
     audioContexts,
     close,
+    connectionOrder,
     disconnect: (index = 0) => sockets[index].close(),
     dom,
+    fetchCalls,
     mediaDevices,
     peers,
     receive: (message) => sockets[0].receive(message),
@@ -2006,6 +2040,98 @@ async function bootConversationHarness({
     waitFor,
   };
 }
+
+describe("operator Access browser connection", () => {
+  it("activates audio and requests microphone permission before probing Access and opening a socket", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0] });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.deepEqual(connection.connectionOrder, [
+        "audio-context",
+        "audio-resume",
+        "microphone",
+        "access",
+        "socket",
+      ]);
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("clears public capabilities and opens the actual socket without a capability protocol", async () => {
+    const capability = "I".repeat(43);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      initialCapability: capability,
+      url: `https://operator.example.com/#${capability}`,
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.equal(connection.dom.window.location.hash, "");
+      assert.equal(connection.dom.window.localStorage.getItem("moco.capability"), null);
+      assert.equal(connection.dom.window.sessionStorage.getItem("moco.capability"), null);
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("keeps the actual public socket capability-free when storage removal throws", async () => {
+    const capability = "J".repeat(43);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      initialCapability: capability,
+      storageRemovalThrows: true,
+      url: `https://operator.example.com/#${capability}`,
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.equal(connection.dom.window.location.hash, "");
+      assert.equal(connection.dom.window.localStorage.getItem("moco.capability"), capability);
+      assert.equal(connection.dom.window.sessionStorage.getItem("moco.capability"), capability);
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("shows the actionable Access error and never opens a socket when the probe fails", async () => {
+    const connection = await bootConversationHarness({ accessStatus: 403 });
+    try {
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#error-text").textContent !== "",
+      );
+
+      assert.equal(connection.sockets.length, 0);
+      assert.equal(connection.peers.length, 0);
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "access_auth_failed — Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("probes Access again before each Voice reconnection", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0, 1] });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      assert.equal(connection.fetchCalls.filter(({ url }) => url === "/auth/status").length, 1);
+
+      connection.requireReplacement();
+      await connection.waitFor(() => connection.peers[1]?.remoteDescriptions.length === 1);
+
+      assert.equal(connection.fetchCalls.filter(({ url }) => url === "/auth/status").length, 2);
+    } finally {
+      await connection.close();
+    }
+  });
+});
 
 describe("audio device switching", () => {
   it("replaces the current microphone track without reconnecting the conversation", async () => {
@@ -2640,7 +2766,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: `#${capability}`, pathname: "/" },
+        location: { hash: `#${capability}`, hostname: "127.0.0.1", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2649,7 +2775,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "", pathname: "/" },
+        location: { hash: "", hostname: "127.0.0.1", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2671,7 +2797,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "", pathname: "/" },
+        location: { hash: "", hostname: "localhost", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2681,7 +2807,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: `#${freshCapability}`, pathname: "/" },
+        location: { hash: `#${freshCapability}`, hostname: "localhost", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2702,7 +2828,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history: { replaceState: (_state, _unused, url) => replaced.push(url) },
-        location: { hash: "#invalid", pathname: "/" },
+        location: { hash: "#invalid", hostname: "[::1]", pathname: "/" },
         persistentStorage,
         sessionStorage: { getItem: () => null },
       }),
@@ -2710,6 +2836,121 @@ describe("browser connection timeouts", () => {
     );
     assert.equal(values.get("moco.capability"), persistedCapability);
     assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("removes every capability source from a public origin", () => {
+    const fragmentCapability = "E".repeat(43);
+    const storedCapability = "F".repeat(43);
+    const persistentValues = new Map([["moco.capability", storedCapability]]);
+    const sessionValues = new Map([["moco.capability", storedCapability]]);
+    const storage = (values) => ({
+      getItem: () => assert.fail("public capability storage must not be read"),
+      removeItem: (key) => values.delete(key),
+      setItem: () => assert.fail("public capability storage must not be written"),
+    });
+    const replaced = [];
+
+    const capability = appModule.loadCapability({
+      history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+      location: {
+        hash: `#${fragmentCapability}`,
+        hostname: "operator.example.com",
+        pathname: "/operator",
+        search: "?mode=voice",
+      },
+      persistentStorage: storage(persistentValues),
+      sessionStorage: storage(sessionValues),
+    });
+
+    assert.equal(capability, "");
+    assert.equal(persistentValues.has("moco.capability"), false);
+    assert.equal(sessionValues.has("moco.capability"), false);
+    assert.deepEqual(replaced, ["/operator?mode=voice"]);
+  });
+
+  it("keeps public Access startup capability-free when storage cleanup throws", () => {
+    const removals = [];
+    const replaced = [];
+    const capability = appModule.loadCapability({
+      history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+      location: {
+        hash: `#${"G".repeat(43)}`,
+        hostname: "operator.example.com",
+        pathname: "/",
+        search: "",
+      },
+      persistentStorage: {
+        removeItem() {
+          removals.push("persistent");
+          throw new Error("storage unavailable");
+        },
+      },
+      sessionStorage: {
+        removeItem() {
+          removals.push("session");
+          throw new Error("storage unavailable");
+        },
+      },
+    });
+
+    assert.equal(capability, "");
+    assert.deepEqual(appModule.operatorSocketProtocols(capability), ["moco"]);
+    assert.deepEqual(removals, ["persistent", "session"]);
+    assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("builds exact socket protocols for Access and loopback authentication", () => {
+    const capability = "H".repeat(43);
+
+    assert.deepEqual(appModule.operatorSocketProtocols(""), ["moco"]);
+    assert.deepEqual(appModule.operatorSocketProtocols(capability), [
+      "moco",
+      `moco.capability.${capability}`,
+    ]);
+  });
+
+  it("probes Access with a body-free same-origin request", async () => {
+    const calls = [];
+    await appModule.probeOperatorAccess(async (...args) => {
+      calls.push(args);
+      return { redirected: false, status: 204, type: "basic" };
+    });
+
+    assert.deepEqual(calls, [
+      [
+        "/auth/status",
+        {
+          cache: "no-store",
+          credentials: "same-origin",
+          method: "GET",
+          redirect: "manual",
+        },
+      ],
+    ]);
+  });
+
+  it("rejects failed, redirected, opaque, and non-204 Access probes without reading a body", async () => {
+    const body = {
+      text() {
+        assert.fail("Access failure bodies must not be read");
+      },
+    };
+    for (const response of [
+      { ...body, redirected: false, status: 200, type: "basic" },
+      { ...body, redirected: true, status: 204, type: "basic" },
+      { ...body, redirected: false, status: 0, type: "opaqueredirect" },
+    ]) {
+      await assert.rejects(
+        appModule.probeOperatorAccess(async () => response),
+        (error) => error.name === "access_auth_failed",
+      );
+    }
+    await assert.rejects(
+      appModule.probeOperatorAccess(async () => {
+        throw new Error("network unavailable");
+      }),
+      (error) => error.name === "access_auth_failed",
+    );
   });
 
   it("rejects ICE gathering that never completes", async () => {

@@ -44,6 +44,8 @@ const ERROR_COPY = Object.freeze({
   websocket_open_timeout: "オペレーター接続が時間内に開きませんでした",
   websocket_failed: "オペレーター接続に失敗しました",
   websocket_closed_before_open: "オペレーター接続が開始前に閉じました",
+  access_auth_failed:
+    "Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
   webrtc_connection_failed: "Realtime 音声接続が失敗しました",
   theme_config_invalid: "保存済み配色を読み込めないため既定値へ戻しました",
   audio_decode_failed: "受信した音声を再生できませんでした",
@@ -863,6 +865,23 @@ function isLoopbackHostname(hostname) {
 }
 
 export function loadCapability({ location, history, persistentStorage, sessionStorage }) {
+  if (!isLoopbackHostname(location.hostname)) {
+    for (const storage of [persistentStorage, sessionStorage]) {
+      try {
+        storage.removeItem(CAPABILITY_STORAGE_KEY);
+      } catch {
+        // Access authentication must remain usable when browser storage is unavailable.
+      }
+    }
+    if (location.hash) {
+      try {
+        history.replaceState(null, "", `${location.pathname}${location.search ?? ""}`);
+      } catch {
+        // The capability remains ignored even if the visible URL cannot be replaced.
+      }
+    }
+    return "";
+  }
   const capabilityFromUrl = location.hash.slice(1);
   if (capabilityFromUrl) {
     history.replaceState(null, "", location.pathname);
@@ -881,6 +900,32 @@ export function loadCapability({ location, history, persistentStorage, sessionSt
     return legacy;
   }
   return "";
+}
+
+export function operatorSocketProtocols(capability) {
+  return capability
+    ? [WEBSOCKET_PROTOCOL, `${CAPABILITY_PREFIX}${capability}`]
+    : [WEBSOCKET_PROTOCOL];
+}
+
+export async function probeOperatorAccess(fetch) {
+  try {
+    const response = await fetch("/auth/status", {
+      cache: "no-store",
+      credentials: "same-origin",
+      method: "GET",
+      redirect: "manual",
+    });
+    if (
+      response.redirected === true ||
+      response.type === "opaqueredirect" ||
+      response.status !== 204
+    ) {
+      throw namedError("access_auth_failed");
+    }
+  } catch {
+    throw namedError("access_auth_failed");
+  }
 }
 
 export class PairingPanel {
@@ -1180,6 +1225,7 @@ function boot() {
     persistentStorage: window.localStorage,
     sessionStorage: window.sessionStorage,
   });
+  const operatorFetch = window.fetch.bind(window);
   const pairingPanel = new PairingPanel({
     capability,
     dom: {
@@ -1188,7 +1234,7 @@ function boot() {
       close: dom.pairingClose,
       image: dom.pairingImage,
     },
-    fetch: window.fetch.bind(window),
+    fetch: operatorFetch,
     location: window.location,
     createObjectURL: (blob) => window.URL.createObjectURL(blob),
     revokeObjectURL: (url) => window.URL.revokeObjectURL(url),
@@ -1231,10 +1277,7 @@ function boot() {
     }
     const url = new URL("/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    const nextSocket = new WebSocket(url, [
-      WEBSOCKET_PROTOCOL,
-      `${CAPABILITY_PREFIX}${capability}`,
-    ]);
+    const nextSocket = new WebSocket(url, operatorSocketProtocols(capability));
     socket = nextSocket;
     nextSocket.binaryType = "arraybuffer";
     let wasOnline = false;
@@ -1410,6 +1453,7 @@ function boot() {
       voiceLossClaimed = true;
       send({ type: "voice_lost" });
     };
+    await probeOperatorAccess(operatorFetch);
     await connectSocket();
     stopPeerWatch?.();
     peer?.close();
