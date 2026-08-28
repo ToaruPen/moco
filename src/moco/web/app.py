@@ -9,7 +9,7 @@ from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, assert_never, cast
-from urllib.parse import urlsplit
+from urllib.parse import SplitResult, urlsplit
 
 from fastapi import FastAPI, HTTPException, Request, Response, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, JSONResponse
@@ -3222,10 +3222,14 @@ def create_app(  # noqa: C901, PLR0915
         if not _origin_allowed(websocket, resolved.server.public_url):
             await _reject_operator_socket(websocket, "origin_rejected")
             return
+        host = _single_valid_authority(websocket.headers.getlist("host"))
+        if host is None:
+            await _reject_operator_socket(websocket, "origin_rejected")
+            return
         rejection_code: (
             AccessRejectionCode | Literal["capability_missing", "capability_mismatch"] | None
         )
-        if _is_public_host(websocket.headers.get("host"), resolved.server.public_url):
+        if _is_public_host(host, resolved.server.public_url):
             rejection_code = await _access_rejection_code(
                 getattr(app.state, "access_verifier", None),
                 websocket.headers.getlist("cf-access-jwt-assertion"),
@@ -3286,7 +3290,10 @@ def _install_access_middleware(app: FastAPI, public_url: str | None) -> None:
         request: Request,
         call_next: Callable[[Request], Awaitable[Response]],
     ) -> Response:
-        if not _is_public_host(request.headers.get("host"), public_url):
+        host = _single_valid_authority(request.headers.getlist("host"))
+        if host is None:
+            return _operator_http_rejection("operator_authority_invalid")
+        if not _is_public_host(host, public_url):
             return await call_next(request)
         rejection_code = await _access_rejection_code(
             getattr(app.state, "access_verifier", None),
@@ -3294,19 +3301,25 @@ def _install_access_middleware(app: FastAPI, public_url: str | None) -> None:
         )
         if rejection_code is None:
             return await call_next(request)
-        safe_event(
-            logger,
-            "operator_http_rejected",
-            component="web",
-            boundary="operator_http",
-            event_code=rejection_code,
-            result="rejected",
-        )
-        return JSONResponse(
-            {"code": "access_auth_failed"},
-            status_code=403,
-            headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
-        )
+        return _operator_http_rejection(rejection_code)
+
+
+def _operator_http_rejection(
+    rejection_code: AccessRejectionCode | Literal["operator_authority_invalid"],
+) -> JSONResponse:
+    safe_event(
+        logger,
+        "operator_http_rejected",
+        component="web",
+        boundary="operator_http",
+        event_code=rejection_code,
+        result="rejected",
+    )
+    return JSONResponse(
+        {"code": "access_auth_failed"},
+        status_code=403,
+        headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
+    )
 
 
 def _codex_session_factory(
@@ -3394,16 +3407,24 @@ def _project_ui_state(
 
 
 def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
-    origin = websocket.headers.get("origin")
-    host = websocket.headers.get("host")
-    if origin is None or host is None:
+    origins = websocket.headers.getlist("origin")
+    origin = origins[0] if len(origins) == 1 else None
+    host = _single_valid_authority(websocket.headers.getlist("host"))
+    if origin is None or host is None or not _safe_url_text(origin):
         return False
-    origin_parts = urlsplit(origin)
-    host_parts = urlsplit(f"//{host}")
+    try:
+        origin_parts = urlsplit(origin)
+        _ = origin_parts.port
+    except ValueError:
+        return False
+    host_parts = _parse_authority(host)
+    if host_parts is None:
+        return False
     if (
         origin_parts.path not in {"", "/"}
         or origin_parts.query
         or origin_parts.fragment
+        or origin_parts.netloc.endswith(":")
         or origin_parts.username is not None
         or origin_parts.password is not None
     ):
@@ -3431,10 +3452,48 @@ def _origin_allowed(websocket: WebSocket, public_url: str | None) -> bool:
 
 
 def _is_public_host(host: str | None, public_url: str | None) -> bool:
-    if host is None or public_url is None:
+    if host is None or public_url is None or _parse_authority(host) is None:
         return False
-    expected_host = urlsplit(public_url).netloc
+    try:
+        public_parts = urlsplit(public_url)
+        _ = public_parts.port
+    except ValueError:
+        return False
+    expected_host = public_parts.netloc
     return bool(expected_host) and host.casefold() == expected_host.casefold()
+
+
+def _single_valid_authority(values: Sequence[str]) -> str | None:
+    if len(values) != 1 or _parse_authority(values[0]) is None:
+        return None
+    return values[0]
+
+
+def _parse_authority(authority: str) -> SplitResult | None:
+    if not _safe_url_text(authority) or authority.endswith(":"):
+        return None
+    try:
+        parts = urlsplit(f"//{authority}")
+        _ = parts.port
+    except ValueError:
+        return None
+    if (
+        parts.netloc != authority
+        or parts.hostname is None
+        or parts.username is not None
+        or parts.password is not None
+        or parts.path
+        or parts.query
+        or parts.fragment
+    ):
+        return None
+    return parts
+
+
+def _safe_url_text(value: str) -> bool:
+    return bool(value) and not any(
+        character.isspace() or not character.isprintable() for character in value
+    )
 
 
 async def _access_rejection_code(

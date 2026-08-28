@@ -5,7 +5,15 @@ import gc
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import suppress
 from dataclasses import replace
 from pathlib import Path
@@ -3431,14 +3439,16 @@ def websocket_context(
     client: TestClient,
     *,
     capability: str | None = CAPABILITY,
-    origin: str = "http://127.0.0.1:8765",
-    host: str = "127.0.0.1:8765",
+    origin: str | Sequence[str] = "http://127.0.0.1:8765",
+    host: str | Sequence[str] = "127.0.0.1:8765",
     access_assertions: Sequence[str] = (),
 ) -> WebSocketTestSession:
+    origins = [origin] if isinstance(origin, str) else origin
+    hosts = [host] if isinstance(host, str) else host
     headers = Headers(
         [
-            ("host", host),
-            ("origin", origin),
+            *(("host", value) for value in hosts),
+            *(("origin", value) for value in origins),
             *(("cf-access-jwt-assertion", assertion) for assertion in access_assertions),
         ],
     )
@@ -3460,6 +3470,79 @@ class FakeAccessVerifier:
     async def rejection_code(self, assertions: Sequence[str]) -> str | None:
         self.assertions.append(list(assertions))
         return self.result
+
+
+async def raw_http_response(
+    app: FastAPI,
+    *,
+    headers: Sequence[tuple[bytes, bytes]],
+) -> tuple[int, dict[str, str]]:
+    messages: list[dict[str, Any]] = []
+    request_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        messages.append(dict(message))
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "https",
+        "method": "GET",
+        "root_path": "",
+        "path": "/auth/status",
+        "raw_path": b"/auth/status",
+        "query_string": b"",
+        "headers": list(headers),
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8765),
+        "state": {},
+    }
+    await app(cast("Any", scope), receive, send)
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    response_headers = {
+        key.decode("latin-1"): value.decode("latin-1") for key, value in start["headers"]
+    }
+    return cast("int", start["status"]), response_headers
+
+
+async def raw_websocket_messages(
+    app: FastAPI,
+    *,
+    headers: Sequence[tuple[bytes, bytes]],
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        messages.append(dict(message))
+
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "root_path": "",
+        "path": "/ws",
+        "raw_path": b"/ws",
+        "query_string": b"",
+        "headers": list(headers),
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8765),
+        "subprotocols": ["moco", f"moco.capability.{CAPABILITY}"],
+        "state": {},
+    }
+    await app(cast("Any", scope), receive, send)
+    return messages
 
 
 def public_settings() -> MocoSettings:
@@ -3628,6 +3711,93 @@ def test_public_http_auth_status_passes_all_access_assertions_without_caching() 
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert verifier.assertions == [["assertion-one", "assertion-two"]]
+
+
+@pytest.mark.parametrize("path", ["/", "/static/app.js"])
+def test_public_http_routes_require_valid_access(path: str) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get(
+            path,
+            headers={"cf-access-jwt-assertion": "route-access-assertion"},
+        )
+
+    assert response.status_code == 200
+    assert verifier.assertions == [["route-access-assertion"]]
+
+
+@pytest.mark.parametrize("path", ["/", "/static/app.js"])
+@pytest.mark.parametrize(
+    ("result", "assertions"),
+    [
+        ("access_token_missing", []),
+        ("access_token_invalid", ["invalid-route-access-assertion"]),
+    ],
+)
+def test_public_http_routes_reject_missing_or_invalid_access_without_caching(
+    path: str,
+    result: str,
+    assertions: list[str],
+) -> None:
+    verifier = FakeAccessVerifier(result)
+    app = public_app(verifier)
+    headers = Headers(
+        [("cf-access-jwt-assertion", assertion) for assertion in assertions],
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get(path, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert verifier.assertions == [assertions]
+
+
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        ["127.0.0.1:8765", "voice.example.com"],
+        ["voice.example.com", "127.0.0.1:8765"],
+        ["[malformed"],
+        ["127.0.0.1:not-a-port"],
+        ["127.0.0.1:"],
+    ],
+)
+def test_http_rejects_ambiguous_or_malformed_host_before_auth_routing(
+    hosts: list[str],
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = Headers([*(("host", host) for host in hosts)])
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        response = client.get("/auth/status", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert verifier.assertions == []
+
+
+@pytest.mark.asyncio
+async def test_http_rejects_missing_host_before_auth_routing() -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+
+    status, headers = await raw_http_response(
+        app,
+        headers=[(b"cf-access-jwt-assertion", b"must-not-reach-verifier")],
+    )
+
+    assert status == 403
+    assert headers["cache-control"] == "no-store"
+    assert headers["pragma"] == "no-cache"
+    assert verifier.assertions == []
 
 
 @pytest.mark.parametrize(
@@ -3801,6 +3971,82 @@ def test_loopback_websocket_capability_does_not_call_access_verifier() -> None:
         assert socket.receive_json()["state"] == "ready"
 
     assert verifier.assertions == []
+
+
+@pytest.mark.parametrize(
+    ("hosts", "origins"),
+    [
+        (
+            ["127.0.0.1:8765", "voice.example.com"],
+            ["http://127.0.0.1:8765"],
+        ),
+        (
+            ["voice.example.com", "127.0.0.1:8765"],
+            ["https://voice.example.com"],
+        ),
+        (
+            ["127.0.0.1:8765"],
+            ["http://127.0.0.1:8765", "https://voice.example.com"],
+        ),
+        (["127.0.0.1:8765"], []),
+        (["[malformed"], ["https://voice.example.com"]),
+        (["127.0.0.1:not-a-port"], ["http://127.0.0.1:8765"]),
+        (["127.0.0.1:8765"], ["http://[malformed"]),
+        (["127.0.0.1:8765"], ["http://127.0.0.1:not-a-port"]),
+        (["127.0.0.1:"], ["http://127.0.0.1:8765"]),
+        (["127.0.0.1:8765"], ["http://127.0.0.1:"]),
+        (["127.0.0.1:"], ["http://127.0.0.1:"]),
+    ],
+)
+def test_websocket_rejects_ambiguous_or_malformed_authority_before_auth_routing(
+    hosts: list[str],
+    origins: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        pytest.raises(WebSocketDisconnect),
+        websocket_context(
+            client,
+            capability=CAPABILITY,
+            host=hosts,
+            origin=origins,
+            access_assertions=["access-must-not-select-routing"],
+        ),
+    ):
+        pass
+
+    assert verifier.assertions == []
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert "event_code=origin_rejected" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"origin", b"http://127.0.0.1:8765")],
+        [(b"host", b"127.0.0.1:8765")],
+    ],
+)
+async def test_websocket_rejects_missing_authority_headers(
+    headers: list[tuple[bytes, bytes]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    messages = await raw_websocket_messages(app, headers=headers)
+
+    assert messages == [{"type": "websocket.close", "code": 1008, "reason": ""}]
+    assert verifier.assertions == []
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert "event_code=origin_rejected" in caplog.text
 
 
 @pytest.mark.parametrize(
