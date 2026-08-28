@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import logging
 import time
@@ -16,11 +17,13 @@ from collections.abc import (
 )
 from contextlib import suppress
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, cast
 
 import pytest
+import segno
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from httpx import Headers
@@ -108,6 +111,7 @@ from moco.speech.queue import SpeechQueue
 from moco.web import app as web_app
 from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import ClientControl, StartMessage
+from moco.web.pairing import mobile_operator_url, render_pairing_svg
 from moco.web.reviewer import ReviewerBroker
 from test_codex_agent import FakeSharedConnection, make_session
 from test_codex_approval import (
@@ -4139,6 +4143,64 @@ def test_pairing_svg_is_private_and_not_cached() -> None:
     assert response.headers["cache-control"] == "no-store"
     assert response.headers["pragma"] == "no-cache"
     assert response.content.startswith(b"<svg")
+
+
+def test_mobile_operator_url_is_the_bare_public_url() -> None:
+    public_url = "https://voice.example.com"
+
+    assert mobile_operator_url(public_url) == public_url
+    assert list(inspect.signature(mobile_operator_url).parameters) == ["public_url"]
+
+
+def test_pairing_svg_encodes_only_the_bare_public_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoded: list[str] = []
+
+    class FakeQr:
+        def save(self, stream: BytesIO, **_kwargs: object) -> None:
+            stream.write(b"<svg/>")
+
+    def make(content: str, **_kwargs: object) -> FakeQr:
+        encoded.append(content)
+        return FakeQr()
+
+    monkeypatch.setattr(segno, "make", make)
+
+    assert render_pairing_svg("https://voice.example.com") == b"<svg/>"
+    assert encoded == ["https://voice.example.com"]
+    assert list(inspect.signature(render_pairing_svg).parameters) == ["public_url"]
+
+
+def test_pairing_endpoint_calls_renderer_without_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered: list[str] = []
+
+    def render(public_url: str) -> bytes:
+        rendered.append(public_url)
+        return b"<svg/>"
+
+    monkeypatch.setattr(web_app, "render_pairing_svg", render)
+    settings = MocoSettings(
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
+    )
+    app = create_app(settings, capability_token=CAPABILITY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        response = client.get(
+            "/pairing.svg",
+            headers={
+                "host": "127.0.0.1:8765",
+                "x-moco-capability": CAPABILITY,
+                "sec-fetch-site": "same-origin",
+            },
+        )
+
+    assert response.status_code == 200
+    assert rendered == ["https://voice.example.com"]
 
 
 def test_pairing_svg_accepts_arbitrary_numeric_loopback_host() -> None:

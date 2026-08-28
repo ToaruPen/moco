@@ -3212,7 +3212,7 @@ def create_app(  # noqa: C901, PLR0915
         ):
             raise HTTPException(status_code=404)
         return Response(
-            render_pairing_svg(public_url, app.state.capability_token),
+            render_pairing_svg(public_url),
             media_type="image/svg+xml",
             headers={"Cache-Control": "no-store", "Pragma": "no-cache"},
         )

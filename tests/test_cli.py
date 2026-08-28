@@ -16,7 +16,7 @@ from typer.testing import CliRunner
 
 from moco import cli
 from moco import config as config_module
-from moco.cli import _is_safe_operator_url, _run_runtime, app
+from moco.cli import _is_safe_mobile_url, _is_safe_operator_url, _run_runtime, app
 from moco.config import MocoSettings, load_config
 from moco.doctor import DoctorCheck
 from moco.errors import PrivateStateError
@@ -170,7 +170,7 @@ def test_open_delegates_to_platform_browser_without_printing_capability(
         {
             "version": 1,
             "url": f"http://127.0.0.1:8765/#{capability_value}",
-            "mobile_url": f"https://voice.example.com/#{capability_value}",
+            "mobile_url": "https://voice.example.com",
             "control_secret": "private-control-secret",
         }
     ).encode()
@@ -245,6 +245,26 @@ def test_config_validate_reports_invalid_yaml(tmp_path: Path) -> None:
 )
 def test_operator_url_validation_rejects_unsafe_urls(url: str) -> None:
     assert not _is_safe_operator_url(url)
+
+
+def test_mobile_url_validation_accepts_bare_public_url() -> None:
+    assert _is_safe_mobile_url("https://voice.example.com")
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://voice.example.com/#token",
+        "https://voice.example.com?mode=mobile",
+        "https://voice.example.com/path",
+        "https://voice.example.com/",
+        "https://user@voice.example.com",
+        "https://localhost",
+        "https://127.0.0.1",
+    ],
+)
+def test_mobile_url_validation_rejects_non_bare_public_urls(url: str) -> None:
+    assert not _is_safe_mobile_url(url)
 
 
 @pytest.mark.parametrize(
@@ -686,8 +706,9 @@ async def test_runtime_writes_private_capability_state_and_cleans_up(
     local_url = cast("str", removed_payloads[0]["url"])
     mobile_url = cast("str", removed_payloads[0]["mobile_url"])
     assert local_url.startswith("http://127.0.0.1:")
-    assert mobile_url.startswith("https://voice.example.com/#")
-    assert local_url.split("#", 1)[1] == mobile_url.split("#", 1)[1]
+    assert mobile_url == "https://voice.example.com"
+    assert "#" not in mobile_url
+    assert local_url.split("#", 1)[1] not in mobile_url
     assert _is_safe_operator_url(local_url)
     assert telemetry.closed
     assert listener.stopped

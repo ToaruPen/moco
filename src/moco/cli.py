@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import json
 import secrets
 import sys
@@ -74,6 +75,8 @@ _REVIEW_BOOTSTRAP_PATH = "/review/bootstrap"
 _REVIEW_PAGE_PATH = "/review"
 _MAX_BOOTSTRAP_RESPONSE_BYTES = 4096
 _HTTP_OK = 200
+_MIN_PUBLIC_DNS_LABELS = 2
+_MAX_DNS_LABEL_LENGTH = 63
 
 
 class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -404,13 +407,31 @@ def _is_safe_mobile_url(url: str) -> bool:
         port = parsed.port
     except ValueError:
         return False
+    hostname = parsed.hostname
+    labels = (hostname or "").split(".")
+    try:
+        ipaddress.ip_address(hostname or "")
+    except ValueError:
+        is_ip_address = False
+    else:
+        is_ip_address = True
+    is_fqdn = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
+        label.isascii()
+        and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        for label in labels
+    )
     return (
         parsed.scheme == "https"
-        and parsed.hostname is not None
+        and hostname is not None
+        and not is_ip_address
+        and is_fqdn
         and parsed.username is None
         and parsed.password is None
-        and parsed.path in {"", "/"}
-        and bool(parsed.fragment)
+        and not parsed.path
+        and not parsed.fragment
         and not parsed.query
         and port is None
     )
@@ -436,7 +457,7 @@ def _runtime_state_payload(
         "control_secret": control_secret,
     }
     if settings.server.public_url is not None:
-        payload["mobile_url"] = mobile_operator_url(settings.server.public_url, capability)
+        payload["mobile_url"] = mobile_operator_url(settings.server.public_url)
     return payload
 
 

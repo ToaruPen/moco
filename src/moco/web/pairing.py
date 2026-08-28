@@ -5,14 +5,14 @@ from io import BytesIO
 import segno
 
 
-def mobile_operator_url(public_url: str, capability: str) -> str:
-    return f"{public_url}/#{capability}"
+def mobile_operator_url(public_url: str) -> str:
+    return public_url
 
 
-def render_pairing_svg(public_url: str, capability: str) -> bytes:
+def render_pairing_svg(public_url: str) -> bytes:
     stream = BytesIO()
     qr = segno.make(
-        mobile_operator_url(public_url, capability),
+        mobile_operator_url(public_url),
         error="m",
         micro=False,
         boost_error=False,
