@@ -1701,9 +1701,11 @@ async function bootConversationHarness({
   accessStatus = 204,
   answerStarts = [],
   initialCapability,
+  pendingAccessProbes = [],
   pendingEnumerations = [],
   pendingOffers = [],
   pendingSenderReplacements = [],
+  storageGettersThrow = false,
   storageRemovalThrows = false,
   url = "http://127.0.0.1:8765/?capability=test-capability",
 } = {}) {
@@ -1724,14 +1726,31 @@ async function bootConversationHarness({
       },
     });
   }
+  if (storageGettersThrow) {
+    for (const property of ["localStorage", "sessionStorage"]) {
+      Object.defineProperty(dom.window, property, {
+        configurable: true,
+        get() {
+          throw new dom.window.DOMException("storage blocked", "SecurityError");
+        },
+      });
+    }
+  }
   dom.window.matchMedia = () => ({ matches: false, addEventListener() {} });
 
   const connectionOrder = [];
   const fetchCalls = [];
+  const accessResolvers = new Map();
+  let accessIndex = 0;
   dom.window.fetch = async (requestUrl, options = {}) => {
     fetchCalls.push({ url: requestUrl, options });
     if (requestUrl === "/auth/status") {
+      const index = accessIndex;
+      accessIndex += 1;
       connectionOrder.push("access");
+      if (pendingAccessProbes.includes(index)) {
+        await new Promise((resolve) => accessResolvers.set(index, resolve));
+      }
       return { redirected: false, status: accessStatus, type: "basic" };
     }
     return { ok: false, status: 404, type: "basic" };
@@ -2022,6 +2041,7 @@ async function bootConversationHarness({
 
   dom.window.document.querySelector("#enable").click();
   return {
+    accessResolvers,
     audioContexts,
     close,
     connectionOrder,
@@ -2032,6 +2052,12 @@ async function bootConversationHarness({
     peers,
     receive: (message) => sockets[0].receive(message),
     requireReplacement,
+    resolveAccess: (index) => {
+      const resolve = accessResolvers.get(index);
+      assert.ok(resolve, `Access probe ${index} must be pending`);
+      accessResolvers.delete(index);
+      resolve();
+    },
     retryListening: () => dom.window.document.querySelector("#listen-start").click(),
     sent,
     sockets,
@@ -2079,21 +2105,46 @@ describe("operator Access browser connection", () => {
     }
   });
 
-  it("keeps the actual public socket capability-free when storage removal throws", async () => {
+  it("fails closed when a readable public capability remains after storage removal fails", async () => {
     const capability = "J".repeat(43);
     const connection = await bootConversationHarness({
-      answerStarts: [0],
       initialCapability: capability,
       storageRemovalThrows: true,
       url: `https://operator.example.com/#${capability}`,
     });
     try {
-      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#error-text").textContent !== "",
+      );
 
       assert.equal(connection.dom.window.location.hash, "");
       assert.equal(connection.dom.window.localStorage.getItem("moco.capability"), capability);
       assert.equal(connection.dom.window.sessionStorage.getItem("moco.capability"), capability);
+      assert.equal(connection.sockets.length, 0);
+      assert.equal(connection.peers.length, 0);
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "capability_cleanup_failed — 保存済み接続情報を安全に消去できませんでした。ページを再読み込みしてください",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("boots with safe no-op storage when browser storage getters throw", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      storageGettersThrow: true,
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
       assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+      assert.equal(
+        connection.dom.window.document.querySelector("#connection").textContent,
+        "WS ONLINE",
+      );
     } finally {
       await connection.close();
     }
@@ -2128,6 +2179,37 @@ describe("operator Access browser connection", () => {
 
       assert.equal(connection.fetchCalls.filter(({ url }) => url === "/auth/status").length, 2);
     } finally {
+      await connection.close();
+    }
+  });
+
+  it("invalidates a delayed reconnect probe when its current socket closes", async () => {
+    const unhandled = [];
+    const onUnhandled = (error) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      pendingAccessProbes: [1],
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.requireReplacement();
+      await connection.waitFor(() => connection.accessResolvers.has(1));
+
+      connection.disconnect();
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#connection-row").hidden === false,
+      );
+      connection.resolveAccess(1);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(connection.sockets.length, 1);
+      assert.equal(connection.peers.length, 1);
+      assert.equal(connection.dom.window.document.querySelector("#enable").disabled, false);
+      assert.equal(connection.dom.window.document.querySelector("#enable").textContent, "再接続");
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
       await connection.close();
     }
   });
@@ -2868,7 +2950,7 @@ describe("browser connection timeouts", () => {
     assert.deepEqual(replaced, ["/operator?mode=voice"]);
   });
 
-  it("keeps public Access startup capability-free when storage cleanup throws", () => {
+  it("keeps public Access startup capability-free when failed storage is unreadable", () => {
     const removals = [];
     const replaced = [];
     const capability = appModule.loadCapability({
@@ -2897,6 +2979,69 @@ describe("browser connection timeouts", () => {
     assert.deepEqual(appModule.operatorSocketProtocols(capability), ["moco"]);
     assert.deepEqual(removals, ["persistent", "session"]);
     assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("fails closed after attempting both stores when a removed public capability remains readable", () => {
+    const capability = "K".repeat(43);
+    const reads = [];
+    const removals = [];
+    const storage = (name) => ({
+      getItem() {
+        reads.push(name);
+        return capability;
+      },
+      removeItem() {
+        removals.push(name);
+        throw new Error("storage unavailable");
+      },
+    });
+    const replaced = [];
+
+    assert.throws(
+      () =>
+        appModule.loadCapability({
+          history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+          location: {
+            hash: `#${capability}`,
+            hostname: "operator.example.com",
+            pathname: "/",
+            search: "",
+          },
+          persistentStorage: storage("persistent"),
+          sessionStorage: storage("session"),
+        }),
+      (error) => error.name === "capability_cleanup_failed",
+    );
+    assert.deepEqual(removals, ["persistent", "session"]);
+    assert.deepEqual(reads, ["persistent", "session"]);
+    assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("attempts clean navigation and fails closed when public fragment replacement fails", () => {
+    const navigations = [];
+    const storage = { removeItem() {} };
+
+    assert.throws(
+      () =>
+        appModule.loadCapability({
+          history: {
+            replaceState() {
+              throw new Error("history unavailable");
+            },
+          },
+          location: {
+            hash: `#${"L".repeat(43)}`,
+            hostname: "operator.example.com",
+            pathname: "/operator",
+            replace: (url) => navigations.push(url),
+            search: "?mode=voice",
+          },
+          persistentStorage: storage,
+          sessionStorage: storage,
+        }),
+      (error) => error.name === "capability_cleanup_failed",
+    );
+    assert.deepEqual(navigations, ["/operator?mode=voice"]);
   });
 
   it("builds exact socket protocols for Access and loopback authentication", () => {

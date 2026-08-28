@@ -46,6 +46,8 @@ const ERROR_COPY = Object.freeze({
   websocket_closed_before_open: "オペレーター接続が開始前に閉じました",
   access_auth_failed:
     "Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+  capability_cleanup_failed:
+    "保存済み接続情報を安全に消去できませんでした。ページを再読み込みしてください",
   webrtc_connection_failed: "Realtime 音声接続が失敗しました",
   theme_config_invalid: "保存済み配色を読み込めないため既定値へ戻しました",
   audio_decode_failed: "受信した音声を再生できませんでした",
@@ -864,21 +866,82 @@ function isLoopbackHostname(hostname) {
   );
 }
 
-export function loadCapability({ location, history, persistentStorage, sessionStorage }) {
+const NOOP_STORAGE = Object.freeze({
+  getItem: () => null,
+  removeItem: () => {},
+  setItem: () => {},
+});
+
+function guardedBrowserStorage(owner, property) {
+  try {
+    const storage = owner[property];
+    const strict = {
+      getItem: storage.getItem.bind(storage),
+      removeItem: storage.removeItem.bind(storage),
+      setItem: storage.setItem.bind(storage),
+    };
+    return {
+      safe: {
+        getItem(key) {
+          try {
+            return strict.getItem(key);
+          } catch {
+            return null;
+          }
+        },
+        removeItem(key) {
+          try {
+            strict.removeItem(key);
+          } catch {}
+        },
+        setItem(key, value) {
+          try {
+            strict.setItem(key, value);
+          } catch {}
+        },
+      },
+      strict,
+    };
+  } catch {
+    return { safe: NOOP_STORAGE, strict: NOOP_STORAGE };
+  }
+}
+
+export function loadCapability({
+  location,
+  history,
+  persistentStorage,
+  sessionStorage,
+  cleanupPersistentStorage = persistentStorage,
+  cleanupSessionStorage = sessionStorage,
+}) {
   if (!isLoopbackHostname(location.hostname)) {
-    for (const storage of [persistentStorage, sessionStorage]) {
+    let cleanupFailed = false;
+    for (const storage of [cleanupPersistentStorage, cleanupSessionStorage]) {
       try {
         storage.removeItem(CAPABILITY_STORAGE_KEY);
       } catch {
-        // Access authentication must remain usable when browser storage is unavailable.
+        try {
+          const capabilityRemains = Boolean(storage.getItem(CAPABILITY_STORAGE_KEY));
+          cleanupFailed = capabilityRemains || cleanupFailed;
+        } catch {
+          // Inaccessible storage cannot be read or sent by this page.
+        }
       }
     }
     if (location.hash) {
+      const cleanUrl = `${location.pathname}${location.search ?? ""}`;
       try {
-        history.replaceState(null, "", `${location.pathname}${location.search ?? ""}`);
+        history.replaceState(null, "", cleanUrl);
       } catch {
-        // The capability remains ignored even if the visible URL cannot be replaced.
+        cleanupFailed = true;
+        try {
+          location.replace(cleanUrl);
+        } catch {}
       }
+    }
+    if (cleanupFailed) {
+      throw namedError("capability_cleanup_failed");
     }
     return "";
   }
@@ -1207,9 +1270,11 @@ function boot() {
       updated: dom.progressUpdated,
     }),
   });
+  const localStorage = guardedBrowserStorage(window, "localStorage");
+  const sessionStorage = guardedBrowserStorage(window, "sessionStorage");
   const themeController = new ThemeController({
     root: document.documentElement,
-    storage: window.localStorage,
+    storage: localStorage.safe,
     onWarning: (code) => operatorStatus.showError(code),
   });
   themeController.load();
@@ -1219,12 +1284,21 @@ function boot() {
     themePanel.render(),
   );
   operatorStatus.renderProgress();
-  const capability = loadCapability({
-    location: window.location,
-    history: window.history,
-    persistentStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
+  let capability = "";
+  let capabilityCleanupError;
+  try {
+    capability = loadCapability({
+      location: window.location,
+      history: window.history,
+      persistentStorage: localStorage.safe,
+      sessionStorage: sessionStorage.safe,
+      cleanupPersistentStorage: localStorage.strict,
+      cleanupSessionStorage: sessionStorage.strict,
+    });
+  } catch (error) {
+    capabilityCleanupError = error;
+    operatorStatus.showError(error.name || "capability_cleanup_failed");
+  }
   const operatorFetch = window.fetch.bind(window);
   const pairingPanel = new PairingPanel({
     capability,
@@ -1254,6 +1328,7 @@ function boot() {
   let discardFailedHandshakeTerminal = false;
   let stopPeerWatch;
   let socketCloseError;
+  let connectionAttemptGeneration = 0;
   const hotkeyMapper = new BrowserHotkeyMapper({
     globalHotkeysEnabled: true,
     startKey: "",
@@ -1271,7 +1346,18 @@ function boot() {
   });
   const turnCancel = new TurnCancelController({ button: dom.turnCancel, send });
 
-  const connectSocket = () => {
+  const assertCurrentConnectionAttempt = (attempt) => {
+    if (
+      attempt.generation !== connectionAttemptGeneration ||
+      attempt.controller !== controller ||
+      attempt.stream !== stream
+    ) {
+      throw namedError("websocket_disconnected", { displayed: true });
+    }
+  };
+
+  const connectSocket = (attempt) => {
+    assertCurrentConnectionAttempt(attempt);
     if (openPromise) {
       return openPromise;
     }
@@ -1288,6 +1374,7 @@ function boot() {
       const disconnectError = socketCloseError;
       const disconnectCode = disconnectError?.code;
       socketCloseError = undefined;
+      connectionAttemptGeneration += 1;
       setTransportOffline(dom);
       clearInterval(progressTimer);
       progressTimer = undefined;
@@ -1442,7 +1529,12 @@ function boot() {
   };
 
   const connectConversation = async () => {
-    const replacement = controller?.reconnectRequired === true;
+    const attempt = {
+      controller,
+      generation: ++connectionAttemptGeneration,
+      stream,
+    };
+    const replacement = attempt.controller?.reconnectRequired === true;
     let startSent = false;
     let established = false;
     let voiceLossClaimed = false;
@@ -1454,7 +1546,9 @@ function boot() {
       send({ type: "voice_lost" });
     };
     await probeOperatorAccess(operatorFetch);
-    await connectSocket();
+    assertCurrentConnectionAttempt(attempt);
+    await connectSocket(attempt);
+    assertCurrentConnectionAttempt(attempt);
     stopPeerWatch?.();
     peer?.close();
     const nextPeer = new RTCPeerConnection();
@@ -1464,7 +1558,7 @@ function boot() {
       if (
         !closeCurrentPeer(nextPeer, peer, {
           stopWatching: stopPeerWatch,
-          requireReconnect: () => controller?.requireReconnect(),
+          requireReconnect: () => attempt.controller?.requireReconnect(),
         })
       ) {
         return;
@@ -1480,11 +1574,14 @@ function boot() {
       operatorStatus.showError(code);
     });
     try {
-      nextPeer.addTrack(stream.getAudioTracks()[0], stream);
+      nextPeer.addTrack(attempt.stream.getAudioTracks()[0], attempt.stream);
       nextPeer.createDataChannel("oai-events");
       const offer = await nextPeer.createOffer();
+      assertCurrentConnectionAttempt(attempt);
       await nextPeer.setLocalDescription(offer);
+      assertCurrentConnectionAttempt(attempt);
       await waitForIce(nextPeer);
+      assertCurrentConnectionAttempt(attempt);
       handshake = new ConversationHandshake((sdp) =>
         nextPeer.setRemoteDescription({ type: "answer", sdp }),
       );
@@ -1499,7 +1596,7 @@ function boot() {
           replacement,
           startSent,
           stopWatching: stopPeerWatch,
-          requireReconnect: () => controller?.requireReconnect(),
+          requireReconnect: () => attempt.controller?.requireReconnect(),
           send,
           claimVoiceLoss,
         })
@@ -1516,6 +1613,11 @@ function boot() {
   };
 
   dom.enable.addEventListener("click", async () => {
+    if (capabilityCleanupError) {
+      operatorStatus.showError(capabilityCleanupError.name || "capability_cleanup_failed");
+      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      return;
+    }
     dom.enable.disabled = true;
     let stage = "audio";
     try {
@@ -1563,7 +1665,7 @@ function boot() {
         outputSelect: dom.audioOutput,
         context,
         mediaDevices: navigator.mediaDevices,
-        storage: window.localStorage,
+        storage: localStorage.safe,
         getCurrentStream: () => stream,
         getAudioSender: () => peer?.getSenders().find((sender) => sender.track?.kind === "audio"),
         replaceCurrentStream: (nextStream) => {
@@ -1610,13 +1712,14 @@ function boot() {
   });
 
   const apply = async (control) => {
-    if (!controller) {
+    const activeController = controller;
+    if (!activeController) {
       return;
     }
     const listening = control === "listen_start";
     let applied;
     try {
-      applied = await controller.applyControl(control);
+      applied = await activeController.applyControl(control);
     } catch (error) {
       const closing = closeSocketForFailure(
         socket,
@@ -1624,11 +1727,14 @@ function boot() {
         (failure) => {
           socketCloseError = failure;
         },
-        { preserveTransport: controller.reconnectRequired },
+        { preserveTransport: activeController.reconnectRequired },
       );
       if (!closing && !error.displayed) {
         operatorStatus.showError(error.name || "conversation_start_failed");
       }
+      return;
+    }
+    if (controller !== activeController) {
       return;
     }
     if (!applied) {
