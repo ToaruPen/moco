@@ -3,29 +3,29 @@
 ## 位置づけ
 
 本設計は、`2026-08-01-mobile-operator-access-design.md` にある「capability は daemon
-再起動で更新される」「browser storage は `sessionStorage` に限定する」というライフサイクルを
-置き換える。Cloudflare Access、Tunnel、loopback bind、Origin / Host 検証、単一オペレーター制約は
-変更しない。
+再起動で更新される」「browser storage は `sessionStorage` に限定する」という loopback
+capability のライフサイクルを置き換える。公開経路の認証契約は後続の
+`2026-08-28-cloudflare-access-operator-auth-design.md` が置き換える。loopback bind、Origin / Host
+検証、単一オペレーター制約は変更しない。
 
 ## 目的
 
-本人が一度 QR コードでスマートフォンを登録した後は、次の操作だけでオペレーター接続キーを
-失わないようにする。
+本人が一度 loopback 操作画面を開いた後は、次の操作だけでオペレーター接続キーを失わないように
+する。
 
 - moco daemon の再起動
 - macOS または Windows の再起動
 - ブラウザの終了と再起動
 - 同じブラウザプロファイルでの新しいタブ
 
-Cloudflare Access のセッション期間は引き続き Cloudflare が管理する。moco の接続キーは
-Cloudflare 認証を置き換えず、公開 hostname に対する独立した defense-in-depth の bearer
-credential として維持する。
+persistent operator capability は loopback operator endpoint だけの認証境界とする。公開
+operator endpoint の認証は後続の Cloudflare Access 設計へ移管する。
 
 ## 成功条件
 
 - 接続キーを環境変数、YAML 設定、ソースコード、テスト固定値、リポジトリへ保存しない。
 - daemon は所有者限定の永続ファイルから同じ接続キーを再利用する。
-- QR から登録したブラウザは、同一 origin・同一ブラウザプロファイルで接続キーを再利用する。
+- loopback URL から登録したブラウザは、同一 origin・同一ブラウザプロファイルで接続キーを再利用する。
 - 既存の `sessionStorage` 値を一度だけ永続領域へ移行できる。
 - runtime state は引き続きプロセス終了時に削除し、Reviewer control secret は永続化しない。
 - 永続ファイルの破損、未知 field、symlink、所有者不一致、緩い権限を黙って修復せず fail closed にする。
@@ -37,7 +37,7 @@ credential として維持する。
 ### 採用: owner-private ファイルと browser local storage
 
 Mac / Windows では既存の private-state 境界を使う独立ファイルへランダムキーを保存し、
-ブラウザでは URL fragment から受け取った値を origin-scoped な `localStorage` へ保存する。
+loopback ブラウザでは URL fragment から受け取った値を origin-scoped な `localStorage` へ保存する。
 既存の WebSocket subprotocol 検証を変えず、最小の変更で再起動と新規タブを扱える。
 
 ### 不採用: daemon 側だけ永続化
@@ -45,11 +45,11 @@ Mac / Windows では既存の private-state 境界を使う独立ファイルへ
 サーバー再起動には対応できるが、新しいタブやブラウザ再起動で QR が再度必要になり、今回の
 成功条件を満たさない。
 
-### 不採用: Cloudflare Access JWT の直接検証
+### 後続設計へ移管: Cloudflare Access JWT の直接検証
 
-moco 独自キーをなくせる一方、Cloudflare の署名鍵取得、audience、clock skew、鍵更新、障害時の
-扱いを新たな runtime 境界として実装する必要がある。今回必要な UX に対して変更範囲が大きく、
-Cloudflare への結合も強くなる。
+Cloudflare の署名鍵取得、audience、clock skew、鍵更新、障害時の扱いは独立した runtime 境界を
+必要とするため、本設計の slice には含めない。後続の Cloudflare Access 設計が公開経路について
+この境界を実装し、moco capability を公開 URL、browser storage、WebSocket から除去する。
 
 ## daemon 側の保存契約
 
@@ -96,10 +96,11 @@ Reviewer の `control_secret` は従来どおりプロセスごとに生成し�
 
 URL fragment があれば `localStorage` へ保存し、既存どおり直ちに history から fragment を除去する。
 旧 `sessionStorage` だけに値がある場合は `localStorage` へコピーし、同じ値を返す。接続キーは query、
-cookie、DOM、console、telemetry へ移さない。ブラウザ保存を消した場合や別プロファイルでは、再度 QR
-登録が必要になる。
+cookie、DOM、console、telemetry へ移さない。browser storage を消した場合や別プロファイルでは、
+`moco open` から loopback URL を再度開く。
 
-新しい QR の fragment は保存済み値より常に優先し、キー更新後の再登録で古い値を置き換えられる。
+新しい loopback URL の fragment は保存済み値より常に優先し、キー更新後の再登録で古い値を
+置き換えられる。
 WebSocket は従来どおり `moco.capability.<value>` subprotocol を送り、サーバーは constant-time 比較を
 維持する。
 
@@ -110,14 +111,15 @@ WebSocket は従来どおり `moco.capability.<value>` subprotocol を送り、�
 削除する。daemon 稼働中はファイルもプロセス内キーも変更せず、停止後に再実行するよう安定した
 エラーを返す。
 
-次回 daemon 起動時に新しいキーを生成する。登録済みブラウザは `capability_mismatch` になり、新しい
-QR を読むと `localStorage` が置き換わる。rotate コマンドは旧値、新値、QR URL を出力しない。
+次回 daemon 起動時に新しいキーを生成する。登録済み loopback ブラウザは
+`capability_mismatch` になり、`moco open` から新しい loopback URL を開くと `localStorage` が
+置き換わる。rotate コマンドは旧値、新値、接続 URL を出力しない。
 
 ## 移行
 
-初回更新時、永続ファイルがなければ新しいキーを生成するため、原則として最後に一度だけ新しい QR
-登録が必要になる。ただし同じキーが安全に事前移行された環境では、ブラウザの旧
-`sessionStorage` から `localStorage` への移行により再登録なしで継続できる。
+初回更新時、永続ファイルがなければ新しいキーを生成するため、loopback browser は原則として
+最後に一度だけ `moco open` から接続し直す。ただし同じキーが安全に事前移行された環境では、
+ブラウザの旧 `sessionStorage` から `localStorage` への移行により再登録なしで継続できる。
 
 既存の `runtime.json` を永続ファイルへ改名してはならない。`runtime.json` にはプロセス限定の
 Reviewer control secret と死んだ endpoint 情報が含まれうるため、引き続き ephemeral state として
@@ -125,9 +127,10 @@ Reviewer control secret と死んだ endpoint 情報が含まれうるため、�
 
 ## セキュリティと失敗時の扱い
 
-- Cloudflare Access を通過しても正しい moco capability がなければ WebSocket を拒否する。
-- 永続化によりブラウザプロファイル侵害時の capability 生存期間は長くなるが、攻撃者は別途
-  Cloudflare Access も通過する必要がある。
+- 公開 host では Cloudflare Access identity だけを検証し、loopback host では正しい moco
+  capability を要求する。
+- 永続化により loopback ブラウザプロファイル侵害時の capability 生存期間は長くなる。攻撃には
+  同じ端末から loopback service へ到達できる実行環境も必要になる。
 - same-origin script は `localStorage` を読めるため、既存 CSP と外部 script 非依存を維持し、今回の
   変更で third-party script を追加しない。
 - capability 欠落と不一致は値を記録せず、bounded な安定コードで区別する。
@@ -158,8 +161,8 @@ Reviewer control secret と死んだ endpoint 情報が含まれうるため、�
 
 ### 統合と回帰
 
-- daemon を再起動しても同じ QR capability を受け入れる。
-- rotate 後は旧 capability を拒否し、新しい QR capability を受け入れる。
+- daemon を再起動しても同じ loopback capability を受け入れる。
+- rotate 後は旧 capability を拒否し、新しい loopback URL の capability を受け入れる。
 - loopback bind、公開 Origin / Host、QR endpoint、単一オペレーター、Reviewer secret の既存テストを
   維持する。
 - 完了前に `just check` を通す。
@@ -167,7 +170,7 @@ Reviewer control secret と死んだ endpoint 情報が含まれうるため、�
 ## 対象外
 
 - Cloudflare Access の session duration や policy の変更
-- Access JWT の moco 内検証
+- Access JWT の moco 内検証（後続の Cloudflare Access 設計で実装する）
 - 複数ブラウザプロファイル間の同期
 - ブラウザ保存を消した端末の自動再登録
 - capability の時刻ベース自動更新

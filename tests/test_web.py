@@ -3520,21 +3520,25 @@ async def test_access_lease_deadline_expires_and_cannot_be_revived() -> None:
 
 @pytest.mark.asyncio
 async def test_access_lease_refresh_extends_deadline_and_release_invalidates_token() -> None:
-    authority = web_app._AccessLeaseAuthority(max_seconds=0.08)  # noqa: SLF001
+    now = 0.0
+    authority = web_app._AccessLeaseAuthority(  # noqa: SLF001
+        max_seconds=0.08,
+        monotonic=lambda: now,
+        wall_time=lambda: 0.0,
+    )
     connection = ExpiringLeaseConnection()
-    authorization = AccessAuthorization("owner@example.com", time.time() + 300)
+    authorization = AccessAuthorization("owner@example.com", 300.0)
 
     token = await authority.issue(connection, authorization, on_expire=connection.expire)
     assert token is not None
-    await asyncio.sleep(0.05)
+    now = 0.05
     assert await authority.refresh(token, authorization)
-    await asyncio.sleep(0.05)
+    now = 0.1
     assert await authority.authorized(connection)
 
     await authority.release(connection)
     assert not await authority.refresh(token, authorization)
     assert not await authority.authorized(connection)
-    await asyncio.sleep(0.05)
     assert connection.expire_calls == 0
 
 
@@ -3884,7 +3888,7 @@ def test_public_operator_is_closed_and_unregistered_when_lease_refresh_stops() -
     verifier = FakeAccessVerifier()
     app = public_app(verifier)
     app.state.access_lease_authority = web_app._AccessLeaseAuthority(  # noqa: SLF001
-        max_seconds=0.02,
+        max_seconds=0.3,
     )
 
     with TestClient(app, base_url="https://voice.example.com") as client:
@@ -3897,13 +3901,13 @@ def test_public_operator_is_closed_and_unregistered_when_lease_refresh_stops() -
         ) as first:
             assert first.receive_json()["state"] == "ready"
             assert first.receive_json()["type"] == "access_lease"
-            try:
-                first.receive_json()
-            except WebSocketDisconnect:
-                pass
-            else:
-                with pytest.raises(WebSocketDisconnect):
+
+            def receive_until_disconnect() -> None:
+                while True:
                     first.receive_json()
+
+            with pytest.raises(WebSocketDisconnect):
+                receive_until_disconnect()
 
         with websocket_context(
             client,

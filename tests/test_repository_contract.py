@@ -313,6 +313,15 @@ def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> N
 
 def test_security_docs_distinguish_public_access_from_loopback_capability() -> None:
     security = _compact_prose((ROOT / "SECURITY.md").read_text(encoding="utf-8"))
+    persistent_design = _compact_prose(
+        (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-27-persistent-operator-capability-design.md"
+        ).read_text(encoding="utf-8")
+    )
     danger_design = _compact_prose(
         (
             ROOT
@@ -345,6 +354,17 @@ def test_security_docs_distinguish_public_access_from_loopback_capability() -> N
         "iPhoneはCloudflareAccessidentityの検証を通過してoperatorWebSocketへ接続する。"
     ) in danger_design
     assert "iPhoneはCloudflareAccessとoperatorcapabilityを通過" not in danger_design
+
+    assert (
+        "persistentoperatorcapabilityはloopbackoperatorendpointだけの認証境界とする。"
+        "公開operatorendpointの認証は後続のCloudflareAccess設計へ移管する。"
+    ) in persistent_design
+    assert (
+        "公開hostではCloudflareAccessidentityだけを検証し、loopbackhostでは正しい"
+        "mococapabilityを要求する。"
+    ) in persistent_design
+    assert "公開hostnameに対する独立したdefense-in-depth" not in persistent_design
+    assert "CloudflareAccessを通過しても正しいmococapability" not in persistent_design
 
 
 def test_readme_documents_stage_b_verification_without_claiming_live_acceptance() -> None:
