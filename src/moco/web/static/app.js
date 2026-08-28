@@ -12,6 +12,8 @@ import {
 const WEBSOCKET_PROTOCOL = "moco";
 const CAPABILITY_PREFIX = `${WEBSOCKET_PROTOCOL}.capability.`;
 const CAPABILITY_STORAGE_KEY = "moco.capability";
+const ACCESS_LEASE_REFRESH_MS = 20_000;
+const ACCESS_LEASE_TOKEN_PATTERN = /^[\x21-\x7e]{1,128}$/;
 const CAPABILITY_PATTERN = /^[A-Za-z0-9_-]{43}$/;
 const ICE_GATHERING_TIMEOUT_MS = 10_000;
 const WEBSOCKET_OPEN_TIMEOUT_MS = 10_000;
@@ -44,6 +46,10 @@ const ERROR_COPY = Object.freeze({
   websocket_open_timeout: "オペレーター接続が時間内に開きませんでした",
   websocket_failed: "オペレーター接続に失敗しました",
   websocket_closed_before_open: "オペレーター接続が開始前に閉じました",
+  access_auth_failed:
+    "Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+  capability_cleanup_failed:
+    "保存済み接続情報を安全に消去できませんでした。ページを再読み込みしてください",
   webrtc_connection_failed: "Realtime 音声接続が失敗しました",
   theme_config_invalid: "保存済み配色を読み込めないため既定値へ戻しました",
   audio_decode_failed: "受信した音声を再生できませんでした",
@@ -862,7 +868,85 @@ function isLoopbackHostname(hostname) {
   );
 }
 
-export function loadCapability({ location, history, persistentStorage, sessionStorage }) {
+const NOOP_STORAGE = Object.freeze({
+  getItem: () => null,
+  removeItem: () => {},
+  setItem: () => {},
+});
+
+function guardedBrowserStorage(owner, property) {
+  try {
+    const storage = owner[property];
+    const strict = {
+      getItem: storage.getItem.bind(storage),
+      removeItem: storage.removeItem.bind(storage),
+      setItem: storage.setItem.bind(storage),
+    };
+    return {
+      safe: {
+        getItem(key) {
+          try {
+            return strict.getItem(key);
+          } catch {
+            return null;
+          }
+        },
+        removeItem(key) {
+          try {
+            strict.removeItem(key);
+          } catch {}
+        },
+        setItem(key, value) {
+          try {
+            strict.setItem(key, value);
+          } catch {}
+        },
+      },
+      strict,
+    };
+  } catch {
+    return { safe: NOOP_STORAGE, strict: NOOP_STORAGE };
+  }
+}
+
+export function loadCapability({
+  location,
+  history,
+  persistentStorage,
+  sessionStorage,
+  cleanupPersistentStorage = persistentStorage,
+  cleanupSessionStorage = sessionStorage,
+}) {
+  if (!isLoopbackHostname(location.hostname)) {
+    let cleanupFailed = false;
+    for (const storage of [cleanupPersistentStorage, cleanupSessionStorage]) {
+      try {
+        storage.removeItem(CAPABILITY_STORAGE_KEY);
+      } catch {
+        try {
+          const capabilityRemains = Boolean(storage.getItem(CAPABILITY_STORAGE_KEY));
+          cleanupFailed = capabilityRemains || cleanupFailed;
+        } catch {
+          // Inaccessible storage cannot be read or sent by this page.
+        }
+      }
+    }
+    if (location.hash) {
+      const cleanUrl = `${location.pathname}${location.search ?? ""}`;
+      try {
+        history.replaceState(null, "", cleanUrl);
+      } catch {
+        cleanupFailed = true;
+        try {
+          location.replace(cleanUrl);
+        } catch {}
+      }
+    }
+    if (cleanupFailed) {
+      throw namedError("capability_cleanup_failed");
+    }
+    return "";
+  }
   const capabilityFromUrl = location.hash.slice(1);
   if (capabilityFromUrl) {
     history.replaceState(null, "", location.pathname);
@@ -881,6 +965,108 @@ export function loadCapability({ location, history, persistentStorage, sessionSt
     return legacy;
   }
   return "";
+}
+
+export function operatorSocketProtocols(capability) {
+  return capability
+    ? [WEBSOCKET_PROTOCOL, `${CAPABILITY_PREFIX}${capability}`]
+    : [WEBSOCKET_PROTOCOL];
+}
+
+export async function probeOperatorAccess(fetch) {
+  try {
+    const response = await fetch("/auth/status", {
+      cache: "no-store",
+      credentials: "same-origin",
+      method: "GET",
+      redirect: "manual",
+    });
+    if (
+      response.redirected === true ||
+      response.type === "opaqueredirect" ||
+      response.status !== 204
+    ) {
+      throw namedError("access_auth_failed");
+    }
+  } catch {
+    throw namedError("access_auth_failed");
+  }
+}
+
+export class AccessLeaseRefresher {
+  constructor({ fetch, onFailure, timers }) {
+    this.fetch = fetch;
+    this.onFailure = onFailure;
+    this.timers = timers;
+    this.timer = undefined;
+    this.token = undefined;
+    this.generation = 0;
+    this.inFlight = undefined;
+  }
+
+  start(token) {
+    this.stop();
+    if (typeof token !== "string" || !ACCESS_LEASE_TOKEN_PATTERN.test(token)) {
+      this.onFailure("access_auth_failed");
+      return;
+    }
+    this.token = token;
+    const generation = this.generation;
+    this.timer = this.timers.set(() => this.#refresh(generation, token), ACCESS_LEASE_REFRESH_MS);
+  }
+
+  stop() {
+    this.generation += 1;
+    if (this.timer !== undefined) {
+      this.timers.clear(this.timer);
+    }
+    this.timer = undefined;
+    this.token = undefined;
+    this.inFlight = undefined;
+  }
+
+  async #refresh(generation, token) {
+    if (generation !== this.generation || token !== this.token) {
+      return;
+    }
+    if (this.inFlight?.generation === generation) {
+      return this.inFlight.promise;
+    }
+    const promise = this.#performRefresh(generation, token);
+    this.inFlight = { generation, promise };
+    try {
+      await promise;
+    } finally {
+      if (this.inFlight?.promise === promise) {
+        this.inFlight = undefined;
+      }
+    }
+  }
+
+  async #performRefresh(generation, token) {
+    try {
+      const response = await this.fetch("/auth/lease", {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Moco-Access-Lease": token },
+        method: "POST",
+        redirect: "manual",
+      });
+      if (
+        response.redirected === true ||
+        response.type === "opaqueredirect" ||
+        response.status !== 204
+      ) {
+        throw new Error("access lease rejected");
+      }
+    } catch {
+      if (generation !== this.generation || token !== this.token) {
+        return;
+      }
+      this.stop();
+      this.onFailure("access_auth_failed");
+    }
+  }
 }
 
 export class PairingPanel {
@@ -1162,9 +1348,11 @@ function boot() {
       updated: dom.progressUpdated,
     }),
   });
+  const localStorage = guardedBrowserStorage(window, "localStorage");
+  const sessionStorage = guardedBrowserStorage(window, "sessionStorage");
   const themeController = new ThemeController({
     root: document.documentElement,
-    storage: window.localStorage,
+    storage: localStorage.safe,
     onWarning: (code) => operatorStatus.showError(code),
   });
   themeController.load();
@@ -1174,12 +1362,22 @@ function boot() {
     themePanel.render(),
   );
   operatorStatus.renderProgress();
-  const capability = loadCapability({
-    location: window.location,
-    history: window.history,
-    persistentStorage: window.localStorage,
-    sessionStorage: window.sessionStorage,
-  });
+  let capability = "";
+  let capabilityCleanupError;
+  try {
+    capability = loadCapability({
+      location: window.location,
+      history: window.history,
+      persistentStorage: localStorage.safe,
+      sessionStorage: sessionStorage.safe,
+      cleanupPersistentStorage: localStorage.strict,
+      cleanupSessionStorage: sessionStorage.strict,
+    });
+  } catch (error) {
+    capabilityCleanupError = error;
+    operatorStatus.showError(error.name || "capability_cleanup_failed");
+  }
+  const operatorFetch = window.fetch.bind(window);
   const pairingPanel = new PairingPanel({
     capability,
     dom: {
@@ -1188,7 +1386,7 @@ function boot() {
       close: dom.pairingClose,
       image: dom.pairingImage,
     },
-    fetch: window.fetch.bind(window),
+    fetch: operatorFetch,
     location: window.location,
     createObjectURL: (blob) => window.URL.createObjectURL(blob),
     revokeObjectURL: (url) => window.URL.revokeObjectURL(url),
@@ -1208,6 +1406,21 @@ function boot() {
   let discardFailedHandshakeTerminal = false;
   let stopPeerWatch;
   let socketCloseError;
+  let connectionAttemptGeneration = 0;
+  const accessLeaseRefresher = new AccessLeaseRefresher({
+    fetch: operatorFetch,
+    onFailure: (code) => {
+      if (!socket) {
+        return;
+      }
+      socketCloseError = { code, displayed: false };
+      socket.close();
+    },
+    timers: {
+      clear: (timer) => window.clearInterval(timer),
+      set: (callback, delayMs) => window.setInterval(callback, delayMs),
+    },
+  });
   const hotkeyMapper = new BrowserHotkeyMapper({
     globalHotkeysEnabled: true,
     startKey: "",
@@ -1225,16 +1438,24 @@ function boot() {
   });
   const turnCancel = new TurnCancelController({ button: dom.turnCancel, send });
 
-  const connectSocket = () => {
+  const assertCurrentConnectionAttempt = (attempt) => {
+    if (
+      attempt.generation !== connectionAttemptGeneration ||
+      attempt.controller !== controller ||
+      attempt.stream !== stream
+    ) {
+      throw namedError("websocket_disconnected", { displayed: true });
+    }
+  };
+
+  const connectSocket = (attempt) => {
+    assertCurrentConnectionAttempt(attempt);
     if (openPromise) {
       return openPromise;
     }
     const url = new URL("/ws", window.location.href);
     url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
-    const nextSocket = new WebSocket(url, [
-      WEBSOCKET_PROTOCOL,
-      `${CAPABILITY_PREFIX}${capability}`,
-    ]);
+    const nextSocket = new WebSocket(url, operatorSocketProtocols(capability));
     socket = nextSocket;
     nextSocket.binaryType = "arraybuffer";
     let wasOnline = false;
@@ -1245,6 +1466,8 @@ function boot() {
       const disconnectError = socketCloseError;
       const disconnectCode = disconnectError?.code;
       socketCloseError = undefined;
+      connectionAttemptGeneration += 1;
+      accessLeaseRefresher.stop();
       setTransportOffline(dom);
       clearInterval(progressTimer);
       progressTimer = undefined;
@@ -1295,6 +1518,12 @@ function boot() {
         message = JSON.parse(event.data);
       } catch {
         operatorStatus.showError("invalid_message");
+        return;
+      }
+      if (message.type === "access_lease") {
+        if (!isLoopbackHostname(window.location.hostname) && socket === nextSocket) {
+          accessLeaseRefresher.start(message.token);
+        }
         return;
       }
       if (
@@ -1399,7 +1628,12 @@ function boot() {
   };
 
   const connectConversation = async () => {
-    const replacement = controller?.reconnectRequired === true;
+    const attempt = {
+      controller,
+      generation: ++connectionAttemptGeneration,
+      stream,
+    };
+    const replacement = attempt.controller?.reconnectRequired === true;
     let startSent = false;
     let established = false;
     let voiceLossClaimed = false;
@@ -1410,7 +1644,10 @@ function boot() {
       voiceLossClaimed = true;
       send({ type: "voice_lost" });
     };
-    await connectSocket();
+    await probeOperatorAccess(operatorFetch);
+    assertCurrentConnectionAttempt(attempt);
+    await connectSocket(attempt);
+    assertCurrentConnectionAttempt(attempt);
     stopPeerWatch?.();
     peer?.close();
     const nextPeer = new RTCPeerConnection();
@@ -1420,7 +1657,7 @@ function boot() {
       if (
         !closeCurrentPeer(nextPeer, peer, {
           stopWatching: stopPeerWatch,
-          requireReconnect: () => controller?.requireReconnect(),
+          requireReconnect: () => attempt.controller?.requireReconnect(),
         })
       ) {
         return;
@@ -1436,11 +1673,14 @@ function boot() {
       operatorStatus.showError(code);
     });
     try {
-      nextPeer.addTrack(stream.getAudioTracks()[0], stream);
+      nextPeer.addTrack(attempt.stream.getAudioTracks()[0], attempt.stream);
       nextPeer.createDataChannel("oai-events");
       const offer = await nextPeer.createOffer();
+      assertCurrentConnectionAttempt(attempt);
       await nextPeer.setLocalDescription(offer);
+      assertCurrentConnectionAttempt(attempt);
       await waitForIce(nextPeer);
+      assertCurrentConnectionAttempt(attempt);
       handshake = new ConversationHandshake((sdp) =>
         nextPeer.setRemoteDescription({ type: "answer", sdp }),
       );
@@ -1455,7 +1695,7 @@ function boot() {
           replacement,
           startSent,
           stopWatching: stopPeerWatch,
-          requireReconnect: () => controller?.requireReconnect(),
+          requireReconnect: () => attempt.controller?.requireReconnect(),
           send,
           claimVoiceLoss,
         })
@@ -1472,6 +1712,11 @@ function boot() {
   };
 
   dom.enable.addEventListener("click", async () => {
+    if (capabilityCleanupError) {
+      operatorStatus.showError(capabilityCleanupError.name || "capability_cleanup_failed");
+      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      return;
+    }
     dom.enable.disabled = true;
     let stage = "audio";
     try {
@@ -1519,7 +1764,7 @@ function boot() {
         outputSelect: dom.audioOutput,
         context,
         mediaDevices: navigator.mediaDevices,
-        storage: window.localStorage,
+        storage: localStorage.safe,
         getCurrentStream: () => stream,
         getAudioSender: () => peer?.getSenders().find((sender) => sender.track?.kind === "audio"),
         replaceCurrentStream: (nextStream) => {
@@ -1566,13 +1811,14 @@ function boot() {
   });
 
   const apply = async (control) => {
-    if (!controller) {
+    const activeController = controller;
+    if (!activeController) {
       return;
     }
     const listening = control === "listen_start";
     let applied;
     try {
-      applied = await controller.applyControl(control);
+      applied = await activeController.applyControl(control);
     } catch (error) {
       const closing = closeSocketForFailure(
         socket,
@@ -1580,11 +1826,14 @@ function boot() {
         (failure) => {
           socketCloseError = failure;
         },
-        { preserveTransport: controller.reconnectRequired },
+        { preserveTransport: activeController.reconnectRequired },
       );
       if (!closing && !error.displayed) {
         operatorStatus.showError(error.name || "conversation_start_failed");
       }
+      return;
+    }
+    if (controller !== activeController) {
       return;
     }
     if (!applied) {

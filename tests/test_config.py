@@ -12,6 +12,7 @@ from pydantic import ValidationError
 from moco import config as config_module
 from moco.config import (
     AgentProfileMode,
+    CloudflareAccessSettings,
     CodexSettings,
     ConfigError,
     IrodoriSettings,
@@ -172,9 +173,230 @@ def test_operator_server_must_bind_loopback(tmp_path: Path) -> None:
 
 
 def test_public_operator_url_is_normalized() -> None:
-    settings = ServerSettings(public_url=" HTTPS://Voice.Example.COM ")
+    settings = ServerSettings.model_validate(
+        {
+            "public_url": " HTTPS://Voice.Example.COM/ ",
+            "cloudflare_access": {
+                "team_domain": " HTTPS://Example-Team.CloudflareAccess.COM/ ",
+                "audience": " audience_123-ABC ",
+                "allowed_email": "Owner@Example.COM",
+            },
+        },
+    )
 
     assert settings.public_url == "https://voice.example.com"
+    assert settings.cloudflare_access is not None
+    assert settings.cloudflare_access.team_domain == "https://example-team.cloudflareaccess.com"
+    assert settings.cloudflare_access.audience == "audience_123-ABC"
+    assert settings.cloudflare_access.allowed_email == "Owner@Example.COM"
+
+
+@pytest.mark.parametrize(
+    "public_url",
+    [
+        "https://xn--bcher-kva.example",
+        "https://xn--fa-hia.example",
+        "https://xn--strae-oqa.example",
+    ],
+)
+def test_public_operator_url_accepts_valid_ace_hostname(public_url: str) -> None:
+    settings = ServerSettings.model_validate(
+        {
+            "public_url": public_url,
+            "cloudflare_access": {
+                "team_domain": "https://example-team.cloudflareaccess.com",
+                "audience": "audience_123-ABC",
+                "allowed_email": "owner@example.com",
+            },
+        },
+    )
+
+    assert settings.public_url == public_url
+
+
+@pytest.mark.parametrize(
+    "server",
+    [
+        {"public_url": "https://voice.example.com"},
+        {
+            "cloudflare_access": {
+                "team_domain": "https://example-team.cloudflareaccess.com",
+                "audience": "audience_123-ABC",
+                "allowed_email": "owner@example.com",
+            },
+        },
+    ],
+    ids=["public-url-only", "access-only"],
+)
+def test_public_operator_url_and_cloudflare_access_are_required_together(
+    server: dict[str, object],
+) -> None:
+    with pytest.raises(ValidationError, match=r"public_url.*cloudflare_access"):
+        ServerSettings.model_validate(server)
+
+
+def test_cloudflare_access_settings_are_frozen_and_reject_unknown_keys() -> None:
+    settings = CloudflareAccessSettings(
+        team_domain="https://example-team.cloudflareaccess.com",
+        audience="audience_123-ABC",
+        allowed_email="owner@example.com",
+    )
+
+    with pytest.raises(ValidationError, match="frozen"):
+        settings.audience = "replacement"
+    with pytest.raises(ValidationError, match="extra"):
+        CloudflareAccessSettings.model_validate(
+            {
+                "team_domain": "https://example-team.cloudflareaccess.com",
+                "audience": "audience_123-ABC",
+                "allowed_email": "owner@example.com",
+                "token": "must-not-be-configurable",
+            },
+        )
+
+
+@pytest.mark.parametrize(
+    "team_domain",
+    [
+        "http://example-team.cloudflareaccess.com",
+        "https://user@example-team.cloudflareaccess.com",
+        "https://example-team.cloudflareaccess.com:443",
+        "https://example-team.cloudflareaccess.com:invalid",
+        "https://example-team.cloudflareaccess.com:",
+        "https://example-team.cloudflareaccess.com/path",
+        "https://example-team.cloudflareaccess.com?query=yes",
+        "https://example-team.cloudflareaccess.com#fragment",
+        "https://*.cloudflareaccess.com",
+        "https://127.0.0.1",
+        "https://example-team.cloudflareaccess.com.evil.example",
+        "https://example-team.cloudflareaccess.com.",
+        "https://example-team.cloudflareaccess.com%2eevil.example",
+        "https://example- team.cloudflareaccess.com",
+        "https://example-\tteam.cloudflareaccess.com",
+        "https://example-\rteam.cloudflareaccess.com",
+        "https://example-\nteam.cloudflareaccess.com",
+        "https://foo.bar.cloudflareaccess.com",
+        "https://-example.cloudflareaccess.com",
+        "https://example-.cloudflareaccess.com",
+        "https://example_team.cloudflareaccess.com",
+        f"https://{'a' * 64}.cloudflareaccess.com",
+        "https://équipe.cloudflareaccess.com",
+        "https://cloudflareaccess.com",
+        "https://example.com",
+        "https://[::1",
+    ],
+)
+def test_cloudflare_access_rejects_invalid_team_domain(team_domain: str) -> None:
+    with pytest.raises(ValidationError, match="team domain"):
+        CloudflareAccessSettings(
+            team_domain=team_domain,
+            audience="audience_123-ABC",
+            allowed_email="owner@example.com",
+        )
+
+
+def test_cloudflare_access_accepts_maximum_audience_length() -> None:
+    audience = "a" * 256
+
+    settings = CloudflareAccessSettings(
+        team_domain="https://example-team.cloudflareaccess.com",
+        audience=f" {audience} ",
+        allowed_email="owner@example.com",
+    )
+
+    assert settings.audience == audience
+
+
+@pytest.mark.parametrize(
+    "audience",
+    [
+        "",
+        "   ",
+        "audience with space",
+        "audience\tvalue",
+        "audience\nvalue",
+        "\taudience",
+        "audience\n",
+        "audience\0value",
+        "audience.value",
+        "é",
+        "a" * 257,
+    ],
+)
+def test_cloudflare_access_rejects_invalid_audience(audience: str) -> None:
+    with pytest.raises(ValidationError, match="audience"):
+        CloudflareAccessSettings(
+            team_domain="https://example-team.cloudflareaccess.com",
+            audience=audience,
+            allowed_email="owner@example.com",
+        )
+
+
+def test_cloudflare_access_accepts_maximum_email_length_and_preserves_exact_case() -> None:
+    allowed_email = f"{'A' * 242}@Example.com"
+
+    settings = CloudflareAccessSettings(
+        team_domain="https://example-team.cloudflareaccess.com",
+        audience="audience_123-ABC",
+        allowed_email=allowed_email,
+    )
+
+    assert len(settings.allowed_email) == 254
+    assert settings.allowed_email == allowed_email
+
+
+@pytest.mark.parametrize(
+    "allowed_email",
+    [
+        "straße@example.com",
+        "owner@exämple.com",
+        "オーナー@example.com",
+    ],
+)
+def test_cloudflare_access_rejects_non_ascii_allowed_email(allowed_email: str) -> None:
+    with pytest.raises(ValidationError, match="allowed email"):
+        CloudflareAccessSettings(
+            team_domain="https://example-team.cloudflareaccess.com",
+            audience="audience_123-ABC",
+            allowed_email=allowed_email,
+        )
+
+
+@pytest.mark.parametrize(
+    "allowed_email",
+    [
+        "",
+        "   ",
+        "owner.example.com",
+        "@example.com",
+        "owner@",
+        "owner@@example.com",
+        "owner @example.com",
+        "owner@example .com",
+        "owner\texample@example.com",
+        "owner\n@example.com",
+        " owner@example.com",
+        "owner@example.com ",
+        "\towner@example.com",
+        "owner@example.com\t",
+        "\rowner@example.com",
+        "owner@example.com\r",
+        "\nowner@example.com",
+        "owner@example.com\n",
+        "owner\0@example.com",
+        "Owner <owner@example.com>",
+        "owner@example.com,other@example.com",
+        "owner@example.com,",
+        f"{'a' * 243}@example.com",
+    ],
+)
+def test_cloudflare_access_rejects_invalid_allowed_email(allowed_email: str) -> None:
+    with pytest.raises(ValidationError, match="allowed email"):
+        CloudflareAccessSettings(
+            team_domain="https://example-team.cloudflareaccess.com",
+            audience="audience_123-ABC",
+            allowed_email=allowed_email,
+        )
 
 
 @pytest.mark.parametrize(
@@ -182,10 +404,27 @@ def test_public_operator_url_is_normalized() -> None:
     [
         "http://voice.example.com",
         "https://127.0.0.1",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://127.0.0.01",
+        "https://1.2",
+        "https://0x7f.1",
+        "https://0177.1",
+        "https://2130706433",
+        "https://127..1",
+        "https://1.4294967296",
+        "https://xn--a.com",
+        "https://faß.example",
+        "https://straße.example",
+        "https://K.example",
+        "https://ſ.example",
         "https://*.example.com",
+        "https://voice.example.com:",
         "https://voice.example.com:8443",
         "https://voice.example.com/path",
+        "https://voice.example.com?",
         "https://voice.example.com?mode=mobile",
+        "https://voice.example.com#",
         "https://voice.example.com/#fragment",
         "https://user@voice.example.com",
         "https://localhost",
@@ -193,7 +432,16 @@ def test_public_operator_url_is_normalized() -> None:
 )
 def test_public_operator_url_rejects_unsafe_shapes(public_url: str) -> None:
     with pytest.raises(ValueError, match="public URL"):
-        ServerSettings(public_url=public_url)
+        ServerSettings.model_validate(
+            {
+                "public_url": public_url,
+                "cloudflare_access": {
+                    "team_domain": "https://example-team.cloudflareaccess.com",
+                    "audience": "audience_123-ABC",
+                    "allowed_email": "owner@example.com",
+                },
+            },
+        )
 
 
 @pytest.mark.parametrize(

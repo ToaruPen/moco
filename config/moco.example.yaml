@@ -3,8 +3,14 @@ server:
   # moco stays loopback-only; cloudflared connects to this origin.
   host: 127.0.0.1
   port: 8765
-  # Optional stable hostname protected by Cloudflare Access. No path or port.
+  # The public URL and Cloudflare Access settings must be configured together.
   public_url: null
+  cloudflare_access: null
+  # public_url: https://voice.example.com
+  # cloudflare_access:
+  #   team_domain: https://example-team.cloudflareaccess.com
+  #   audience: example-access-application-aud
+  #   allowed_email: owner@example.com
 
 hotkeys:
   enabled: true

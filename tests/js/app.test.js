@@ -1698,19 +1698,84 @@ describe("VoiceModelController", () => {
 let bootHarnessSequence = 0;
 
 async function bootConversationHarness({
+  accessStatus = 204,
   answerStarts = [],
+  initialCapability,
+  leaseStatus = 204,
+  pendingAccessProbes = [],
   pendingEnumerations = [],
   pendingOffers = [],
   pendingSenderReplacements = [],
+  storageGettersThrow = false,
+  storageRemovalThrows = false,
+  url = "http://127.0.0.1:8765/?capability=test-capability",
 } = {}) {
   const html = await readFile(
     new URL("../../src/moco/web/static/index.html", import.meta.url),
     "utf8",
   );
-  const dom = new JSDOM(html, { url: "http://127.0.0.1:8765/?capability=test-capability" });
+  const dom = new JSDOM(html, { url });
+  if (initialCapability) {
+    dom.window.localStorage.setItem("moco.capability", initialCapability);
+    dom.window.sessionStorage.setItem("moco.capability", initialCapability);
+  }
+  if (storageRemovalThrows) {
+    Object.defineProperty(dom.window.Storage.prototype, "removeItem", {
+      configurable: true,
+      value: () => {
+        throw new Error("storage unavailable");
+      },
+    });
+  }
+  if (storageGettersThrow) {
+    for (const property of ["localStorage", "sessionStorage"]) {
+      Object.defineProperty(dom.window, property, {
+        configurable: true,
+        get() {
+          throw new dom.window.DOMException("storage blocked", "SecurityError");
+        },
+      });
+    }
+  }
   dom.window.matchMedia = () => ({ matches: false, addEventListener() {} });
-  dom.window.fetch = async () => ({ ok: false });
 
+  const connectionOrder = [];
+  const fetchCalls = [];
+  const leaseIntervals = new Map();
+  let leaseIntervalId = 0;
+  const realSetInterval = dom.window.setInterval.bind(dom.window);
+  const realClearInterval = dom.window.clearInterval.bind(dom.window);
+  dom.window.setInterval = (callback, delayMs, ...args) => {
+    if (delayMs !== 20_000) {
+      return realSetInterval(callback, delayMs, ...args);
+    }
+    const id = ++leaseIntervalId;
+    leaseIntervals.set(id, callback);
+    return id;
+  };
+  dom.window.clearInterval = (id) => {
+    if (!leaseIntervals.delete(id)) {
+      realClearInterval(id);
+    }
+  };
+  const accessResolvers = new Map();
+  let accessIndex = 0;
+  dom.window.fetch = async (requestUrl, options = {}) => {
+    fetchCalls.push({ url: requestUrl, options });
+    if (requestUrl === "/auth/status") {
+      const index = accessIndex;
+      accessIndex += 1;
+      connectionOrder.push("access");
+      if (pendingAccessProbes.includes(index)) {
+        await new Promise((resolve) => accessResolvers.set(index, resolve));
+      }
+      return { redirected: false, status: accessStatus, type: "basic" };
+    }
+    if (requestUrl === "/auth/lease") {
+      return { redirected: false, status: leaseStatus, type: "basic" };
+    }
+    return { ok: false, status: 404, type: "basic" };
+  };
   const sent = [];
   const sockets = [];
   const peers = [];
@@ -1724,8 +1789,11 @@ async function bootConversationHarness({
     static OPEN = 1;
     static CLOSED = 3;
 
-    constructor() {
+    constructor(socketUrl, protocols) {
       super();
+      connectionOrder.push("socket");
+      this.protocols = protocols;
+      this.url = socketUrl.toString();
       this.readyState = FakeSocket.CONNECTING;
       sockets.push(this);
       queueMicrotask(() => {
@@ -1830,6 +1898,7 @@ async function bootConversationHarness({
 
   class FakeAudioContext {
     constructor() {
+      connectionOrder.push("audio-context");
       this.state = "running";
       this.currentTime = 0;
       this.destination = {};
@@ -1837,7 +1906,9 @@ async function bootConversationHarness({
       audioContexts.push(this);
     }
 
-    async resume() {}
+    async resume() {
+      connectionOrder.push("audio-resume");
+    }
 
     async setSinkId(deviceId) {
       this.sinkIds.push(deviceId);
@@ -1880,6 +1951,7 @@ async function bootConversationHarness({
     }
 
     async getUserMedia(constraints) {
+      connectionOrder.push("microphone");
       this.requests.push(constraints);
       const exact = constraints.audio?.deviceId?.exact;
       const deviceId = exact || "mic-1";
@@ -1990,14 +2062,29 @@ async function bootConversationHarness({
 
   dom.window.document.querySelector("#enable").click();
   return {
+    accessResolvers,
     audioContexts,
     close,
+    connectionOrder,
     disconnect: (index = 0) => sockets[index].close(),
     dom,
+    fetchCalls,
+    leaseIntervals,
     mediaDevices,
     peers,
     receive: (message) => sockets[0].receive(message),
     requireReplacement,
+    resolveAccess: (index) => {
+      const resolve = accessResolvers.get(index);
+      assert.ok(resolve, `Access probe ${index} must be pending`);
+      accessResolvers.delete(index);
+      resolve();
+    },
+    runLeaseRefresh: async () => {
+      assert.equal(leaseIntervals.size, 1, "one Access lease timer must be active");
+      await [...leaseIntervals.values()][0]();
+      await new Promise((resolve) => setImmediate(resolve));
+    },
     retryListening: () => dom.window.document.querySelector("#listen-start").click(),
     sent,
     sockets,
@@ -2006,6 +2093,209 @@ async function bootConversationHarness({
     waitFor,
   };
 }
+
+describe("operator Access browser connection", () => {
+  it("activates audio and requests microphone permission before probing Access and opening a socket", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.deepEqual(connection.connectionOrder, [
+        "audio-context",
+        "audio-resume",
+        "microphone",
+        "access",
+        "socket",
+      ]);
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("clears public capabilities and opens the actual socket without a capability protocol", async () => {
+    const capability = "I".repeat(43);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      initialCapability: capability,
+      url: `https://operator.example.com/#${capability}`,
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.equal(connection.dom.window.location.hash, "");
+      assert.equal(connection.dom.window.localStorage.getItem("moco.capability"), null);
+      assert.equal(connection.dom.window.sessionStorage.getItem("moco.capability"), null);
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("fails closed when a readable public capability remains after storage removal fails", async () => {
+    const capability = "J".repeat(43);
+    const connection = await bootConversationHarness({
+      initialCapability: capability,
+      storageRemovalThrows: true,
+      url: `https://operator.example.com/#${capability}`,
+    });
+    try {
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#error-text").textContent !== "",
+      );
+
+      assert.equal(connection.dom.window.location.hash, "");
+      assert.equal(connection.dom.window.localStorage.getItem("moco.capability"), capability);
+      assert.equal(connection.dom.window.sessionStorage.getItem("moco.capability"), capability);
+      assert.equal(connection.sockets.length, 0);
+      assert.equal(connection.peers.length, 0);
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "capability_cleanup_failed — 保存済み接続情報を安全に消去できませんでした。ページを再読み込みしてください",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("boots with safe no-op storage when browser storage getters throw", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      storageGettersThrow: true,
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+
+      assert.deepEqual(connection.sockets[0].protocols, ["moco"]);
+      assert.equal(
+        connection.dom.window.document.querySelector("#connection").textContent,
+        "WS ONLINE",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("shows the actionable Access error and never opens a socket when the probe fails", async () => {
+    const connection = await bootConversationHarness({ accessStatus: 403 });
+    try {
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#error-text").textContent !== "",
+      );
+
+      assert.equal(connection.sockets.length, 0);
+      assert.equal(connection.peers.length, 0);
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "access_auth_failed — Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+      );
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("probes Access again before each Voice reconnection", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0, 1] });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      assert.equal(connection.fetchCalls.filter(({ url }) => url === "/auth/status").length, 1);
+
+      connection.requireReplacement();
+      await connection.waitFor(() => connection.peers[1]?.remoteDescriptions.length === 1);
+
+      assert.equal(connection.fetchCalls.filter(({ url }) => url === "/auth/status").length, 2);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("invalidates a delayed reconnect probe when its current socket closes", async () => {
+    const unhandled = [];
+    const onUnhandled = (error) => unhandled.push(error);
+    process.on("unhandledRejection", onUnhandled);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      pendingAccessProbes: [1],
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.requireReplacement();
+      await connection.waitFor(() => connection.accessResolvers.has(1));
+
+      connection.disconnect();
+      await connection.waitFor(
+        () => connection.dom.window.document.querySelector("#connection-row").hidden === false,
+      );
+      connection.resolveAccess(1);
+      await new Promise((resolve) => setImmediate(resolve));
+
+      assert.equal(connection.sockets.length, 1);
+      assert.equal(connection.peers.length, 1);
+      assert.equal(connection.dom.window.document.querySelector("#enable").disabled, false);
+      assert.equal(connection.dom.window.document.querySelector("#enable").textContent, "再接続");
+      assert.deepEqual(unhandled, []);
+    } finally {
+      process.off("unhandledRejection", onUnhandled);
+      await connection.close();
+    }
+  });
+
+  it("silently refreshes a server-issued lease without interrupting active media", async () => {
+    const token = "V".repeat(43);
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.receive({ type: "access_lease", token });
+      await connection.waitFor(() => connection.leaseIntervals.size === 1);
+
+      await connection.runLeaseRefresh();
+
+      const refresh = connection.fetchCalls.find(({ url }) => url === "/auth/lease");
+      assert.deepEqual(refresh.options, {
+        cache: "no-store",
+        credentials: "same-origin",
+        headers: { "X-Moco-Access-Lease": token },
+        method: "POST",
+        redirect: "manual",
+      });
+      assert.equal(connection.sockets[0].readyState, connection.sockets[0].constructor.OPEN);
+      assert.equal(connection.tracks[0].readyState, "live");
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("closes the operator and shows Access auth failure when lease refresh is rejected", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      leaseStatus: 403,
+      url: "https://operator.example.com/",
+    });
+    try {
+      await connection.waitFor(() => connection.peers[0]?.remoteDescriptions.length === 1);
+      connection.receive({ type: "access_lease", token: "W".repeat(43) });
+      await connection.waitFor(() => connection.leaseIntervals.size === 1);
+
+      await connection.runLeaseRefresh();
+      await connection.waitFor(() => connection.sockets[0].readyState === 3);
+
+      assert.equal(
+        connection.dom.window.document.querySelector("#error-text").textContent,
+        "access_auth_failed — Cloudflare Access の認証を確認できませんでした。ページを再読み込みしてください",
+      );
+      assert.equal(connection.leaseIntervals.size, 0);
+    } finally {
+      await connection.close();
+    }
+  });
+});
 
 describe("audio device switching", () => {
   it("replaces the current microphone track without reconnecting the conversation", async () => {
@@ -2640,7 +2930,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: `#${capability}`, pathname: "/" },
+        location: { hash: `#${capability}`, hostname: "127.0.0.1", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2649,7 +2939,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "", pathname: "/" },
+        location: { hash: "", hostname: "127.0.0.1", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2671,7 +2961,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: "", pathname: "/" },
+        location: { hash: "", hostname: "localhost", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2681,7 +2971,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history,
-        location: { hash: `#${freshCapability}`, pathname: "/" },
+        location: { hash: `#${freshCapability}`, hostname: "localhost", pathname: "/" },
         persistentStorage,
         sessionStorage,
       }),
@@ -2702,7 +2992,7 @@ describe("browser connection timeouts", () => {
     assert.equal(
       appModule.loadCapability({
         history: { replaceState: (_state, _unused, url) => replaced.push(url) },
-        location: { hash: "#invalid", pathname: "/" },
+        location: { hash: "#invalid", hostname: "[::1]", pathname: "/" },
         persistentStorage,
         sessionStorage: { getItem: () => null },
       }),
@@ -2710,6 +3000,320 @@ describe("browser connection timeouts", () => {
     );
     assert.equal(values.get("moco.capability"), persistedCapability);
     assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("removes every capability source from a public origin", () => {
+    const fragmentCapability = "E".repeat(43);
+    const storedCapability = "F".repeat(43);
+    const persistentValues = new Map([["moco.capability", storedCapability]]);
+    const sessionValues = new Map([["moco.capability", storedCapability]]);
+    const storage = (values) => ({
+      getItem: () => assert.fail("public capability storage must not be read"),
+      removeItem: (key) => values.delete(key),
+      setItem: () => assert.fail("public capability storage must not be written"),
+    });
+    const replaced = [];
+
+    const capability = appModule.loadCapability({
+      history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+      location: {
+        hash: `#${fragmentCapability}`,
+        hostname: "operator.example.com",
+        pathname: "/operator",
+        search: "?mode=voice",
+      },
+      persistentStorage: storage(persistentValues),
+      sessionStorage: storage(sessionValues),
+    });
+
+    assert.equal(capability, "");
+    assert.equal(persistentValues.has("moco.capability"), false);
+    assert.equal(sessionValues.has("moco.capability"), false);
+    assert.deepEqual(replaced, ["/operator?mode=voice"]);
+  });
+
+  it("keeps public Access startup capability-free when failed storage is unreadable", () => {
+    const removals = [];
+    const replaced = [];
+    const capability = appModule.loadCapability({
+      history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+      location: {
+        hash: `#${"G".repeat(43)}`,
+        hostname: "operator.example.com",
+        pathname: "/",
+        search: "",
+      },
+      persistentStorage: {
+        removeItem() {
+          removals.push("persistent");
+          throw new Error("storage unavailable");
+        },
+      },
+      sessionStorage: {
+        removeItem() {
+          removals.push("session");
+          throw new Error("storage unavailable");
+        },
+      },
+    });
+
+    assert.equal(capability, "");
+    assert.deepEqual(appModule.operatorSocketProtocols(capability), ["moco"]);
+    assert.deepEqual(removals, ["persistent", "session"]);
+    assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("fails closed after attempting both stores when a removed public capability remains readable", () => {
+    const capability = "K".repeat(43);
+    const reads = [];
+    const removals = [];
+    const storage = (name) => ({
+      getItem() {
+        reads.push(name);
+        return capability;
+      },
+      removeItem() {
+        removals.push(name);
+        throw new Error("storage unavailable");
+      },
+    });
+    const replaced = [];
+
+    assert.throws(
+      () =>
+        appModule.loadCapability({
+          history: { replaceState: (_state, _unused, url) => replaced.push(url) },
+          location: {
+            hash: `#${capability}`,
+            hostname: "operator.example.com",
+            pathname: "/",
+            search: "",
+          },
+          persistentStorage: storage("persistent"),
+          sessionStorage: storage("session"),
+        }),
+      (error) => error.name === "capability_cleanup_failed",
+    );
+    assert.deepEqual(removals, ["persistent", "session"]);
+    assert.deepEqual(reads, ["persistent", "session"]);
+    assert.deepEqual(replaced, ["/"]);
+  });
+
+  it("attempts clean navigation and fails closed when public fragment replacement fails", () => {
+    const navigations = [];
+    const storage = { removeItem() {} };
+
+    assert.throws(
+      () =>
+        appModule.loadCapability({
+          history: {
+            replaceState() {
+              throw new Error("history unavailable");
+            },
+          },
+          location: {
+            hash: `#${"L".repeat(43)}`,
+            hostname: "operator.example.com",
+            pathname: "/operator",
+            replace: (url) => navigations.push(url),
+            search: "?mode=voice",
+          },
+          persistentStorage: storage,
+          sessionStorage: storage,
+        }),
+      (error) => error.name === "capability_cleanup_failed",
+    );
+    assert.deepEqual(navigations, ["/operator?mode=voice"]);
+  });
+
+  it("builds exact socket protocols for Access and loopback authentication", () => {
+    const capability = "H".repeat(43);
+
+    assert.deepEqual(appModule.operatorSocketProtocols(""), ["moco"]);
+    assert.deepEqual(appModule.operatorSocketProtocols(capability), [
+      "moco",
+      `moco.capability.${capability}`,
+    ]);
+  });
+
+  it("probes Access with a body-free same-origin request", async () => {
+    const calls = [];
+    await appModule.probeOperatorAccess(async (...args) => {
+      calls.push(args);
+      return { redirected: false, status: 204, type: "basic" };
+    });
+
+    assert.deepEqual(calls, [
+      [
+        "/auth/status",
+        {
+          cache: "no-store",
+          credentials: "same-origin",
+          method: "GET",
+          redirect: "manual",
+        },
+      ],
+    ]);
+  });
+
+  it("rejects failed, redirected, opaque, and non-204 Access probes without reading a body", async () => {
+    const body = {
+      text() {
+        assert.fail("Access failure bodies must not be read");
+      },
+    };
+    for (const response of [
+      { ...body, redirected: false, status: 200, type: "basic" },
+      { ...body, redirected: true, status: 204, type: "basic" },
+      { ...body, redirected: false, status: 0, type: "opaqueredirect" },
+    ]) {
+      await assert.rejects(
+        appModule.probeOperatorAccess(async () => response),
+        (error) => error.name === "access_auth_failed",
+      );
+    }
+    await assert.rejects(
+      appModule.probeOperatorAccess(async () => {
+        throw new Error("network unavailable");
+      }),
+      (error) => error.name === "access_auth_failed",
+    );
+  });
+
+  it("refreshes an opaque Access lease every 20 seconds without a request body", async () => {
+    const calls = [];
+    const scheduled = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: async (...args) => {
+        calls.push(args);
+        return { redirected: false, status: 204, type: "basic" };
+      },
+      onFailure: () => assert.fail("valid lease refresh must stay invisible"),
+      timers: {
+        clear: () => {},
+        set: (callback, delayMs) => {
+          scheduled.push({ callback, delayMs });
+          return 17;
+        },
+      },
+    });
+    const token = "T".repeat(43);
+
+    refresher.start(token);
+    assert.equal(scheduled.length, 1);
+    assert.equal(scheduled[0].delayMs, 20_000);
+    await scheduled[0].callback();
+
+    assert.deepEqual(calls, [
+      [
+        "/auth/lease",
+        {
+          cache: "no-store",
+          credentials: "same-origin",
+          headers: { "X-Moco-Access-Lease": token },
+          method: "POST",
+          redirect: "manual",
+        },
+      ],
+    ]);
+  });
+
+  it("fails closed and stops scheduling when an Access lease refresh is rejected", async () => {
+    const cleared = [];
+    const failures = [];
+    let callback;
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: async () => ({ redirected: false, status: 403, type: "basic" }),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (scheduled) => {
+          callback = scheduled;
+          return 23;
+        },
+      },
+    });
+
+    refresher.start("U".repeat(43));
+    await callback();
+
+    assert.deepEqual(cleared, [23]);
+    assert.deepEqual(failures, ["access_auth_failed"]);
+  });
+
+  it("ignores a late rejected refresh after a new lease generation starts", async () => {
+    const pending = [];
+    const callbacks = [];
+    const cleared = [];
+    const failures = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: (...args) => new Promise((resolve, reject) => pending.push({ args, reject, resolve })),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (callback) => {
+          callbacks.push(callback);
+          return callbacks.length;
+        },
+      },
+    });
+    const firstToken = "A".repeat(43);
+    const secondToken = "B".repeat(43);
+
+    refresher.start(firstToken);
+    const firstRefresh = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    refresher.stop();
+    refresher.start(secondToken);
+    const secondRefresh = callbacks[1]();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    pending[1].resolve({ redirected: false, status: 204, type: "basic" });
+    await secondRefresh;
+    pending[0].reject(new Error("old Access session rejected"));
+    await firstRefresh;
+
+    assert.deepEqual(
+      pending.map(({ args }) => args[1].headers["X-Moco-Access-Lease"]),
+      [firstToken, secondToken],
+    );
+    assert.deepEqual(cleared, [1]);
+    assert.deepEqual(failures, []);
+  });
+
+  it("serializes overlapping refresh callbacks and applies only the current failure", async () => {
+    const pending = [];
+    const callbacks = [];
+    const cleared = [];
+    const failures = [];
+    const refresher = new appModule.AccessLeaseRefresher({
+      fetch: () => new Promise((resolve) => pending.push(resolve)),
+      onFailure: (code) => failures.push(code),
+      timers: {
+        clear: (timer) => cleared.push(timer),
+        set: (callback) => {
+          callbacks.push(callback);
+          return 31;
+        },
+      },
+    });
+
+    refresher.start("C".repeat(43));
+    const first = callbacks[0]();
+    const overlapping = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 1);
+
+    pending[0]({ redirected: false, status: 204, type: "basic" });
+    await Promise.all([first, overlapping]);
+    const currentFailure = callbacks[0]();
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(pending.length, 2);
+    pending[1]({ redirected: false, status: 403, type: "basic" });
+    await currentFailure;
+
+    assert.deepEqual(cleared, [31]);
+    assert.deepEqual(failures, ["access_auth_failed"]);
   });
 
   it("rejects ICE gathering that never completes", async () => {

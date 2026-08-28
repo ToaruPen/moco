@@ -18,6 +18,7 @@ from moco.config import (
     ConfigError,
     MocoSettings,
     canonical_browser_loopback_host,
+    canonical_public_https_origin,
     default_config_path,
     load_config,
     write_config,
@@ -399,21 +400,7 @@ def _is_numeric_loopback_host(hostname: str | None) -> bool:
 
 
 def _is_safe_mobile_url(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return False
-    return (
-        parsed.scheme == "https"
-        and parsed.hostname is not None
-        and parsed.username is None
-        and parsed.password is None
-        and parsed.path in {"", "/"}
-        and bool(parsed.fragment)
-        and not parsed.query
-        and port is None
-    )
+    return canonical_public_https_origin(url) == url
 
 
 def _raise_review_unavailable() -> NoReturn:
@@ -436,7 +423,7 @@ def _runtime_state_payload(
         "control_secret": control_secret,
     }
     if settings.server.public_url is not None:
-        payload["mobile_url"] = mobile_operator_url(settings.server.public_url, capability)
+        payload["mobile_url"] = mobile_operator_url(settings.server.public_url)
     return payload
 
 

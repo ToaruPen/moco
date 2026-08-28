@@ -2,18 +2,31 @@ from __future__ import annotations
 
 import asyncio
 import gc
+import inspect
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Coroutine, Mapping
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Coroutine,
+    Mapping,
+    MutableMapping,
+    Sequence,
+)
 from contextlib import suppress
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, ClassVar, Literal, cast
 
 import pytest
+import segno
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from httpx import Headers
 from irodori_tts_infra.contracts import (
     CapabilitiesResponse,
     ConditioningCapabilities,
@@ -58,6 +71,7 @@ from moco.codex.session import (
 )
 from moco.config import (
     AgentProfileMode,
+    CloudflareAccessSettings,
     CodexSettings,
     IrodoriSettings,
     MocoSettings,
@@ -95,8 +109,10 @@ from moco.speech.irodori import (
 )
 from moco.speech.queue import SpeechQueue
 from moco.web import app as web_app
+from moco.web.access import AccessAuthorization
 from moco.web.app import RealtimeSession, WebSynthesizer, create_app
 from moco.web.messages import ClientControl, StartMessage
+from moco.web.pairing import mobile_operator_url, render_pairing_svg
 from moco.web.reviewer import ReviewerBroker
 from test_codex_agent import FakeSharedConnection, make_session
 from test_codex_approval import (
@@ -115,6 +131,11 @@ from test_coordinator import (
 )
 
 CAPABILITY = "test-capability"
+CLOUDFLARE_ACCESS = CloudflareAccessSettings(
+    team_domain="https://example-team.cloudflareaccess.com",
+    audience="audience_123-ABC",
+    allowed_email="owner@example.com",
+)
 
 
 @pytest.mark.asyncio
@@ -3422,15 +3443,204 @@ class RecordingSpeechInvalidation:
 def websocket_context(
     client: TestClient,
     *,
-    capability: str = CAPABILITY,
-    origin: str = "http://127.0.0.1:8765",
-    host: str = "127.0.0.1:8765",
+    capability: str | None = CAPABILITY,
+    origin: str | Sequence[str] = "http://127.0.0.1:8765",
+    host: str | Sequence[str] = "127.0.0.1:8765",
+    access_assertions: Sequence[str] = (),
 ) -> WebSocketTestSession:
+    origins = [origin] if isinstance(origin, str) else origin
+    hosts = [host] if isinstance(host, str) else host
+    headers = Headers(
+        [
+            *(("host", value) for value in hosts),
+            *(("origin", value) for value in origins),
+            *(("cf-access-jwt-assertion", assertion) for assertion in access_assertions),
+        ],
+    )
+    subprotocols = ["moco"]
+    if capability is not None:
+        subprotocols.append(f"moco.capability.{capability}")
     return client.websocket_connect(
         "/ws",
-        headers={"host": host, "origin": origin},
-        subprotocols=["moco", f"moco.capability.{capability}"],
+        headers=headers,
+        subprotocols=subprotocols,
     )
+
+
+class FakeAccessVerifier:
+    def __init__(
+        self,
+        result: str | None = None,
+        *,
+        identity: str = "owner@example.com",
+        expires_at: float | None = None,
+    ) -> None:
+        self.result = result
+        self.identity = identity
+        self.expires_at = expires_at or time.time() + 300
+        self.assertions: list[list[str]] = []
+
+    async def rejection_code(self, assertions: Sequence[str]) -> str | None:
+        self.assertions.append(list(assertions))
+        return self.result
+
+    async def authorization(
+        self,
+        assertions: Sequence[str],
+    ) -> tuple[str | None, AccessAuthorization | None]:
+        self.assertions.append(list(assertions))
+        if self.result is not None:
+            return self.result, None
+        return None, AccessAuthorization(
+            identity=self.identity,
+            expires_at=self.expires_at,
+        )
+
+
+class ExpiringLeaseConnection:
+    def __init__(self) -> None:
+        self.expired = asyncio.Event()
+        self.expire_calls = 0
+
+    async def expire(self) -> None:
+        self.expire_calls += 1
+        self.expired.set()
+
+
+@pytest.mark.asyncio
+async def test_access_lease_deadline_expires_and_cannot_be_revived() -> None:
+    authority = web_app._AccessLeaseAuthority(max_seconds=0.02)  # noqa: SLF001
+    connection = ExpiringLeaseConnection()
+    authorization = AccessAuthorization("owner@example.com", time.time() + 300)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+    assert token is not None
+    await asyncio.wait_for(connection.expired.wait(), timeout=0.5)
+
+    assert not await authority.refresh(token, authorization)
+    assert not await authority.authorized(connection)
+    assert connection.expire_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_access_lease_refresh_extends_deadline_and_release_invalidates_token() -> None:
+    authority = web_app._AccessLeaseAuthority(max_seconds=0.08)  # noqa: SLF001
+    connection = ExpiringLeaseConnection()
+    authorization = AccessAuthorization("owner@example.com", time.time() + 300)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+    assert token is not None
+    await asyncio.sleep(0.05)
+    assert await authority.refresh(token, authorization)
+    await asyncio.sleep(0.05)
+    assert await authority.authorized(connection)
+
+    await authority.release(connection)
+    assert not await authority.refresh(token, authorization)
+    assert not await authority.authorized(connection)
+    await asyncio.sleep(0.05)
+    assert connection.expire_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_access_lease_is_capped_by_verified_jwt_expiry() -> None:
+    connection = ExpiringLeaseConnection()
+    authority = web_app._AccessLeaseAuthority(max_seconds=60)  # noqa: SLF001
+    authorization = AccessAuthorization("owner@example.com", time.time() + 0.02)
+
+    token = await authority.issue(connection, authorization, on_expire=connection.expire)
+
+    assert token is not None
+    await asyncio.wait_for(connection.expired.wait(), timeout=0.5)
+    assert not await authority.authorized(connection)
+
+
+async def raw_http_response(
+    app: FastAPI,
+    *,
+    headers: Sequence[tuple[bytes, bytes]],
+) -> tuple[int, dict[str, str]]:
+    messages: list[dict[str, Any]] = []
+    request_sent = False
+
+    async def receive() -> dict[str, Any]:
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": b"", "more_body": False}
+        return {"type": "http.disconnect"}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        messages.append(dict(message))
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "https",
+        "method": "GET",
+        "root_path": "",
+        "path": "/auth/status",
+        "raw_path": b"/auth/status",
+        "query_string": b"",
+        "headers": list(headers),
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8765),
+        "state": {},
+    }
+    await app(cast("Any", scope), receive, send)
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    response_headers = {
+        key.decode("latin-1"): value.decode("latin-1") for key, value in start["headers"]
+    }
+    return cast("int", start["status"]), response_headers
+
+
+async def raw_websocket_messages(
+    app: FastAPI,
+    *,
+    headers: Sequence[tuple[bytes, bytes]],
+) -> list[dict[str, Any]]:
+    messages: list[dict[str, Any]] = []
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "websocket.connect"}
+
+    async def send(message: MutableMapping[str, Any]) -> None:
+        messages.append(dict(message))
+
+    scope = {
+        "type": "websocket",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "scheme": "ws",
+        "root_path": "",
+        "path": "/ws",
+        "raw_path": b"/ws",
+        "query_string": b"",
+        "headers": list(headers),
+        "client": ("127.0.0.1", 12345),
+        "server": ("127.0.0.1", 8765),
+        "subprotocols": ["moco", f"moco.capability.{CAPABILITY}"],
+        "state": {},
+    }
+    await app(cast("Any", scope), receive, send)
+    return messages
+
+
+def public_settings() -> MocoSettings:
+    return MocoSettings(
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
+    )
+
+
+def public_app(verifier: FakeAccessVerifier) -> FastAPI:
+    app = create_app(public_settings(), capability_token=CAPABILITY)
+    app.state.access_verifier = verifier
+    return app
 
 
 def receive_ready_catalog(socket: WebSocketTestSession) -> dict[str, object]:
@@ -3549,19 +3759,575 @@ def test_rejects_mapped_or_scoped_media_authority(authority: str) -> None:
 
 
 def test_accepts_exact_configured_public_origin() -> None:
-    settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
-    )
-    app = create_app(settings, capability_token=CAPABILITY)
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
     with (
         TestClient(app, base_url="https://voice.example.com") as client,
         websocket_context(
             client,
+            capability=None,
             origin="https://voice.example.com",
             host="voice.example.com",
+            access_assertions=["assertion-one", "assertion-two"],
         ) as socket,
     ):
         assert socket.receive_json()["state"] == "ready"
+        assert cast("Any", socket).accepted_subprotocol == "moco"
+        assert verifier.assertions == [["assertion-one", "assertion-two"]]
+
+
+def test_public_websocket_issues_refreshable_access_lease_without_leaking_token(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="https://voice.example.com") as client,
+        websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["socket-assertion"],
+        ) as socket,
+    ):
+        assert socket.receive_json()["state"] == "ready"
+        lease_message = socket.receive_json()
+        token = lease_message["token"]
+        assert lease_message["type"] == "access_lease"
+        assert isinstance(token, str)
+        assert len(token) == 43
+
+        response = client.post(
+            "/auth/lease",
+            headers={
+                "host": "voice.example.com",
+                "origin": "https://voice.example.com",
+                "cf-access-jwt-assertion": "refresh-assertion",
+                "x-moco-access-lease": token,
+            },
+        )
+
+        assert response.status_code == 204
+        assert response.content == b""
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["pragma"] == "no-cache"
+        assert token not in caplog.text
+        assert token not in str(response.headers)
+
+    assert verifier.assertions == [["socket-assertion"], ["refresh-assertion"]]
+
+
+@pytest.mark.parametrize(
+    "lease_headers",
+    [
+        [],
+        [("x-moco-access-lease", "")],
+        [("x-moco-access-lease", "malformed")],
+        [("x-moco-access-lease", "x" * 129)],
+        [("x-moco-access-lease", "one"), ("x-moco-access-lease", "two")],
+    ],
+)
+def test_public_access_lease_rejects_missing_malformed_or_duplicate_header(
+    lease_headers: list[tuple[str, str]],
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = Headers(
+        [
+            ("host", "voice.example.com"),
+            ("origin", "https://voice.example.com"),
+            ("cf-access-jwt-assertion", "refresh-assertion"),
+            *lease_headers,
+        ],
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.post("/auth/lease", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+
+
+@pytest.mark.parametrize(
+    ("base_url", "host", "origin"),
+    [
+        ("https://voice.example.com", "voice.example.com", "https://evil.example.com"),
+        ("https://voice.example.com", "voice.example.com", ""),
+        ("http://127.0.0.1:8765", "127.0.0.1:8765", "http://127.0.0.1:8765"),
+    ],
+)
+def test_access_lease_endpoint_is_exact_public_same_origin_only(
+    base_url: str,
+    host: str,
+    origin: str,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = {
+        "host": host,
+        "cf-access-jwt-assertion": "refresh-assertion",
+        "x-moco-access-lease": "x" * 43,
+    }
+    if origin:
+        headers["origin"] = origin
+
+    with TestClient(app, base_url=base_url) as client:
+        response = client.post("/auth/lease", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+
+
+def test_public_operator_is_closed_and_unregistered_when_lease_refresh_stops() -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    app.state.access_lease_authority = web_app._AccessLeaseAuthority(  # noqa: SLF001
+        max_seconds=0.02,
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        with websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["first-assertion"],
+        ) as first:
+            assert first.receive_json()["state"] == "ready"
+            assert first.receive_json()["type"] == "access_lease"
+            first.receive_json()  # Initial voice catalog can race the deadline close.
+            with pytest.raises(WebSocketDisconnect):
+                first.receive_json()
+
+        with websocket_context(
+            client,
+            capability=None,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=["second-assertion"],
+        ) as second:
+            assert second.receive_json()["state"] == "ready"
+
+
+def test_loopback_operator_does_not_issue_or_consult_access_lease() -> None:
+    class UnexpectedLeaseAuthority:
+        async def issue(self, *_args: object, **_kwargs: object) -> str:
+            raise AssertionError
+
+    app = create_app(capability_token=CAPABILITY)
+    app.state.access_lease_authority = UnexpectedLeaseAuthority()
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        assert socket.receive_json()["state"] == "ready"
+
+
+def test_public_http_auth_status_passes_all_access_assertions_without_caching() -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = Headers(
+        [
+            ("host", "voice.example.com"),
+            ("cf-access-jwt-assertion", "assertion-one"),
+            ("cf-access-jwt-assertion", "assertion-two"),
+        ],
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get("/auth/status", headers=headers)
+
+    assert response.status_code == 204
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert verifier.assertions == [["assertion-one", "assertion-two"]]
+
+
+@pytest.mark.parametrize("path", ["/", "/static/app.js"])
+def test_public_http_routes_require_valid_access(path: str) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get(
+            path,
+            headers={"cf-access-jwt-assertion": "route-access-assertion"},
+        )
+
+    assert response.status_code == 200
+    assert verifier.assertions == [["route-access-assertion"]]
+
+
+@pytest.mark.parametrize("path", ["/", "/static/app.js"])
+@pytest.mark.parametrize(
+    ("result", "assertions"),
+    [
+        ("access_token_missing", []),
+        ("access_token_invalid", ["invalid-route-access-assertion"]),
+    ],
+)
+def test_public_http_routes_reject_missing_or_invalid_access_without_caching(
+    path: str,
+    result: str,
+    assertions: list[str],
+) -> None:
+    verifier = FakeAccessVerifier(result)
+    app = public_app(verifier)
+    headers = Headers(
+        [("cf-access-jwt-assertion", assertion) for assertion in assertions],
+    )
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get(path, headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert verifier.assertions == [assertions]
+
+
+@pytest.mark.parametrize(
+    "hosts",
+    [
+        ["127.0.0.1:8765", "voice.example.com"],
+        ["voice.example.com", "127.0.0.1:8765"],
+        ["[malformed"],
+        ["127.0.0.1:not-a-port"],
+        ["127.0.0.1:"],
+    ],
+)
+def test_http_rejects_ambiguous_or_malformed_host_before_auth_routing(
+    hosts: list[str],
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    headers = Headers([*(("host", host) for host in hosts)])
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        response = client.get("/auth/status", headers=headers)
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert verifier.assertions == []
+
+
+@pytest.mark.asyncio
+async def test_http_rejects_missing_host_before_auth_routing() -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+
+    status, headers = await raw_http_response(
+        app,
+        headers=[(b"cf-access-jwt-assertion", b"must-not-reach-verifier")],
+    )
+
+    assert status == 403
+    assert headers["cache-control"] == "no-store"
+    assert headers["pragma"] == "no-cache"
+    assert verifier.assertions == []
+
+
+@pytest.mark.parametrize(
+    ("verifier", "expected_code"),
+    [
+        (FakeAccessVerifier("access_token_missing"), "access_token_missing"),
+        (FakeAccessVerifier("access_token_invalid"), "access_token_invalid"),
+        (None, "access_keys_unavailable"),
+    ],
+)
+def test_public_http_access_rejection_fails_closed_without_leaking_secrets(
+    verifier: FakeAccessVerifier | None,
+    expected_code: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sensitive_assertion = "secret-access-assertion"
+    app = public_app(verifier or FakeAccessVerifier())
+    if verifier is None:
+        del app.state.access_verifier
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.get(
+            "/auth/status",
+            headers={
+                "host": "voice.example.com",
+                "cf-access-jwt-assertion": sensitive_assertion,
+            },
+        )
+
+    assert response.status_code == 403
+    assert response.json() == {"code": "access_auth_failed"}
+    assert response.headers["cache-control"] == "no-store"
+    assert response.headers["pragma"] == "no-cache"
+    assert "event=operator_http_rejected" in caplog.text
+    assert f"event_code={expected_code}" in caplog.text
+    assert "boundary=operator_http" in caplog.text
+    assert "result=rejected" in caplog.text
+    assert sensitive_assertion not in caplog.text
+    assert CLOUDFLARE_ACCESS.allowed_email not in caplog.text
+    assert CLOUDFLARE_ACCESS.team_domain not in caplog.text
+    assert CLOUDFLARE_ACCESS.audience not in caplog.text
+    assert CAPABILITY not in caplog.text
+
+
+def test_loopback_http_ignores_access_assertions_and_forwarded_host() -> None:
+    verifier = FakeAccessVerifier("access_token_invalid")
+    app = public_app(verifier)
+
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        response = client.get(
+            "/auth/status",
+            headers={
+                "cf-access-jwt-assertion": "valid-access-assertion",
+                "x-forwarded-host": "voice.example.com",
+            },
+        )
+
+    assert response.status_code == 204
+    assert response.headers["cache-control"] == "no-store"
+    assert verifier.assertions == []
+
+
+def test_create_app_constructs_access_verifier_only_when_configured(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    constructed: list[CloudflareAccessSettings] = []
+
+    class ConstructedVerifier(FakeAccessVerifier):
+        def __init__(self, settings: CloudflareAccessSettings) -> None:
+            constructed.append(settings)
+            super().__init__()
+
+    monkeypatch.setattr(web_app, "CloudflareAccessVerifier", ConstructedVerifier)
+
+    public = create_app(public_settings(), capability_token=CAPABILITY)
+    loopback = create_app(capability_token=CAPABILITY)
+
+    assert isinstance(public.state.access_verifier, ConstructedVerifier)
+    assert not hasattr(loopback.state, "access_verifier")
+    assert constructed == [CLOUDFLARE_ACCESS]
+
+
+@pytest.mark.parametrize(
+    "result",
+    [
+        "access_token_missing",
+        "access_token_invalid",
+        "access_identity_mismatch",
+        "access_keys_unavailable",
+    ],
+)
+def test_public_websocket_access_rejection_logs_only_stable_code(
+    result: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    assertion_value = "assertion-log-sentinel.private.jwt"
+    capability_value = "capability-log-sentinel"
+    access_settings = CloudflareAccessSettings(
+        team_domain="https://team-log-sentinel.cloudflareaccess.com",
+        audience="audience-log-sentinel",
+        allowed_email="owner-log-sentinel@example.com",
+    )
+    verifier = FakeAccessVerifier(result)
+    app = create_app(
+        MocoSettings(
+            server=ServerSettings(
+                public_url="https://voice.example.com",
+                cloudflare_access=access_settings,
+            ),
+        ),
+        capability_token=capability_value,
+    )
+    app.state.access_verifier = verifier
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="https://voice.example.com") as client,
+        pytest.raises(WebSocketDisconnect),
+        websocket_context(
+            client,
+            capability=capability_value,
+            origin="https://voice.example.com",
+            host="voice.example.com",
+            access_assertions=[assertion_value],
+        ),
+    ):
+        pass
+
+    assert verifier.assertions == [[assertion_value]]
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert f"event_code={result}" in caplog.text
+    assert assertion_value not in caplog.text
+    assert access_settings.allowed_email not in caplog.text
+    assert access_settings.audience not in caplog.text
+    assert access_settings.team_domain not in caplog.text
+    assert capability_value not in caplog.text
+    assert "moco.capability." not in caplog.text
+
+
+def test_loopback_websocket_access_cannot_replace_missing_capability(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        pytest.raises(WebSocketDisconnect),
+        websocket_context(
+            client,
+            capability=None,
+            access_assertions=["valid-access-assertion"],
+        ),
+    ):
+        pass
+
+    assert verifier.assertions == []
+    assert "event_code=capability_missing" in caplog.text
+
+
+def test_loopback_websocket_capability_does_not_call_access_verifier() -> None:
+    verifier = FakeAccessVerifier("access_token_invalid")
+    app = public_app(verifier)
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        websocket_context(client) as socket,
+    ):
+        assert socket.receive_json()["state"] == "ready"
+
+    assert verifier.assertions == []
+
+
+@pytest.mark.parametrize(
+    ("hosts", "origins"),
+    [
+        (
+            ["127.0.0.1:8765", "voice.example.com"],
+            ["http://127.0.0.1:8765"],
+        ),
+        (
+            ["voice.example.com", "127.0.0.1:8765"],
+            ["https://voice.example.com"],
+        ),
+        (
+            ["127.0.0.1:8765"],
+            ["http://127.0.0.1:8765", "https://voice.example.com"],
+        ),
+        (["127.0.0.1:8765"], []),
+        (["[malformed"], ["https://voice.example.com"]),
+        (["127.0.0.1:not-a-port"], ["http://127.0.0.1:8765"]),
+        (["127.0.0.1:8765"], ["http://[malformed"]),
+        (["127.0.0.1:8765"], ["http://127.0.0.1:not-a-port"]),
+        (["127.0.0.1:"], ["http://127.0.0.1:8765"]),
+        (["127.0.0.1:8765"], ["http://127.0.0.1:"]),
+        (["127.0.0.1:"], ["http://127.0.0.1:"]),
+    ],
+)
+def test_websocket_rejects_ambiguous_or_malformed_authority_before_auth_routing(
+    hosts: list[str],
+    origins: list[str],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    with (
+        TestClient(app, base_url="http://127.0.0.1:8765") as client,
+        pytest.raises(WebSocketDisconnect),
+        websocket_context(
+            client,
+            capability=CAPABILITY,
+            host=hosts,
+            origin=origins,
+            access_assertions=["access-must-not-select-routing"],
+        ),
+    ):
+        pass
+
+    assert verifier.assertions == []
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert "event_code=origin_rejected" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "headers",
+    [
+        [(b"origin", b"http://127.0.0.1:8765")],
+        [(b"host", b"127.0.0.1:8765")],
+    ],
+)
+async def test_websocket_rejects_missing_authority_headers(
+    headers: list[tuple[bytes, bytes]],
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
+    caplog.set_level(logging.INFO, logger=web_app.logger.name)
+
+    messages = await raw_websocket_messages(app, headers=headers)
+
+    assert messages == [{"type": "websocket.close", "code": 1008, "reason": ""}]
+    assert verifier.assertions == []
+    assert "event=operator_websocket_rejected" in caplog.text
+    assert "event_code=origin_rejected" in caplog.text
+
+
+@pytest.mark.parametrize(
+    "host",
+    [
+        "voice.example.com",
+        None,
+        "voice.example.com.evil.test",
+        "voice.example.com:443",
+        "[malformed",
+    ],
+)
+def test_public_host_classifier_requires_full_configured_netloc(host: str | None) -> None:
+    assert web_app._is_public_host(host, "https://voice.example.com") is (  # noqa: SLF001
+        host == "voice.example.com"
+    )
+
+
+@pytest.mark.parametrize("path", ["/pairing.svg", "/review/bootstrap"])
+def test_public_access_does_not_weaken_private_http_gates(path: str) -> None:
+    verifier = FakeAccessVerifier()
+    review_credential = CAPABILITY[::-1]
+    app = create_app(
+        public_settings(),
+        capability_token=CAPABILITY,
+        control_secret=review_credential,
+    )
+    app.state.access_verifier = verifier
+
+    with TestClient(app, base_url="https://voice.example.com") as client:
+        response = client.request(
+            "POST" if path == "/review/bootstrap" else "GET",
+            path,
+            headers={
+                "host": "voice.example.com",
+                "origin": "https://voice.example.com",
+                "cf-access-jwt-assertion": "valid-access-assertion",
+                "x-moco-capability": CAPABILITY,
+                "x-moco-control-secret": review_credential,
+            },
+        )
+
+    assert response.status_code == 404
+    assert verifier.assertions == [["valid-access-assertion"]]
 
 
 @pytest.mark.parametrize(
@@ -3575,10 +4341,8 @@ def test_accepts_exact_configured_public_origin() -> None:
     ],
 )
 def test_rejects_public_origin_variants(origin: str, host: str) -> None:
-    settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
-    )
-    app = create_app(settings, capability_token=CAPABILITY)
+    verifier = FakeAccessVerifier()
+    app = public_app(verifier)
     with (
         TestClient(app, base_url="https://voice.example.com") as client,
         pytest.raises(WebSocketDisconnect),
@@ -3586,10 +4350,15 @@ def test_rejects_public_origin_variants(origin: str, host: str) -> None:
     ):
         pass
 
+    assert verifier.assertions == []
+
 
 def test_pairing_svg_is_private_and_not_cached() -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
@@ -3609,9 +4378,70 @@ def test_pairing_svg_is_private_and_not_cached() -> None:
     assert response.content.startswith(b"<svg")
 
 
+def test_mobile_operator_url_is_the_bare_public_url() -> None:
+    public_url = "https://voice.example.com"
+
+    assert mobile_operator_url(public_url) == public_url
+    assert list(inspect.signature(mobile_operator_url).parameters) == ["public_url"]
+
+
+def test_pairing_svg_encodes_only_the_bare_public_url(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    encoded: list[str] = []
+
+    class FakeQr:
+        def save(self, stream: BytesIO, **_kwargs: object) -> None:
+            stream.write(b"<svg/>")
+
+    def make(content: str, **_kwargs: object) -> FakeQr:
+        encoded.append(content)
+        return FakeQr()
+
+    monkeypatch.setattr(segno, "make", make)
+
+    assert render_pairing_svg("https://voice.example.com") == b"<svg/>"
+    assert encoded == ["https://voice.example.com"]
+    assert list(inspect.signature(render_pairing_svg).parameters) == ["public_url"]
+
+
+def test_pairing_endpoint_calls_renderer_without_capability(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    rendered: list[str] = []
+
+    def render(public_url: str) -> bytes:
+        rendered.append(public_url)
+        return b"<svg/>"
+
+    monkeypatch.setattr(web_app, "render_pairing_svg", render)
+    settings = MocoSettings(
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
+    )
+    app = create_app(settings, capability_token=CAPABILITY)
+    with TestClient(app, base_url="http://127.0.0.1:8765") as client:
+        response = client.get(
+            "/pairing.svg",
+            headers={
+                "host": "127.0.0.1:8765",
+                "x-moco-capability": CAPABILITY,
+                "sec-fetch-site": "same-origin",
+            },
+        )
+
+    assert response.status_code == 200
+    assert rendered == ["https://voice.example.com"]
+
+
 def test_pairing_svg_accepts_arbitrary_numeric_loopback_host() -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3630,7 +4460,10 @@ def test_pairing_svg_accepts_arbitrary_numeric_loopback_host() -> None:
 @pytest.mark.parametrize("host", ["192.0.2.1:8765", "127.0.0.42.evil:8765"])
 def test_pairing_svg_rejects_non_loopback_or_hostname_trick(host: str) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3657,7 +4490,10 @@ def test_pairing_svg_rejects_non_loopback_or_hostname_trick(host: str) -> None:
 )
 def test_pairing_svg_rejects_mapped_or_scoped_loopback_host(host: str) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.42:8765") as client:
@@ -3674,27 +4510,36 @@ def test_pairing_svg_rejects_mapped_or_scoped_loopback_host(host: str) -> None:
 
 
 @pytest.mark.parametrize(
-    "headers",
+    ("headers", "expected_status"),
     [
-        {"host": "voice.example.com", "x-moco-capability": CAPABILITY},
-        {"host": "127.0.0.1:8765"},
-        {"host": "127.0.0.1:8765", "x-moco-capability": "wrong"},
-        {
-            "host": "127.0.0.1:8765",
-            "x-moco-capability": CAPABILITY,
-            "sec-fetch-site": "cross-site",
-        },
+        ({"host": "voice.example.com", "x-moco-capability": CAPABILITY}, 403),
+        ({"host": "127.0.0.1:8765"}, 404),
+        ({"host": "127.0.0.1:8765", "x-moco-capability": "wrong"}, 404),
+        (
+            {
+                "host": "127.0.0.1:8765",
+                "x-moco-capability": CAPABILITY,
+                "sec-fetch-site": "cross-site",
+            },
+            404,
+        ),
     ],
 )
-def test_pairing_svg_rejects_untrusted_requests(headers: dict[str, str]) -> None:
+def test_pairing_svg_rejects_untrusted_requests(
+    headers: dict[str, str],
+    expected_status: int,
+) -> None:
     settings = MocoSettings(
-        server=ServerSettings(public_url="https://voice.example.com"),
+        server=ServerSettings(
+            public_url="https://voice.example.com",
+            cloudflare_access=CLOUDFLARE_ACCESS,
+        ),
     )
     app = create_app(settings, capability_token=CAPABILITY)
     with TestClient(app, base_url="http://127.0.0.1:8765") as client:
         response = client.get("/pairing.svg", headers=headers)
 
-    assert response.status_code == 404
+    assert response.status_code == expected_status
 
 
 def test_connection_projects_only_safe_runtime_voice_capabilities(

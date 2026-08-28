@@ -20,11 +20,13 @@ classifiers = [
 dependencies = [
   "fastapi>=0.116,<1",
   "httpx>=0.28,<1",
+  "idna>=3.10,<4",
   "irodori-tts-infra @ git+https://github.com/ToaruPen/irodori-tts-infra.git@2f169719a6491c83bd08e6d3bd58dafc825eb11d",
   "opentelemetry-api>=1.36,<2",
   "opentelemetry-exporter-otlp-proto-http>=1.36,<2",
   "opentelemetry-sdk>=1.36,<2",
   "pydantic>=2.11,<3",
+  "pyjwt[crypto]>=2.10,<3",
   "pynput>=1.8,<2",
   "pywin32>=311,<400; sys_platform == 'win32'",
   "pyyaml>=6.0,<7",
