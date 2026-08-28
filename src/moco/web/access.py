@@ -83,6 +83,7 @@ async def _fetch_cloudflare_jwks(team_domain: str) -> Mapping[str, object]:
     endpoint = f"{team_domain}/cdn-cgi/access/certs"
     try:
         async with (
+            asyncio.timeout(_HTTP_TIMEOUT_SECONDS),
             httpx.AsyncClient(
                 follow_redirects=False,
                 timeout=httpx.Timeout(_HTTP_TIMEOUT_SECONDS),

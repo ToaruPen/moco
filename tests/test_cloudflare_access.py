@@ -4,7 +4,7 @@ import asyncio
 import base64
 import json
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from typing import Any, cast
 
 import httpx
@@ -107,6 +107,12 @@ class FakeFetcher:
         if isinstance(result, Exception):
             raise result
         return result
+
+
+class YieldingFetcher(FakeFetcher):
+    async def __call__(self) -> Mapping[str, object]:
+        await asyncio.sleep(0)
+        return await super().__call__()
 
 
 @pytest.fixture
@@ -436,6 +442,23 @@ async def test_unknown_kid_forces_exactly_one_refresh(private_key: rsa.RSAPrivat
     assert fetcher.calls == 2
 
 
+async def test_concurrent_unknown_kid_checks_share_one_forced_refresh(
+    private_key: rsa.RSAPrivateKey,
+) -> None:
+    unknown_token = _token(private_key, header={"alg": "RS256", "kid": "unknown"})
+    fetcher = YieldingFetcher(
+        {"keys": [_jwk(private_key)]},
+        {"keys": [_jwk(private_key)]},
+    )
+    verifier = CloudflareAccessVerifier(_settings(), fetch_jwks=fetcher)
+
+    assert await verifier.rejection_code([_token(private_key)]) is None
+    results = await asyncio.gather(*(verifier.rejection_code([unknown_token]) for _ in range(8)))
+
+    assert results == ["access_token_invalid"] * 8
+    assert fetcher.calls == 2
+
+
 async def test_unknown_kid_forces_one_refresh_after_initial_fetch(
     private_key: rsa.RSAPrivateKey,
 ) -> None:
@@ -489,6 +512,17 @@ def _install_http_transport(
     return captured
 
 
+class DripStream(httpx.AsyncByteStream):
+    def __init__(self) -> None:
+        self.chunks_emitted = 0
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        for chunk in (b'{"', b"keys", b'":', b"[]", b"}"):
+            await asyncio.sleep(0.01)
+            self.chunks_emitted += 1
+            yield chunk
+
+
 async def test_default_fetcher_uses_bounded_non_redirecting_json_request(
     private_key: rsa.RSAPrivateKey,
     monkeypatch: pytest.MonkeyPatch,
@@ -512,6 +546,34 @@ async def test_default_fetcher_uses_bounded_non_redirecting_json_request(
     timeout = cast("httpx.Timeout", client_options["timeout"])
     assert timeout.connect == 5.0
     assert timeout.read == 5.0
+
+
+async def test_default_fetcher_has_an_absolute_streaming_deadline(
+    private_key: rsa.RSAPrivateKey,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    stream = DripStream()
+
+    def handler(_request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/json"},
+            stream=stream,
+        )
+
+    _install_http_transport(monkeypatch, handler)
+    monkeypatch.setattr("moco.web.access._HTTP_TIMEOUT_SECONDS", 0.02)
+    verifier = CloudflareAccessVerifier(_settings())
+    started = asyncio.get_running_loop().time()
+
+    result = await asyncio.wait_for(
+        verifier.rejection_code([_token(private_key)]),
+        timeout=0.2,
+    )
+
+    assert result == "access_keys_unavailable"
+    assert asyncio.get_running_loop().time() - started < 0.1
+    assert stream.chunks_emitted < 5
 
 
 @pytest.mark.parametrize(
