@@ -179,7 +179,7 @@ def test_public_operator_url_is_normalized() -> None:
             "cloudflare_access": {
                 "team_domain": " HTTPS://Example-Team.CloudflareAccess.COM/ ",
                 "audience": " audience_123-ABC ",
-                "allowed_email": " Owner@Example.COM ",
+                "allowed_email": "Owner@Example.COM",
             },
         },
     )
@@ -248,6 +248,10 @@ def test_cloudflare_access_settings_are_frozen_and_reject_unknown_keys() -> None
         "https://example-team.cloudflareaccess.com.evil.example",
         "https://example-team.cloudflareaccess.com.",
         "https://example-team.cloudflareaccess.com%2eevil.example",
+        "https://example- team.cloudflareaccess.com",
+        "https://example-\tteam.cloudflareaccess.com",
+        "https://example-\rteam.cloudflareaccess.com",
+        "https://example-\nteam.cloudflareaccess.com",
         "https://foo.bar.cloudflareaccess.com",
         "https://-example.cloudflareaccess.com",
         "https://example-.cloudflareaccess.com",
@@ -305,13 +309,13 @@ def test_cloudflare_access_rejects_invalid_audience(audience: str) -> None:
         )
 
 
-def test_cloudflare_access_accepts_maximum_email_length_and_retains_case() -> None:
+def test_cloudflare_access_accepts_maximum_email_length_and_preserves_exact_case() -> None:
     allowed_email = f"{'A' * 242}@Example.com"
 
     settings = CloudflareAccessSettings(
         team_domain="https://example-team.cloudflareaccess.com",
         audience="audience_123-ABC",
-        allowed_email=f" {allowed_email} ",
+        allowed_email=allowed_email,
     )
 
     assert len(settings.allowed_email) == 254
@@ -331,6 +335,12 @@ def test_cloudflare_access_accepts_maximum_email_length_and_retains_case() -> No
         "owner@example .com",
         "owner\texample@example.com",
         "owner\n@example.com",
+        " owner@example.com",
+        "owner@example.com ",
+        "\towner@example.com",
+        "owner@example.com\t",
+        "\rowner@example.com",
+        "owner@example.com\r",
         "\nowner@example.com",
         "owner@example.com\n",
         "owner\0@example.com",

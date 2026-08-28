@@ -251,7 +251,9 @@ Cloudflare 側で session が失効した場合は、本人確認を行って再
 `cloudflared` はリポジトリ外のユーザー LaunchAgent
 `dev.toarupen.moco-cloudflared` として常駐させます。Tunnel ingress は上記 hostname だけを
 loopback origin へ送り、最後を `http_status:404` の catch-all にしてください。Cloudflare edge
-の Access policy だけでなく、cloudflared から届く request の Access assertion も moco が
+の Access policy だけでなく、cloudflared ingress の Access JWT 検証も
+`access.required: true` で必須にし、team と audience を moco の `team_domain`、`audience` に
+一致させてください。さらに、cloudflared から届く request の Access assertion を moco が
 `team_domain`、`audience`、`allowed_email` に対して origin で検証します。moco と Tunnel は
 独立したサービスです。片方が停止しても別経路へ切り替えず、`doctor` が部分失敗をそのまま
 報告します。
@@ -260,8 +262,9 @@ loopback origin へ送り、最後を `http_status:404` の catch-all にして�
 「スマホ接続」が現れるので、QR をスマートフォンで読み取ってください。QR は固定 public URL
 だけを含む convenience link で、moco の capability を fragment、query、path のいずれにも
 含めません。public origin は Cloudflare Access session と origin で検証する assertion に依存し、
-moco の capability をスマートフォンの storage に保存しません。Access session の期限が切れたら
-Cloudflare へ再ログインします。
+moco の capability をスマートフォンの storage に保存しません。QR は入力の手間を省くだけで、
+Access session が有効な間は bare な固定 public URL を直接開いて利用できます。Access session の
+期限が切れたら Cloudflare へ再ログインします。
 
 一方、Mac の loopback 操作画面は引き続き owner-private な `operator-capability.json` の
 capability を使い、同一 loopback origin の `localStorage` に保存します。この loopback 接続キーを

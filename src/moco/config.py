@@ -94,7 +94,13 @@ class CloudflareAccessSettings(StrictSettings):
     @field_validator("team_domain")
     @classmethod
     def _normalize_team_domain(cls, value: str) -> str:
-        candidate = value.strip()
+        candidate = value.strip(" ")
+        if any(
+            character.isspace() or unicodedata.category(character).startswith("C")
+            for character in candidate
+        ):
+            msg = "Cloudflare Access team domain must be a portless HTTPS team domain"
+            raise ValueError(msg)
         try:
             parsed = urlsplit(candidate)
             hostname = parsed.hostname
@@ -143,10 +149,10 @@ class CloudflareAccessSettings(StrictSettings):
     @field_validator("allowed_email")
     @classmethod
     def _validate_allowed_email(cls, value: str) -> str:
-        email = value.strip()
+        email = value
         local, separator, domain = email.partition("@")
         contains_control_character = any(
-            unicodedata.category(character) == "Cc" for character in value
+            unicodedata.category(character).startswith("C") for character in email
         )
         contains_forbidden_character = any(
             character.isspace() or character in "<>,;" for character in email
