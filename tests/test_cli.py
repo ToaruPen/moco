@@ -247,8 +247,12 @@ def test_operator_url_validation_rejects_unsafe_urls(url: str) -> None:
     assert not _is_safe_operator_url(url)
 
 
-def test_mobile_url_validation_accepts_bare_public_url() -> None:
-    assert _is_safe_mobile_url("https://voice.example.com")
+@pytest.mark.parametrize(
+    "url",
+    ["https://voice.example.com", "https://xn--bcher-kva.example"],
+)
+def test_mobile_url_validation_accepts_bare_public_url(url: str) -> None:
+    assert _is_safe_mobile_url(url)
 
 
 @pytest.mark.parametrize(
@@ -266,6 +270,16 @@ def test_mobile_url_validation_accepts_bare_public_url() -> None:
         "https://user@voice.example.com",
         "https://localhost",
         "https://127.0.0.1",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://127.0.0.01",
+        "https://1.2",
+        "https://0x7f.1",
+        "https://0177.1",
+        "https://2130706433",
+        "https://127..1",
+        "https://1.4294967296",
+        "https://xn--a.com",
     ],
 )
 def test_mobile_url_validation_rejects_non_bare_public_urls(url: str) -> None:

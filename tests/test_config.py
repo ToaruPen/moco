@@ -175,7 +175,7 @@ def test_operator_server_must_bind_loopback(tmp_path: Path) -> None:
 def test_public_operator_url_is_normalized() -> None:
     settings = ServerSettings.model_validate(
         {
-            "public_url": " HTTPS://Voice.Example.COM ",
+            "public_url": " HTTPS://Voice.Example.COM/ ",
             "cloudflare_access": {
                 "team_domain": " HTTPS://Example-Team.CloudflareAccess.COM/ ",
                 "audience": " audience_123-ABC ",
@@ -189,6 +189,21 @@ def test_public_operator_url_is_normalized() -> None:
     assert settings.cloudflare_access.team_domain == "https://example-team.cloudflareaccess.com"
     assert settings.cloudflare_access.audience == "audience_123-ABC"
     assert settings.cloudflare_access.allowed_email == "Owner@Example.COM"
+
+
+def test_public_operator_url_accepts_valid_ace_hostname() -> None:
+    settings = ServerSettings.model_validate(
+        {
+            "public_url": "https://xn--bcher-kva.example",
+            "cloudflare_access": {
+                "team_domain": "https://example-team.cloudflareaccess.com",
+                "audience": "audience_123-ABC",
+                "allowed_email": "owner@example.com",
+            },
+        },
+    )
+
+    assert settings.public_url == "https://xn--bcher-kva.example"
 
 
 @pytest.mark.parametrize(
@@ -364,10 +379,23 @@ def test_cloudflare_access_rejects_invalid_allowed_email(allowed_email: str) -> 
     [
         "http://voice.example.com",
         "https://127.0.0.1",
+        "https://127.1",
+        "https://0177.0.0.1",
+        "https://127.0.0.01",
+        "https://1.2",
+        "https://0x7f.1",
+        "https://0177.1",
+        "https://2130706433",
+        "https://127..1",
+        "https://1.4294967296",
+        "https://xn--a.com",
         "https://*.example.com",
+        "https://voice.example.com:",
         "https://voice.example.com:8443",
         "https://voice.example.com/path",
+        "https://voice.example.com?",
         "https://voice.example.com?mode=mobile",
+        "https://voice.example.com#",
         "https://voice.example.com/#fragment",
         "https://user@voice.example.com",
         "https://localhost",

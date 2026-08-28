@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import ipaddress
 import json
 import secrets
 import sys
@@ -19,6 +18,7 @@ from moco.config import (
     ConfigError,
     MocoSettings,
     canonical_browser_loopback_host,
+    canonical_public_https_origin,
     default_config_path,
     load_config,
     write_config,
@@ -75,8 +75,6 @@ _REVIEW_BOOTSTRAP_PATH = "/review/bootstrap"
 _REVIEW_PAGE_PATH = "/review"
 _MAX_BOOTSTRAP_RESPONSE_BYTES = 4096
 _HTTP_OK = 200
-_MIN_PUBLIC_DNS_LABELS = 2
-_MAX_DNS_LABEL_LENGTH = 63
 
 
 class _RejectRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -402,40 +400,7 @@ def _is_numeric_loopback_host(hostname: str | None) -> bool:
 
 
 def _is_safe_mobile_url(url: str) -> bool:
-    try:
-        parsed = urlsplit(url)
-        port = parsed.port
-    except ValueError:
-        return False
-    hostname = parsed.hostname
-    labels = (hostname or "").split(".")
-    try:
-        ipaddress.ip_address(hostname or "")
-    except ValueError:
-        is_ip_address = False
-    else:
-        is_ip_address = True
-    is_fqdn = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
-        label.isascii()
-        and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
-        and label[0].isalnum()
-        and label[-1].isalnum()
-        and all(character.isalnum() or character == "-" for character in label)
-        for label in labels
-    )
-    return (
-        parsed.scheme == "https"
-        and hostname is not None
-        and url == f"https://{hostname}"
-        and not is_ip_address
-        and is_fqdn
-        and parsed.username is None
-        and parsed.password is None
-        and not parsed.path
-        and not parsed.fragment
-        and not parsed.query
-        and port is None
-    )
+    return canonical_public_https_origin(url) == url
 
 
 def _raise_review_unavailable() -> NoReturn:

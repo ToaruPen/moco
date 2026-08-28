@@ -47,9 +47,76 @@ _TEAM_DOMAIN_LABEL_COUNT = 3
 _IPV4_VERSION = 4
 _IPV6_VERSION = 6
 _IPV6_LOOPBACK = ipaddress.IPv6Address("::1")
+_HEX_PREFIX_LENGTH = len("0x")
 _CONFIG_DIRECTORY_MODE = 0o700
 _CONFIG_FILE_MODE = 0o600
 _CONFIG_SECURITY_ERROR = "configuration path does not satisfy host security requirements"
+
+
+def _is_valid_ace_label(label: str) -> bool:
+    if not label.casefold().startswith("xn--"):
+        return True
+    try:
+        decoded = label.encode("ascii").decode("idna")
+        round_trip = decoded.encode("idna").decode("ascii")
+    except UnicodeError:
+        return False
+    return round_trip.casefold() == label.casefold()
+
+
+def _is_whatwg_ipv4_number(value: str) -> bool:
+    if value.isascii() and value.isdigit():
+        return True
+    return (
+        value[:_HEX_PREFIX_LENGTH].casefold() == "0x"
+        and len(value) > _HEX_PREFIX_LENGTH
+        and all(character in "0123456789abcdefABCDEF" for character in value[_HEX_PREFIX_LENGTH:])
+    )
+
+
+def canonical_public_https_origin(value: str) -> str | None:
+    """Return the canonical browser-safe public HTTPS origin, if valid."""
+    candidate = value.strip()
+    try:
+        parsed = urlsplit(candidate)
+        hostname = parsed.hostname
+        port = parsed.port
+    except ValueError:
+        return None
+    canonical_hostname = (hostname or "").rstrip(".").casefold()
+    labels = canonical_hostname.split(".")
+    labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
+        label.isascii()
+        and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
+        and label[0].isalnum()
+        and label[-1].isalnum()
+        and all(character.isalnum() or character == "-" for character in label)
+        and _is_valid_ace_label(label)
+        for label in labels
+    )
+    try:
+        address = ipaddress.ip_address(canonical_hostname)
+    except ValueError:
+        address = None
+    if (
+        parsed.scheme.casefold() != "https"
+        or hostname is None
+        or parsed.netloc.casefold().rstrip(".") != canonical_hostname
+        or address is not None
+        or not labels_valid
+        or _is_whatwg_ipv4_number(labels[-1])
+        or parsed.username is not None
+        or parsed.password is not None
+        or port is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+        or "?" in candidate
+        or "#" in candidate
+        or "*" in candidate
+    ):
+        return None
+    return f"https://{canonical_hostname}"
 
 
 def canonical_browser_loopback_host(
@@ -195,43 +262,11 @@ class ServerSettings(StrictSettings):
     def _validate_public_url(cls, value: str | None) -> str | None:
         if value is None:
             return None
-        candidate = value.strip()
-        parsed = urlsplit(candidate)
-        hostname = parsed.hostname
-        try:
-            address = ipaddress.ip_address(hostname or "")
-        except ValueError:
-            address = None
-        try:
-            port = parsed.port
-        except ValueError as error:
-            msg = "operator public URL must be a portless HTTPS FQDN"
-            raise ValueError(msg) from error
-        labels = (hostname or "").rstrip(".").split(".")
-        labels_valid = len(labels) >= _MIN_PUBLIC_DNS_LABELS and all(
-            label.isascii()
-            and 1 <= len(label) <= _MAX_DNS_LABEL_LENGTH
-            and label[0].isalnum()
-            and label[-1].isalnum()
-            and all(character.isalnum() or character == "-" for character in label)
-            for label in labels
-        )
-        if (
-            parsed.scheme.casefold() != "https"
-            or hostname is None
-            or address is not None
-            or not labels_valid
-            or parsed.username is not None
-            or parsed.password is not None
-            or port is not None
-            or parsed.path not in {"", "/"}
-            or parsed.query
-            or parsed.fragment
-            or "*" in candidate
-        ):
+        canonical = canonical_public_https_origin(value)
+        if canonical is None:
             msg = "operator public URL must be a portless HTTPS FQDN"
             raise ValueError(msg)
-        return f"https://{hostname.rstrip('.').casefold()}"
+        return canonical
 
     @model_validator(mode="after")
     def _require_public_url_and_cloudflare_access_together(self) -> Self:
