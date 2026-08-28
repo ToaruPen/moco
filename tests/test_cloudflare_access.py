@@ -193,6 +193,46 @@ async def test_rejects_duplicate_kid_header_before_fetch(private_key: rsa.RSAPri
 
 
 @pytest.mark.parametrize(
+    ("segment", "malformed_value"),
+    [
+        ("header_padding", None),
+        ("payload_empty", ""),
+        ("payload_padding", _base64url(b"{}") + "="),
+        ("payload_invalid_character", "!"),
+        ("payload_invalid_base64", "A"),
+        ("payload_invalid_json", _base64url(b"not-json")),
+        ("payload_non_object", _base64url(b"[]")),
+        ("payload_duplicate_key", _base64url(b'{"exp":1,"exp":2}')),
+        ("payload_nonfinite", _base64url(b'{"exp":Infinity}')),
+        ("signature_empty", ""),
+        ("signature_padding", "AA=="),
+        ("signature_invalid_character", "!"),
+        ("signature_noncanonical", "AB"),
+        ("signature_invalid_base64", "A"),
+    ],
+)
+async def test_rejects_malformed_compact_token_before_fetching_keys(
+    private_key: rsa.RSAPrivateKey,
+    segment: str,
+    malformed_value: str | None,
+) -> None:
+    segments = _token(private_key).split(".")
+    if segment == "header_padding":
+        segments[0] += "="
+    elif segment.startswith("payload_"):
+        assert malformed_value is not None
+        segments[1] = malformed_value
+    else:
+        assert malformed_value is not None
+        segments[2] = malformed_value
+    fetcher = FakeFetcher(RuntimeError("JWKS must not be fetched"))
+    verifier = CloudflareAccessVerifier(_settings(), fetch_jwks=fetcher)
+
+    assert await verifier.rejection_code([".".join(segments)]) == "access_token_invalid"
+    assert fetcher.calls == 0
+
+
+@pytest.mark.parametrize(
     "claims",
     [
         _claims(iss="https://other.cloudflareaccess.com"),

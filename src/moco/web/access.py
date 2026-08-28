@@ -130,20 +130,29 @@ def _valid_kid(value: object) -> bool:
     )
 
 
-def _decode_header(token: str) -> str:
-    segments = token.split(".")
-    if (
-        len(segments) != _JWT_SEGMENT_COUNT
-        or not segments[0]
-        or _BASE64URL_PATTERN.fullmatch(segments[0]) is None
-    ):
+def _decode_canonical_segment(segment: str) -> bytes:
+    if not segment or _BASE64URL_PATTERN.fullmatch(segment) is None:
         raise ValueError
     try:
-        padded = segments[0] + "=" * (-len(segments[0]) % 4)
-        raw_header = base64.urlsafe_b64decode(padded.encode("ascii"))
-        header = _load_json_object(raw_header)
+        padded = segment + "=" * (-len(segment) % 4)
+        decoded = base64.b64decode(padded.encode("ascii"), altchars=b"-_", validate=True)
     except (UnicodeError, binascii.Error, ValueError) as error:
         raise ValueError from error
+    canonical = base64.urlsafe_b64encode(decoded).rstrip(b"=").decode("ascii")
+    if canonical != segment:
+        raise ValueError
+    return decoded
+
+
+def _preflight_token(token: str) -> str:
+    segments = token.split(".")
+    if len(segments) != _JWT_SEGMENT_COUNT or any(not segment for segment in segments):
+        raise ValueError
+    raw_header, raw_payload, _raw_signature = (
+        _decode_canonical_segment(segment) for segment in segments
+    )
+    header = _load_json_object(raw_header)
+    _load_json_object(raw_payload)
     if header.get("alg") != _ALGORITHM or not _valid_kid(header.get("kid")):
         raise ValueError
     return cast("str", header["kid"])
@@ -275,7 +284,7 @@ class CloudflareAccessVerifier:
         return None
 
     async def _verified_claims(self, token: str) -> Mapping[str, object]:
-        kid = _decode_header(token)
+        kid = _preflight_token(token)
         key = await self._key_for(kid)
         decoded = jwt.decode(
             token,
