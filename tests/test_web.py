@@ -3480,10 +3480,6 @@ class FakeAccessVerifier:
         self.expires_at = expires_at or time.time() + 300
         self.assertions: list[list[str]] = []
 
-    async def rejection_code(self, assertions: Sequence[str]) -> str | None:
-        self.assertions.append(list(assertions))
-        return self.result
-
     async def authorization(
         self,
         assertions: Sequence[str],

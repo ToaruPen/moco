@@ -71,7 +71,7 @@ agent:
 
 ## 信頼境界とリスク
 
-Cloudflare Access と persistent operator capability は、公開 operator endpoint に接続できる利用者を制限する。これらは Codex の実行 sandbox の代わりにはならない。
+公開 operator endpoint は Cloudflare Access identity だけで利用者を認証する。persistent operator capability は loopback operator endpoint だけを保護する。これらは Codex の実行 sandbox の代わりにはならない。
 
 認証済み iPhone からの音声・テキスト、Codex が読むローカルファイル、web 検索結果、plugin/app/MCP の応答は、Agent の判断へ影響する入力である。誤認識、利用者の指示ミス、prompt injection、operator capability の漏えい、端末またはアカウント侵害が起きると、moco 実行ユーザーのデータ破壊、資格情報窃取、外部送信、永続化につながり得る。
 
@@ -81,7 +81,7 @@ app/MCP/provider/workspace が持つ独自の認可、破壊的操作の安全�
 
 ## データフロー
 
-1. iPhone は Cloudflare Access と operator capability を通過して operator WebSocket へ接続する。
+1. iPhone は Cloudflare Access identity の検証を通過して operator WebSocket へ接続する。
 2. Realtime 会話が delegated Agent task を生成する。
 3. moco はローカル設定から `danger_full_access_no_approval` を読み取る。
 4. moco は `thread/start` へ `danger-full-access` と `never` を明示する。

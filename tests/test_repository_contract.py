@@ -311,6 +311,42 @@ def test_readme_documents_browser_observation_and_separate_reviewer_roles() -> N
     assert "daemon を再起動すると古い QR は無効" not in mobile
 
 
+def test_security_docs_distinguish_public_access_from_loopback_capability() -> None:
+    security = _compact_prose((ROOT / "SECURITY.md").read_text(encoding="utf-8"))
+    danger_design = _compact_prose(
+        (
+            ROOT
+            / "docs"
+            / "superpowers"
+            / "specs"
+            / "2026-08-28-danger-full-access-no-approval-design.md"
+        ).read_text(encoding="utf-8")
+    )
+
+    for contract in [
+        (
+            "公開経路では、CloudflareAccessidentityだけをオペレーター認証に使い、"
+            "mococapabilityをURL、browserstorage、WebSocketへ渡しません。"
+        ),
+        (
+            "loopback経路では、persistentoperatorcapabilityをowner-privateな"
+            "`operator-capability.json`と同一originの`localStorage`へ永続化し、"
+            "WebSocketsubprotocolで渡します。"
+        ),
+        ("公開URLとスマートフォン用QRは変わらず、再登録は不要です。"),
+    ]:
+        assert contract in security
+
+    assert (
+        "公開operatorendpointはCloudflareAccessidentityだけで利用者を認証する。"
+        "persistentoperatorcapabilityはloopbackoperatorendpointだけを保護する。"
+    ) in danger_design
+    assert (
+        "iPhoneはCloudflareAccessidentityの検証を通過してoperatorWebSocketへ接続する。"
+    ) in danger_design
+    assert "iPhoneはCloudflareAccessとoperatorcapabilityを通過" not in danger_design
+
+
 def test_readme_documents_stage_b_verification_without_claiming_live_acceptance() -> None:
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     development = readme.split("## 開発", maxsplit=1)[1]

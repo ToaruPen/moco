@@ -262,20 +262,15 @@ class _AccessLeaseAuthority:
                 or not secrets.compare_digest(authorization.identity, record.identity)
             ):
                 return False
-            if now >= record.deadline:
-                self._active = None
-                record.changed.set()
-                on_expire = record.on_expire
-            else:
+            if now < record.deadline:
                 deadline = self._deadline(now, authorization)
-                if deadline <= now:
-                    self._active = None
-                    record.changed.set()
-                    on_expire = record.on_expire
-                else:
+                if deadline > now:
                     record.deadline = deadline
                     record.changed.set()
                     return True
+            self._active = None
+            record.changed.set()
+            on_expire = record.on_expire
         if on_expire is not None:
             await on_expire()
         return False
@@ -3681,10 +3676,7 @@ def _public_http_origin_allowed(request: Request, public_url: str | None) -> boo
 def _valid_access_lease_token(value: object) -> bool:
     if not isinstance(value, str) or not value or not value.isascii():
         return False
-    try:
-        return len(value.encode("ascii")) <= _ACCESS_LEASE_TOKEN_MAX_BYTES
-    except UnicodeError:
-        return False
+    return len(value) <= _ACCESS_LEASE_TOKEN_MAX_BYTES
 
 
 def _single_valid_authority(values: Sequence[str]) -> str | None:
