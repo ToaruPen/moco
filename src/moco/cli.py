@@ -426,6 +426,7 @@ def _is_safe_mobile_url(url: str) -> bool:
     return (
         parsed.scheme == "https"
         and hostname is not None
+        and url == f"https://{hostname}"
         and not is_ip_address
         and is_fqdn
         and parsed.username is None

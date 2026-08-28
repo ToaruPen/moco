@@ -254,8 +254,13 @@ def test_mobile_url_validation_accepts_bare_public_url() -> None:
 @pytest.mark.parametrize(
     "url",
     [
+        "https://voice.example.com#",
         "https://voice.example.com/#token",
+        "https://voice.example.com#token",
+        "https://voice.example.com?",
         "https://voice.example.com?mode=mobile",
+        "https://voice.example.com:",
+        "https://voice.example.com:443",
         "https://voice.example.com/path",
         "https://voice.example.com/",
         "https://user@voice.example.com",
