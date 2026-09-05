@@ -1317,6 +1317,15 @@ describe("operator status", () => {
 });
 
 describe("operator console DOM", () => {
+  it("shows a disabled connection action during a connection attempt", () => {
+    const row = { hidden: true };
+    const button = { disabled: false, textContent: "再接続" };
+    setConnectionAction({ row, button }, "connecting");
+    assert.equal(row.hidden, false);
+    assert.equal(button.disabled, true);
+    assert.equal(button.textContent, "接続中…");
+  });
+
   it("removes the connection action after success and restores it after disconnect", () => {
     const row = { hidden: false };
     const button = { disabled: true, textContent: "接続" };
@@ -2095,6 +2104,59 @@ async function bootConversationHarness({
 }
 
 describe("operator Access browser connection", () => {
+  it("preserves microphone guidance when listening starts during device setup", async () => {
+    const connection = await bootConversationHarness({
+      answerStarts: [0],
+      pendingEnumerations: [0],
+    });
+    const document = connection.dom.window.document;
+    try {
+      await connection.waitFor(() => connection.mediaDevices.enumerationResolvers.has(0));
+      connection.receive({ type: "control", control: "listen_start" });
+      await connection.waitFor(() => document.querySelector("#mic-state").textContent === "MIC ON");
+      assert.match(document.querySelector("#transcript").textContent, /そのまま話しかけて/);
+      connection.mediaDevices.resolveEnumeration(0);
+      await connection.waitFor(() => document.querySelector("#connection-row").hidden);
+      assert.equal(connection.tracks[0].enabled, true);
+      assert.match(document.querySelector("#transcript").textContent, /そのまま話しかけて/);
+    } finally {
+      await connection.close();
+    }
+  });
+
+  it("keeps empty conversation guidance in sync with connection and microphone controls", async () => {
+    const connection = await bootConversationHarness({ answerStarts: [0] });
+    const document = connection.dom.window.document;
+    const text = () => document.querySelector("#transcript").textContent;
+    try {
+      await connection.waitFor(() => document.querySelector("#connection-row").hidden);
+      assert.match(text(), /入力開始/);
+      document.querySelector("#listen-start").click();
+      await connection.waitFor(() => document.querySelector("#mic-state").textContent === "MIC ON");
+      assert.match(text(), /そのまま話しかけて/);
+      document.querySelector("#listen-stop").click();
+      await connection.waitFor(
+        () => document.querySelector("#mic-state").textContent === "MIC OFF",
+      );
+      assert.match(text(), /入力開始/);
+      connection.receive({
+        type: "state",
+        state: "voice_reconnect_required",
+        canCancel: false,
+        hotkeys: { enabled: true, startListening: "f7", stopListening: "f8" },
+        voice: { selected: null, options: [], ready: false, readiness: "loading" },
+      });
+      assert.match(text(), /音声接続/);
+      connection.receive({ type: "transcript", role: "user", text: "テストの発話", done: true });
+      assert.equal(document.querySelector(".transcript-empty"), null);
+      connection.disconnect();
+      document.querySelector("#clear").click();
+      assert.match(text(), /再接続/);
+    } finally {
+      await connection.close();
+    }
+  });
+
   it("activates audio and requests microphone permission before probing Access and opening a socket", async () => {
     const connection = await bootConversationHarness({
       answerStarts: [0],
