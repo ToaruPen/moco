@@ -16,64 +16,68 @@
       <span id="mic-state" class="status-chip" data-status="muted">MIC OFF</span>
       <span id="connection" class="status-chip" data-status="muted">WS OFFLINE</span>
       <div class="operator-actions">
-        <label class="device-control" for="audio-input">
-          <span>INPUT</span>
-          <select id="audio-input" aria-label="入力マイク" disabled>
-            <option value="">接続待ち</option>
-          </select>
-        </label>
-        <label class="device-control" for="audio-output">
-          <span>OUTPUT</span>
-          <select id="audio-output" aria-label="音声出力先" disabled>
-            <option value="">接続待ち</option>
-          </select>
-        </label>
-        <label class="voice-control" for="voice">
-          <span>VOICE</span>
-          <select id="voice" aria-label="音声モデル" disabled>
-            <option>接続待ち</option>
-          </select>
-        </label>
-        <button
-          id="listen-start"
-          type="button"
-          aria-label="音声入力を開始"
-          aria-pressed="false"
-          disabled
-        >
-          <span id="start-key" class="keycap">—</span>
-          <span class="desktop-action-label">開始</span>
-          <span class="mobile-action-label">入力開始</span>
-        </button>
-        <button id="listen-stop" type="button" aria-label="音声入力を停止" disabled>
-          <span id="stop-key" class="keycap">—</span>
-          <span class="desktop-action-label">停止</span>
-          <span class="mobile-action-label">入力停止</span>
-        </button>
-        <button
-          id="turn-cancel"
-          type="button"
-          aria-label="実行中の処理を取り消す"
-          disabled
-        >
-          処理を取消
-        </button>
-        <button id="pairing-open" type="button" hidden>スマホ接続</button>
-        <button
-          id="theme-toggle"
-          type="button"
-          aria-haspopup="dialog"
-          aria-expanded="false"
-          aria-controls="theme-panel"
-        >
-          配色
-        </button>
+        <div class="audio-controls">
+          <label class="device-control" for="audio-input">
+            <span>マイク</span>
+            <select id="audio-input" aria-label="入力マイク" disabled>
+              <option value="">接続待ち</option>
+            </select>
+          </label>
+          <label class="device-control" for="audio-output">
+            <span>出力先</span>
+            <select id="audio-output" aria-label="音声出力先" disabled>
+              <option value="">接続待ち</option>
+            </select>
+          </label>
+          <label class="voice-control" for="voice">
+            <span>声</span>
+            <select id="voice" aria-label="音声モデル" disabled>
+              <option>接続待ち</option>
+            </select>
+          </label>
+        </div>
+        <div class="session-controls">
+          <button
+            id="listen-start"
+            type="button"
+            aria-label="音声入力を開始"
+            aria-pressed="false"
+            disabled
+          >
+            <span id="start-key" class="keycap">—</span>
+            <span>入力開始</span>
+          </button>
+          <button id="listen-stop" type="button" aria-label="音声入力を停止" disabled>
+            <span id="stop-key" class="keycap">—</span>
+            <span>入力停止</span>
+          </button>
+          <button
+            id="turn-cancel"
+            type="button"
+            aria-label="実行中の処理を取り消す"
+            disabled
+          >
+            処理を取消
+          </button>
+        </div>
+        <div class="utility-controls">
+          <button id="pairing-open" type="button" hidden>スマホ接続</button>
+          <button
+            id="theme-toggle"
+            type="button"
+            aria-haspopup="dialog"
+            aria-expanded="false"
+            aria-controls="theme-panel"
+          >
+            配色
+          </button>
+        </div>
       </div>
     </header>
 
     <div id="connection-row" class="connection-row">
       <button id="enable" class="connection-action" type="button">接続</button>
-      <p>マイク停止後も、Codex の処理と音声再生は継続します。</p>
+      <p>接続するとマイクを準備します。入力は「入力開始」でオンになります。</p>
     </div>
 
     <section class="progress-band" aria-label="現在の処理状況">
@@ -94,11 +98,18 @@
             <h2 id="conversation-title">会話</h2>
             <p>この画面のみ・保存されません</p>
           </div>
-          <button id="clear" type="button">消去</button>
+          <div class="panel-actions">
+            <button id="transcript-latest" type="button" hidden>最新へ</button>
+            <button id="clear" type="button" title="表示だけを消去します。会話や処理は継続します。">消去</button>
+          </div>
         </header>
-        <div id="transcript" class="transcript" role="log" aria-live="polite">
-          <p class="transcript-empty">接続後、開始を押すか設定キーで話しかけると表示されます。</p>
+        <div id="transcript" class="transcript" role="log" aria-label="会話の内容" aria-live="polite" tabindex="0">
+          <div class="transcript-empty">
+            <strong>声で会話を始めましょう</strong>
+            <p>「接続」を押してマイクを許可し、その後「入力開始」で話しかけてください。</p>
+          </div>
         </div>
+        <p class="conversation-hint">入力停止はマイクだけを止めます。処理と音声再生は続きます。</p>
       </section>
 
       <section class="activity-pane panel" aria-labelledby="activity-title">
@@ -109,7 +120,7 @@
           </div>
           <button id="activity-latest" type="button" hidden>最新へ</button>
         </header>
-        <div id="activity" class="activity" role="log" aria-live="off">
+        <div id="activity" class="activity" role="log" aria-label="処理の履歴" aria-live="off" tabindex="0">
           <p class="activity-empty">接続後の処理状況がここに表示されます。</p>
         </div>
       </section>

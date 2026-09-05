@@ -584,9 +584,76 @@ export function reconcileListeningState({ controller, state, listenStart, micSta
 }
 
 export class TranscriptView {
-  constructor(container) {
+  constructor(container, { latestButton, now = () => Date.now() } = {}) {
     this.container = container;
+    this.latestButton = latestButton;
+    this.now = now;
     this.active = new Map();
+    this.autoFollow = true;
+    this.guidance = "initial";
+    this.container.addEventListener("scroll", () => {
+      const remaining =
+        this.container.scrollHeight - this.container.scrollTop - this.container.clientHeight;
+      this.autoFollow = remaining < 48;
+      if (this.latestButton) {
+        this.latestButton.hidden = this.autoFollow;
+      }
+    });
+    this.latestButton?.addEventListener("click", () => {
+      this.scrollToLatest();
+      this.container.focus({ preventScroll: true });
+    });
+    this.setGuidance("initial");
+  }
+
+  setGuidance(state) {
+    this.guidance = state;
+    if (this.container.querySelector(".utterance")) {
+      return;
+    }
+    const document = this.container.ownerDocument;
+    const empty = document.createElement("div");
+    const title = document.createElement("strong");
+    const description = document.createElement("p");
+    empty.className = "transcript-empty";
+    switch (state) {
+      case "connecting":
+        title.textContent = "接続を準備しています";
+        description.textContent =
+          "マイクの許可を求められたら許可してください。接続後に入力を開始できます。";
+        break;
+      case "ready":
+        title.textContent = "話す準備ができました";
+        description.textContent =
+          "「入力開始」を押して話しかけてください。設定した開始キーも使えます。";
+        break;
+      case "listening":
+        title.textContent = "マイクがオンです";
+        description.textContent =
+          "そのまま話しかけてください。聞き取った言葉と応答がここに表示されます。";
+        break;
+      case "idle_expired":
+        title.textContent = "音声入力を休止しています";
+        description.textContent = "「入力開始」を押すと、音声接続を再開できます。";
+        break;
+      case "voice_reconnect_required":
+      case "connection_lost":
+        title.textContent = "音声接続が切れました";
+        description.textContent =
+          "「入力開始」を押して音声接続をやり直してください。依頼は自動で再送されません。";
+        break;
+      case "disconnected":
+        title.textContent = "接続を確認してください";
+        description.textContent =
+          "エラーの内容を確認して「再接続」を押してください。依頼は自動で再送されません。";
+        break;
+      default:
+        title.textContent = "声で会話を始めましょう";
+        description.textContent =
+          "「接続」を押してマイクを許可し、その後「入力開始」で話しかけてください。";
+    }
+    empty.append(title, description);
+    this.container.replaceChildren(empty);
   }
 
   update(role, text, done) {
@@ -595,13 +662,24 @@ export class TranscriptView {
     let entry = this.active.get(role);
     if (!entry) {
       const wrapper = document.createElement("article");
+      const metadata = document.createElement("div");
       const label = document.createElement("span");
+      const time = document.createElement("time");
       const content = document.createElement("p");
       wrapper.className = "utterance";
+      metadata.className = "utterance-meta";
       label.className = "utterance-role";
+      time.className = "utterance-time";
       content.className = "utterance-text";
       label.textContent = role === "user" ? "YOU" : "MOCO";
-      wrapper.append(label, content);
+      const started = new Date(this.now());
+      time.dateTime = started.toISOString();
+      time.textContent = started.toLocaleTimeString("ja-JP", {
+        hour: "2-digit",
+        minute: "2-digit",
+      });
+      metadata.append(label, time);
+      wrapper.append(metadata, content);
       this.container.append(wrapper);
       entry = content;
       this.active.set(role, entry);
@@ -610,17 +688,24 @@ export class TranscriptView {
     if (done) {
       this.active.delete(role);
     }
+    if (this.autoFollow) {
+      this.scrollToLatest();
+    }
+  }
+
+  scrollToLatest() {
     this.container.scrollTop = this.container.scrollHeight;
+    this.autoFollow = true;
+    if (this.latestButton) {
+      this.latestButton.hidden = true;
+    }
   }
 
   clear() {
-    const document = this.container.ownerDocument;
     this.active.clear();
     this.container.replaceChildren();
-    const empty = document.createElement("p");
-    empty.className = "transcript-empty";
-    empty.textContent = "会話を消去しました。次の発話を待っています。";
-    this.container.append(empty);
+    this.setGuidance(this.guidance);
+    this.scrollToLatest();
   }
 }
 
@@ -843,8 +928,9 @@ export function setConnectionAction({ row, button }, state) {
   const connected = state === "connected";
   row.hidden = connected;
   if (!connected) {
-    button.disabled = false;
-    button.textContent = state === "disconnected" ? "再接続" : "接続";
+    button.disabled = state === "connecting";
+    button.textContent =
+      state === "connecting" ? "接続中…" : state === "disconnected" ? "再接続" : "接続";
   }
 }
 
@@ -1312,6 +1398,7 @@ function boot() {
     errorText: document.querySelector("#error-text"),
     errorClose: document.querySelector("#error-close"),
     transcript: document.querySelector("#transcript"),
+    transcriptLatest: document.querySelector("#transcript-latest"),
     clear: document.querySelector("#clear"),
     activity: document.querySelector("#activity"),
     activityLatest: document.querySelector("#activity-latest"),
@@ -1330,7 +1417,15 @@ function boot() {
     pairingClose: document.querySelector("#pairing-close"),
     pairingImage: document.querySelector("#pairing-image"),
   };
-  const transcript = new TranscriptView(dom.transcript);
+  const transcript = new TranscriptView(dom.transcript, { latestButton: dom.transcriptLatest });
+  const updateConnectionAction = (state) => {
+    setConnectionAction({ row: dom.connectionRow, button: dom.enable }, state);
+    if (state === "connected") {
+      updateConversationGuidance();
+    } else {
+      transcript.setGuidance(state);
+    }
+  };
   const activityBuffer = new ActivityBuffer();
   const progress = new ProgressTracker();
   const operatorStatus = new OperatorStatus({
@@ -1399,6 +1494,17 @@ function boot() {
   let stream;
   let context;
   let controller;
+  const updateConversationGuidance = () => {
+    transcript.setGuidance(
+      controller?.idleExpired
+        ? "idle_expired"
+        : controller?.reconnectRequired
+          ? "voice_reconnect_required"
+          : controller?.stream.getAudioTracks()[0]?.enabled
+            ? "listening"
+            : "ready",
+    );
+  };
   let deviceController;
   let openPromise;
   let progressTimer;
@@ -1501,7 +1607,7 @@ function boot() {
       peer = undefined;
       stream = undefined;
       void closeDisconnectedMedia(disconnectedMedia);
-      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      updateConnectionAction("disconnected");
       operatorStatus.disconnect();
       const closeErrorCode = connectionCloseErrorCode(disconnectError, wasOnline);
       if (closeErrorCode) {
@@ -1578,6 +1684,7 @@ function boot() {
         });
         dom.startKey.textContent = startKey.toUpperCase();
         dom.stopKey.textContent = stopKey.toUpperCase();
+        updateConversationGuidance();
         voiceModels.configure(message.voice);
         turnCancel.configure(message.canCancel);
       } else if (message.type === "control") {
@@ -1714,10 +1821,10 @@ function boot() {
   dom.enable.addEventListener("click", async () => {
     if (capabilityCleanupError) {
       operatorStatus.showError(capabilityCleanupError.name || "capability_cleanup_failed");
-      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      updateConnectionAction("disconnected");
       return;
     }
-    dom.enable.disabled = true;
+    updateConnectionAction("connecting");
     let stage = "audio";
     try {
       const activation = beginAudioActivation();
@@ -1780,7 +1887,7 @@ function boot() {
       }
       dom.listenStart.disabled = false;
       dom.listenStop.disabled = false;
-      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "connected");
+      updateConnectionAction("connected");
     } catch (error) {
       stopPeerWatch?.();
       stopPeerWatch = undefined;
@@ -1806,7 +1913,7 @@ function boot() {
       if (!error.displayed) {
         operatorStatus.showError(connectionSetupErrorCode(stage, error));
       }
-      setConnectionAction({ row: dom.connectionRow, button: dom.enable }, "disconnected");
+      updateConnectionAction("disconnected");
     }
   });
 
@@ -1843,6 +1950,7 @@ function boot() {
     dom.listenStart.setAttribute("aria-pressed", String(listening));
     dom.micState.textContent = listening ? "MIC ON" : "MIC OFF";
     dom.micState.dataset.status = listening ? "ok" : "muted";
+    updateConversationGuidance();
     operatorStatus.addLocal({
       kind: "microphone",
       phase: listening ? "started" : "completed",
