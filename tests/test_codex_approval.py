@@ -374,6 +374,16 @@ def file_change_profile(**overrides: object) -> ApprovalProfile:
     return ApprovalProfile(**members)  # type: ignore[arg-type]
 
 
+def command_kind_contract() -> CodexProtocolContract:
+    profile = command_profile(
+        member_contracts={
+            **COMMAND_CONTRACTS,
+            "kind": _ValueContract(all_of=(literal("command", "writeStdin"),)),
+        }
+    )
+    return approval_contract(profiles={COMMAND_METHOD: profile, FILE_METHOD: file_change_profile()})
+
+
 def legacy_command_profile(*, denied_object: bool = False, **overrides: object) -> ApprovalProfile:
     """The legacy command approval profile every retained bundle still advertises."""
     members: dict[str, object] = {
@@ -702,6 +712,55 @@ def test_command_approval_accepts_the_shape_without_optional_started_at() -> Non
 
     assert review.command == COMMAND
     assert review.decisions == _ONE_SHOT
+
+
+@pytest.mark.parametrize("kind", [_OMITTED, "command"])
+def test_command_kind_retains_the_real_command_and_one_shot_review(kind: object) -> None:
+    review = adapt_command(
+        command_params(kind=kind, reason=REASON), contract=command_kind_contract()
+    )
+
+    assert (review.command, review.cwd, review.reason) == (COMMAND, CWD, REASON)
+    assert thread_correlation(review) == (THREAD_ID, TURN_ID, ITEM_ID)
+    assert review.decisions == _ONE_SHOT
+    assert review.response_for(ApprovalDecision.ACCEPT) == {"decision": "accept"}
+
+
+@pytest.mark.parametrize("kind", ["writeStdin", "future", None, 1, {"type": "command"}])
+async def test_non_command_kind_never_reaches_the_reviewer(kind: JsonValue) -> None:
+    interaction = broker(command_kind_contract())
+    interaction.register_approval_handlers(Registrar())
+    counts = bind_pending_counts(interaction)
+    connection = interaction.connect_reviewer()
+
+    with pytest.raises(CodexSchemaError) as failure:
+        await asyncio.wait_for(interaction.review(command_request(kind=kind)), 0.1)
+
+    assert counts == []
+    assert pending_reviews(interaction) == 0
+    assert not any(secret in str(failure.value) for secret in SECRETS)
+    with pytest.raises(TimeoutError):
+        await asyncio.wait_for(anext(connection), 0.01)
+    interaction.close()
+
+
+@pytest.mark.parametrize(
+    ("member", "value"),
+    [
+        ("additionalPermissions", {"network": {}}),
+        ("environmentId", "remote"),
+        ("networkApprovalContext", {"host": "example.invalid", "protocol": "https"}),
+        ("proposedExecpolicyAmendment", ["git"]),
+        ("proposedNetworkPolicyAmendments", [{"action": "allow", "host": "example.invalid"}]),
+    ],
+)
+def test_command_kind_does_not_authorize_additional_scope(member: str, value: JsonValue) -> None:
+    contract = command_kind_contract()
+    with pytest.raises(CodexSchemaError, match="scope cannot be explained"):
+        adapt_command(
+            command_params(kind="command", **{member: value}),
+            contract=contract,
+        )
 
 
 def test_optional_cross_version_metadata_is_not_retained() -> None:

@@ -23,6 +23,7 @@ from moco.codex.schema import (
     ApprovalCorrelation,
     ApprovalDecision,
     ApprovalProfile,
+    CommandApprovalKind,
     ServerRequestCategory,
     _is_transport_safe,
 )
@@ -451,6 +452,10 @@ def _command_review(
     fields: dict[str, JsonValue],
     correlation: ApprovalRequestCorrelation,
 ) -> CommandApprovalReview:
+    # A writeStdin approval concerns input to an existing terminal. Its command-shaped
+    # text and cwd cannot identify that terminal or explain what the input will do.
+    if fields.get("kind", CommandApprovalKind.COMMAND.value) != CommandApprovalKind.COMMAND:
+        raise CodexSchemaError(_UNSUPPORTED_SCOPE)
     return CommandApprovalReview(
         profile=profile,
         correlation=correlation,

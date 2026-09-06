@@ -5311,6 +5311,99 @@ def test_approval_profiles_are_read_from_the_generated_request_and_response(
     assert contract.adaptable_approval_categories == STAGE_B_REQUIRED_SERVER_REQUEST_CATEGORIES
 
 
+@pytest.mark.parametrize("referenced", [False, True])
+@pytest.mark.parametrize("required_kind", [False, True])
+def test_command_approval_kind_preserves_the_generated_action_vocabulary(
+    tmp_path: Path, referenced: bool, required_kind: bool
+) -> None:
+    kind: dict[str, JsonValue] = {"type": "string", "enum": ["command", "writeStdin"]}
+    documents: dict[str, JsonValue] = {}
+    if referenced:
+        documents["CommandExecutionApprovalKind.json"] = kind
+        kind = {
+            "allOf": [{"$ref": "CommandExecutionApprovalKind.json"}],
+            "default": "command",
+        }
+    approval_bundle(
+        tmp_path,
+        command_properties=command_approval_properties(overrides={"kind": kind}),
+        command_required=frozenset({"threadId", "turnId", "itemId", "startedAtMs"})
+        | ({"kind"} if required_kind else set()),
+        documents=documents,
+    )
+
+    profile = load_generated_contract(tmp_path, version="fake").approval_profile(
+        COMMAND_APPROVAL_METHOD
+    )
+
+    assert profile is not None
+    assert ("kind" in profile.required_members) is required_kind
+    assert profile.admits_member("kind", "command")
+    assert profile.admits_member("kind", "writeStdin")
+    assert not profile.admits_member("kind", "future")
+    assert not profile.admits_member("kind", None)
+
+
+@pytest.mark.parametrize(
+    "kind",
+    [
+        {"type": "string"},
+        {"type": "string", "enum": ["command", "writeStdin", "future"]},
+        {"type": "string", "enum": ["writeStdin"]},
+        {"type": ["string", "null"], "enum": ["command", "writeStdin", None]},
+        {"type": "object"},
+        {"type": "string", "enum": ["command", "writeStdin"], "const": "writeStdin"},
+        {"anyOf": [{"type": "string", "enum": ["command", "writeStdin"]}, {}]},
+    ],
+)
+def test_unknown_command_approval_kind_schema_remains_unadaptable(
+    tmp_path: Path, kind: dict[str, JsonValue]
+) -> None:
+    approval_bundle(
+        tmp_path, command_properties=command_approval_properties(overrides={"kind": kind})
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert contract.approval_profile(COMMAND_APPROVAL_METHOD) is None
+    assert ServerRequestCategory.COMMAND_APPROVAL not in contract.adaptable_approval_categories
+
+
+@pytest.mark.parametrize("default", ["command", "writeStdin", "future", None])
+@pytest.mark.parametrize(
+    "location", ["inline", "ref", "allOf-ref", "allOf-inline", "referenced-enum", "ref-chain"]
+)
+def test_command_approval_kind_defaults_are_checked_through_wrappers(
+    tmp_path: Path, default: JsonValue, location: str
+) -> None:
+    enum: dict[str, JsonValue] = {"type": "string", "enum": ["command", "writeStdin"]}
+    reference: dict[str, JsonValue] = {"$ref": "CommandExecutionApprovalKind.json"}
+    kinds: dict[str, JsonValue] = {
+        "inline": {**enum, "default": default},
+        "ref": {**reference, "default": default},
+        "allOf-ref": {"allOf": [{**reference, "default": default}], "default": "command"},
+        "allOf-inline": {"allOf": [{**enum, "default": default}], "default": "command"},
+        "referenced-enum": reference,
+        "ref-chain": {"$ref": "IntermediateKind.json"},
+    }
+    approval_bundle(
+        tmp_path,
+        command_properties=command_approval_properties(overrides={"kind": kinds[location]}),
+        documents={
+            "CommandExecutionApprovalKind.json": (
+                {**enum, "default": default} if location == "referenced-enum" else enum
+            ),
+            "IntermediateKind.json": {**reference, "default": default},
+        },
+    )
+
+    contract = load_generated_contract(tmp_path, version="fake")
+
+    assert (contract.approval_profile(COMMAND_APPROVAL_METHOD) is not None) is (
+        default == "command"
+    )
+
+
 def test_a_profile_checks_every_declared_member_against_its_own_schema(tmp_path: Path) -> None:
     """A member moco only displays or drops is compiled and checked like any other."""
     approval_bundle(
