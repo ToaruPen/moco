@@ -679,6 +679,13 @@ class ApprovalDecision(StrEnum):
     CANCEL = "cancel"
 
 
+class CommandApprovalKind(StrEnum):
+    """The generated action discriminator; terminal input needs a separate review."""
+
+    COMMAND = "command"
+    WRITE_STDIN = "writeStdin"
+
+
 class ApprovalCorrelation(StrEnum):
     """Which identifiers one approval family states about the request it is asking about.
 
@@ -1860,12 +1867,15 @@ class _ApprovalSpec:
     argv_member: str | None = None
     changes_member: str | None = None
     offer_member: str | None = None
+    kind_member: str | None = None
     # Stated exactly when this family states its own changed files.
     change_shape: _FileChangeShape | None = None
 
     @property
     def known_members(self) -> frozenset[str]:
-        named = {self.argv_member, self.changes_member, self.offer_member} - {None}
+        named = {self.argv_member, self.changes_member, self.offer_member, self.kind_member} - {
+            None
+        }
         return (
             self.correlation_members
             | self.displayed_members
@@ -1937,6 +1947,7 @@ _APPROVAL_SPECS: Mapping[str, _ApprovalSpec] = MappingProxyType(
                 }
             ),
             offer_member=_OFFER_MEMBER,
+            kind_member="kind",
             decisions=_ONE_SHOT_WIRE,
             unsent_decisions=frozenset({"acceptForSession"}),
             unsent_variants=frozenset(
@@ -2178,9 +2189,17 @@ class _SchemaResolver:
         value: JsonValue,
         base_path: Path,
         stack: _RefStack = (),
+        *,
+        expected_default: str | None = None,
     ) -> _ResolvedSchema:
         self.consume_visit()
         schema = _as_schema(value, _INVALID_SCHEMA)
+        # A caller interpreting omission must check annotations before $ref drops them.
+        if (
+            expected_default is not None
+            and schema.get("default", expected_default) != expected_default
+        ):
+            raise CodexSchemaError(_INVALID_SCHEMA)
         if "$ref" not in schema:
             return schema, base_path, stack
         if not (schema.keys() - {"$ref"}) <= _ALLOWED_REF_SIBLINGS:
@@ -2194,7 +2213,7 @@ class _SchemaResolver:
             raise CodexSchemaError(_INVALID_REFERENCE)
         document = self._read_document(target_path, reference=True)
         target = self._pointer_value(document, pointer)
-        return self.resolve(target, target_path, (*stack, key))
+        return self.resolve(target, target_path, (*stack, key), expected_default=expected_default)
 
     def reference_names(self, value: JsonValue) -> frozenset[str]:
         self.consume_visit()
@@ -3015,6 +3034,8 @@ def _approval_members(
         return None
     contracts: dict[str, _ValueContract] = {}
     for name, raw_member in properties.items():
+        if name == spec.kind_member:
+            _require_command_approval_kind_defaults(raw_member, base_path, stack, resolver)
         contract = _compile_contract(raw_member, base_path, stack, resolver, _contract_budget())
         if not _approval_member_admits(spec, name, contract):
             return None
@@ -3078,7 +3099,41 @@ def _approval_scalar_member_admits(
         return "string" in accepted and accepted <= frozenset({"string", "null"})
     if name in spec.integer_members:
         return "integer" in accepted and accepted <= frozenset({"integer", "null"})
+    if name == spec.kind_member:
+        return _command_approval_kind_admits(contract)
     return None
+
+
+def _require_command_approval_kind_defaults(
+    raw: JsonValue, base_path: Path, stack: _RefStack, resolver: _SchemaResolver
+) -> None:
+    """Check every default along the kind's references and its admitted allOf wrapper."""
+    schema, path, ref_stack = resolver.resolve(
+        raw, base_path, stack, expected_default=CommandApprovalKind.COMMAND.value
+    )
+    branches = schema.get("allOf")
+    if isinstance(branches, list) and len(branches) == 1:
+        resolver.resolve(
+            branches[0], path, ref_stack, expected_default=CommandApprovalKind.COMMAND.value
+        )
+
+
+def _command_approval_kind_admits(contract: _ValueContract) -> bool:
+    """Prove the complete action enum, including the terminal input moco must refuse."""
+    # Generated descriptions/defaults can wrap this enum in a single allOf reference.
+    # Only an otherwise unconstrained wrapper is equivalent to the enum itself.
+    if len(contract.all_of) == 1 and contract == _ValueContract(all_of=contract.all_of):
+        contract = contract.all_of[0]
+    known = frozenset(_json_value_key(kind.value) for kind in CommandApprovalKind)
+    return (
+        contract.types == frozenset({"string"})
+        and frozenset(contract.enum or ()) == known
+        and contract.const is None
+        and not contract.all_of
+        and not contract.any_of
+        and not contract.one_of
+        and all(contract.admits(kind.value) for kind in CommandApprovalKind)
+    )
 
 
 def _approval_structured_member_admits(

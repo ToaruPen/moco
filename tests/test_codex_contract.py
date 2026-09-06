@@ -4,6 +4,8 @@ import json
 
 import pytest
 
+from moco.codex.broker import InteractionBroker
+from moco.codex.connection import CodexConnectionSupervisor
 from moco.codex.schema import (
     AGENT_READINESS_METHODS,
     STAGE_B_REQUIRED_SERVER_REQUEST_CATEGORIES,
@@ -146,6 +148,21 @@ def test_installed_codex_approval_families_are_adaptable_per_raw_method() -> Non
     ]
     if modern_file_profiles:
         assert contract.file_change_patch_profile is not None
+
+
+@pytest.mark.integration
+def test_installed_codex_approval_contract_registers_with_the_production_broker() -> None:
+    command = resolve_codex_command(None)
+    contract = CodexSchemaProbe(command).probe_sync()
+    broker = InteractionBroker(contract)
+    pending_counts: list[int] = []
+    broker.bind_pending_count_changed(pending_counts.append)
+    supervisor = CodexConnectionSupervisor(command)
+
+    broker.register_approval_handlers(supervisor)
+
+    assert pending_counts == []
+    broker.close()
 
 
 @pytest.mark.integration
