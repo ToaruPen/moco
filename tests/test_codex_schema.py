@@ -1598,7 +1598,7 @@ def test_thread_start_accepts_exact_supported_profile_pairs(tmp_path: Path) -> N
     params_schema = variant_params_schema(variant)
     base_properties: dict[str, JsonValue] = {
         "cwd": {"type": "string"},
-        "ephemeral": {"type": "boolean", "const": True},
+        "ephemeral": {"type": "boolean", "const": False},
     }
     profiles: list[dict[str, JsonValue]] = [
         {},
@@ -2441,10 +2441,10 @@ def test_ref_with_instance_assertion_sibling_is_rejected(tmp_path: Path) -> None
 @pytest.mark.parametrize(
     "ephemeral",
     [
-        {"type": "boolean", "const": False},
-        {"type": "boolean", "enum": [False]},
+        {"type": "boolean", "const": True},
+        {"type": "boolean", "enum": [True]},
         {"type": ["boolean", "null"], "enum": [None]},
-        {"anyOf": [{"type": "boolean", "const": False}, {"type": "null"}]},
+        {"anyOf": [{"type": "boolean", "const": True}, {"type": "null"}]},
     ],
 )
 def test_thread_start_rejects_ephemeral_values_moco_never_sends(
@@ -2463,9 +2463,10 @@ def test_thread_start_rejects_ephemeral_values_moco_never_sends(
 @pytest.mark.parametrize(
     "ephemeral",
     [
-        {"type": "boolean", "const": True},
+        {"type": "boolean", "const": False},
+        {"type": "boolean", "enum": [False]},
         {"type": "boolean", "enum": [True, False]},
-        {"anyOf": [{"type": "boolean", "const": True}, {"type": "null"}]},
+        {"anyOf": [{"type": "boolean", "const": False}, {"type": "null"}]},
     ],
 )
 def test_thread_start_accepts_ephemeral_values_moco_actually_sends(
@@ -2485,7 +2486,7 @@ def test_thread_start_accepts_ephemeral_values_moco_actually_sends(
 # Arrays compare positionally, and objects compare independently of member order.
 DUPLICATE_ENUM_VALUES = [
     pytest.param(["stay", "stay"], id="repeated-strings"),
-    pytest.param([False, False], id="repeated-booleans"),
+    pytest.param([True, True], id="repeated-booleans"),
     pytest.param([None, None], id="repeated-nulls"),
     pytest.param([1, 1.0], id="one-number-in-two-python-types"),
     pytest.param([[1, "a"], [1, "a"]], id="repeated-arrays"),
@@ -2499,8 +2500,9 @@ DUPLICATE_ENUM_VALUES = [
     ),
 ]
 # Distinct JSON values a bare Python set would wrongly collapse, or would wrongly keep apart.
+# Every sibling excludes the fixed false value, including the distinct true and 1 pair.
 UNIQUE_ENUM_VALUES = [
-    pytest.param([False, 0], id="boolean-and-number-stay-distinct"),
+    pytest.param([True, 1], id="boolean-and-number-stay-distinct"),
     pytest.param([1, 2], id="distinct-numbers"),
     pytest.param(["stay", "leave"], id="distinct-strings"),
     pytest.param([[1, 2], [2, 1]], id="arrays-differing-by-position"),
@@ -2523,7 +2525,7 @@ def test_one_of_sibling_repeating_an_enum_value_keeps_the_fixed_value_unavailabl
 ) -> None:
     """A repeated enum value is unreadable, so the sibling never proves exactly-one match."""
     variant = thread_start_variant(
-        overrides={"ephemeral": {"oneOf": [{"enum": [True]}, {"enum": candidates}]}}
+        overrides={"ephemeral": {"oneOf": [{"enum": [False]}, {"enum": candidates}]}}
     )
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -2540,7 +2542,7 @@ def test_one_of_sibling_with_unique_enum_values_keeps_its_definite_rejection(
 ) -> None:
     """Distinct JSON values stay readable, so the sibling still rejects the value moco sends."""
     variant = thread_start_variant(
-        overrides={"ephemeral": {"oneOf": [{"enum": [True]}, {"enum": candidates}]}}
+        overrides={"ephemeral": {"oneOf": [{"enum": [False]}, {"enum": candidates}]}}
     )
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -2551,7 +2553,7 @@ def test_one_of_sibling_with_unique_enum_values_keeps_its_definite_rejection(
 
 def test_enum_repeating_the_value_moco_sends_makes_the_method_unavailable(tmp_path: Path) -> None:
     """The declaration applies directly to `ephemeral`, and a repeated value cannot be read."""
-    variant = thread_start_variant(overrides={"ephemeral": {"enum": [True, True]}})
+    variant = thread_start_variant(overrides={"ephemeral": {"enum": [False, False]}})
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
     contract = load_generated_contract(tmp_path, version="fake")
@@ -2563,16 +2565,16 @@ def test_enum_repeating_the_value_moco_sends_makes_the_method_unavailable(tmp_pa
 @pytest.mark.parametrize(
     "candidates",
     [
-        pytest.param([True, 1], id="boolean-beside-integer"),
-        pytest.param([True, 1.0], id="boolean-beside-number"),
-        pytest.param([True, "true"], id="boolean-beside-string"),
+        pytest.param([False, 0], id="boolean-beside-integer"),
+        pytest.param([False, 0.0], id="boolean-beside-number"),
+        pytest.param([False, "false"], id="boolean-beside-string"),
     ],
 )
 def test_enum_listing_distinct_json_types_still_admits_the_value_moco_sends(
     tmp_path: Path,
     candidates: list[JsonValue],
 ) -> None:
-    """JSON keeps `true`, `1` and `"true"` apart, so the listed values are unique and readable."""
+    """JSON keeps `false`, `0` and `"false"` apart, so the listed values are unique and readable."""
     variant = thread_start_variant(overrides={"ephemeral": {"enum": candidates}})
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -2588,7 +2590,7 @@ def test_enum_values_nested_beyond_the_reading_budget_stay_undecided(tmp_path: P
         nested_json_value(64, "other"),
     ]
     variant = thread_start_variant(
-        overrides={"ephemeral": {"oneOf": [{"enum": [True]}, {"enum": candidates}]}}
+        overrides={"ephemeral": {"oneOf": [{"enum": [False]}, {"enum": candidates}]}}
     )
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -2616,7 +2618,7 @@ def test_one_of_sibling_with_an_unreadable_enum_never_proves_exactly_one_match(
 ) -> None:
     """A malformed sibling enum may admit the value moco sends, so exactly-one stays unproven."""
     variant = thread_start_variant(
-        overrides={"ephemeral": {"oneOf": [{"enum": [True]}, {"enum": candidates}]}}
+        overrides={"ephemeral": {"oneOf": [{"enum": [False]}, {"enum": candidates}]}}
     )
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -2977,17 +2979,17 @@ def test_one_of_branch_moco_cannot_exclude_keeps_the_method_unavailable(
 @pytest.mark.parametrize(
     "unsupported",
     [
-        {"type": "boolean", "not": {"const": False}},
-        {"type": "boolean", "if": {"const": True}, "then": {"const": True}},
+        {"type": "boolean", "not": {"const": True}},
+        {"type": "boolean", "if": {"const": False}, "then": {"const": False}},
     ],
 )
 def test_one_of_branch_asserting_beyond_the_evaluator_keeps_a_fixed_value_unavailable(
     tmp_path: Path,
     unsupported: dict[str, JsonValue],
 ) -> None:
-    """The fixed `ephemeral` true also satisfies the second branch, so `oneOf` may be violated."""
+    """The fixed `ephemeral` false also satisfies the second branch, so `oneOf` may be violated."""
     variant = thread_start_variant(
-        overrides={"ephemeral": {"oneOf": [{"type": "boolean", "const": True}, unsupported]}}
+        overrides={"ephemeral": {"oneOf": [{"type": "boolean", "const": False}, unsupported]}}
     )
     write_schema_bundle(tmp_path, client_variants=[variant], server_variants=[])
 
@@ -3115,7 +3117,7 @@ def test_one_of_branch_with_a_malformed_type_keeps_a_fixed_value_unavailable(
     tmp_path: Path,
     malformed: dict[str, JsonValue],
 ) -> None:
-    """An unreadable sibling may admit the fixed `ephemeral` true too, so `oneOf` is unproven."""
+    """An unreadable sibling may admit the fixed `ephemeral` false too, so `oneOf` is unproven."""
     variant = thread_start_variant(
         overrides={"ephemeral": {"oneOf": [{"type": "boolean"}, malformed]}}
     )
@@ -4428,7 +4430,7 @@ def write_raw_enum_bundle(bundle: Path, enum_text: str, *, sibling: bool) -> Non
     branch that admits the value moco sends, where only a readable enum proves exactly-one.
     """
     declaration: dict[str, JsonValue] = (
-        {"oneOf": [{"enum": [True]}, {"enum": "__RAW_ENUM__"}]}
+        {"oneOf": [{"enum": [False]}, {"enum": "__RAW_ENUM__"}]}
         if sibling
         else {"enum": "__RAW_ENUM__"}
     )
@@ -4460,8 +4462,8 @@ RAW_DISTINCT_NUMBER_PAIRS = [
     pytest.param("1000, 1e4", id="integer-and-larger-exponent"),
     pytest.param("0, 1e-999", id="zero-and-underflowing-exponent"),
     pytest.param("1, 1.5", id="integer-and-decimal"),
-    pytest.param("false, 0.0", id="boolean-beside-zero"),
-    pytest.param("false, -0.0", id="boolean-beside-negative-zero"),
+    pytest.param("true, 1.0", id="boolean-beside-one"),
+    pytest.param("true, 1e0", id="boolean-beside-exponent"),
     pytest.param(
         "[9007199254740993.0], [9007199254740992.0]",
         id="arrays-of-adjacent-decimals",
@@ -4473,13 +4475,14 @@ RAW_DISTINCT_NUMBER_PAIRS = [
 ]
 # Enum lists that contain the fixed value moco sends beside numbers no rounding may merge.
 RAW_DISTINCT_ENUM_LISTS_WITH_THE_SENT_VALUE = [
-    pytest.param("true, 1.0", id="boolean-beside-number"),
-    pytest.param("true, 1e0", id="boolean-beside-exponent"),
+    pytest.param("false, 0.0", id="boolean-beside-number"),
+    pytest.param("false, -0.0", id="boolean-beside-negative-zero"),
+    pytest.param("false, 0e0", id="boolean-beside-exponent"),
     pytest.param(
-        "true, 9007199254740993.0, 9007199254740992.0",
+        "false, 9007199254740993.0, 9007199254740992.0",
         id="boolean-beside-adjacent-decimals",
     ),
-    pytest.param("true, 0, 1e-999", id="boolean-beside-zero-and-underflowing-exponent"),
+    pytest.param("false, 0, 1e-999", id="boolean-beside-zero-and-underflowing-exponent"),
 ]
 
 
@@ -4503,7 +4506,7 @@ def test_enum_repeating_a_raw_json_number_beside_the_sent_value_is_unreadable(
     pair: str,
 ) -> None:
     """A repeated number makes the whole declaration unreadable, listed value or not."""
-    write_raw_enum_bundle(tmp_path, f"[true, {pair}]", sibling=False)
+    write_raw_enum_bundle(tmp_path, f"[false, {pair}]", sibling=False)
 
     contract = load_generated_contract(tmp_path, version="fake")
 
@@ -4550,7 +4553,7 @@ def test_json_numbers_keep_their_exact_value_through_the_parser() -> None:
 
 def test_a_contract_read_from_exact_numbers_carries_no_parsed_number(tmp_path: Path) -> None:
     """The exact representation stays inside schema reading and never reaches the contract."""
-    write_raw_enum_bundle(tmp_path, "[true, 9007199254740993.0]", sibling=False)
+    write_raw_enum_bundle(tmp_path, "[false, 9007199254740993.0]", sibling=False)
 
     contract = load_generated_contract(tmp_path, version="fake")
 

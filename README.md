@@ -408,7 +408,13 @@ Codex CLI のreadinessを確認してください。
 
 ## プライバシーと観測
 
-文字起こし、音声、生成 speech、プロンプト、コマンド本文、ファイルパスと内容、patch本文、
+Codex セッションは音声会話用・作業用ともに `ephemeral: false` で作成します。
+Codex app-server が通常の Codex と同じ保存方式・設定でセッションデータを保持し、
+通話終了や moco の終了を理由に保存済み履歴を削除しません。保存される内容と保存先は
+利用する Codex の仕様・設定に従います。moco の再接続時に過去の会話を自動再開する機能は
+含みません。
+
+moco 自体は文字起こし、音声、生成 speech、プロンプト、コマンド本文、ファイルパスと内容、patch本文、
 MCP arguments、approval payload、reasoning、アカウント識別子はファイルへ保存しません。
 通常の操作画面、音声、ログ、OpenTelemetry にもこれらの本文を出しません。App Server の
 `ReasoningSummary` を受信しても、その本文は表示しません。通常アクティビティが扱うのは固定した

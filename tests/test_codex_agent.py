@@ -1017,7 +1017,7 @@ async def test_thread_start_uses_explicit_profile_policy(
     params = cast("dict[str, JsonValue]", thread_calls[0][1])
     assert params == {
         "cwd": str(WORKING_DIRECTORY),
-        "ephemeral": True,
+        "ephemeral": False,
         "sandbox": sandbox,
         "approvalPolicy": approval,
     }
@@ -1034,7 +1034,7 @@ async def test_inherit_codex_omits_policy_fields() -> None:
         call for call in connection.calls if call[0] == WIRE_METHODS[SemanticMethod.THREAD_START]
     )
     params = cast("dict[str, JsonValue]", thread_call[1])
-    assert params == {"cwd": str(WORKING_DIRECTORY), "ephemeral": True}
+    assert params == {"cwd": str(WORKING_DIRECTORY), "ephemeral": False}
     await session.close()
 
 
@@ -1144,7 +1144,7 @@ async def test_turn_preserves_exact_text_and_uses_effective_aliases() -> None:
     await session.close()
 
 
-async def test_thread_is_ephemeral_and_continues_across_sequential_turns() -> None:
+async def test_thread_continues_across_sequential_turns() -> None:
     connection = FakeSharedConnection()
     session = make_session(connection)
 

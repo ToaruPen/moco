@@ -1674,10 +1674,10 @@ _CLIENT_SIGNALS: dict[SemanticMethod, _SemanticSignals] = {
 }
 
 _EMPTY_PARAMS = _object_value({})
-# moco always starts ephemeral threads rooted at a runtime working directory. The inherit
+# moco always starts persistent threads rooted at a runtime working directory. The inherit
 # profile omits the policy members; each explicit profile pins one supported policy pair.
 _THREAD_START_BASE: Mapping[str, _Witness] = MappingProxyType(
-    {"cwd": _DYNAMIC_STRING, "ephemeral": _LiteralValue(value=True)}
+    {"cwd": _DYNAMIC_STRING, "ephemeral": _LiteralValue(value=False)}
 )
 _REALTIME_START = _object_value(
     {

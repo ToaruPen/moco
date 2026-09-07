@@ -591,7 +591,7 @@ class CodexRealtimeSession:
     def _thread_params(self) -> dict[str, JsonValue]:
         params: dict[str, JsonValue] = {
             "cwd": str(self._working_directory),
-            "ephemeral": True,
+            "ephemeral": False,
         }
         profile: object = self._settings.agent.profile
         if profile is AgentProfileMode.READ_ONLY:
