@@ -135,7 +135,7 @@ closed.
 
 The adapter starts the ChatGPT.app-bundled `codex app-server` over stdio and
 uses the binary's experimental API capability. Each conversation receives an
-ephemeral thread using the configured profile and a Realtime v3 WebRTC session.
+persistent thread (`ephemeral: false`) using the configured profile and a Realtime v3 WebRTC session.
 Startup context is disabled; moco supplies its complete Realtime conversation,
 Frameless delegation, and Irodori speech contract as the session prompt.
 
@@ -193,10 +193,11 @@ Activity is refreshed by input start/stop, finalized user input, assistant
 output, delegated work progress, synthesis, and playback. The idle timer runs
 only when no listening, delegated work, synthesis, or playback is active.
 
-On expiry, moco closes the Realtime session and ephemeral Codex thread
+On expiry, moco closes the Realtime session and Codex thread
 connection but keeps the operator WebSocket and hotkey service alive. The next
 start-listening operation creates a fresh media and conversation session. No
-prior transcript is automatically injected.
+prior transcript is automatically injected. Stored session history remains managed by Codex;
+closing the connection does not delete it.
 
 ### Irodori adapter
 

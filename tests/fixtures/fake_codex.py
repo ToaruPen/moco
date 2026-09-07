@@ -274,7 +274,7 @@ for line in sys.stdin:
     elif scenario == "interaction" and method == "effective/thread-start":
         if params != {
             "cwd": params.get("cwd"),
-            "ephemeral": True,
+            "ephemeral": False,
             "sandbox": "read-only",
             "approvalPolicy": "never",
         } or not isinstance(params.get("cwd"), str):

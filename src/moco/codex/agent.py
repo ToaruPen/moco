@@ -196,7 +196,7 @@ def _field_admits(value: object, accepted: frozenset[str] | None) -> bool:
 
 
 class AgentSession:
-    """Own one ephemeral Agent thread and one sequential turn at a time.
+    """Own one persistent Agent thread and one sequential turn at a time.
 
     The app-server connection belongs to the composition root. This owner borrows its request
     and notification interfaces, and never starts or closes that shared connection.
@@ -668,7 +668,7 @@ class AgentSession:
     def _thread_params(self) -> dict[str, JsonValue]:
         params: dict[str, JsonValue] = {
             "cwd": str(self._working_directory),
-            "ephemeral": True,
+            "ephemeral": False,
         }
         if self._profile is AgentProfileMode.READ_ONLY:
             params["sandbox"] = "read-only"

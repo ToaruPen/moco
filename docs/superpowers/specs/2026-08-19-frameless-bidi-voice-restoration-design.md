@@ -45,11 +45,12 @@ commentaryとfinalが追加され、同一Threadの一つのturnとして完了�
   渡す。
 - user speech開始時のbarge-in、動的caption、voice catalog、generation、readiness、Reviewer、
   profileを維持する。
-- transcript、音声、credentialを永続化しない。
+- moco独自のtranscript・音声・credential記録は追加しない。Codexのセッション保存はCodex側に任せる。
 
 ## 採用する構成
 
-一つのapp-server接続と一つのephemeral Realtime Threadを会話leaseの所有単位にする。
+一つのapp-server接続と一つの永続化するRealtime Threadを会話leaseの所有単位にする。
+Threadは`ephemeral: false`で作成し、保存済み履歴はlease終了後もCodexの保存方式に従って保持する。
 
 ```text
 Browser microphone
@@ -161,4 +162,4 @@ block align、bit depth、data length、peak、clipping、DC、duration、segmen
 - dynamic caption、barge-in、Reviewer、profile、voice readiness、再接続が回帰しない。
 - `just check`が成功する。
 - 実機でWebRTC音声、Frameless delegation、Codex作業、Irodori synthesis、browser再生を確認する。
-- 診断用一時音声を削除し、audio、transcript、credentialを保存しない。
+- 診断用一時音声を削除し、mocoの診断用audio・transcript・credential記録を残さない。

@@ -608,7 +608,7 @@ async def _started_prompt(rpc: FakeRpc, settings: MocoSettings) -> str:
     return prompt
 
 
-async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> None:
+async def test_starts_persistent_read_only_audio_v3_session(tmp_path: Path) -> None:
     rpc = FakeRpc()
     session = make_session(
         rpc,
@@ -623,7 +623,7 @@ async def test_starts_ephemeral_read_only_audio_v3_session(tmp_path: Path) -> No
         (
             "thread/start",
             {
-                "ephemeral": True,
+                "ephemeral": False,
                 "sandbox": "read-only",
                 "approvalPolicy": "never",
                 "cwd": str(tmp_path),
@@ -664,7 +664,7 @@ async def test_starts_realtime_thread_with_workspace_write_profile(tmp_path: Pat
     assert rpc.requests[0] == (
         "thread/start",
         {
-            "ephemeral": True,
+            "ephemeral": False,
             "sandbox": "workspace-write",
             "approvalPolicy": "on-request",
             "cwd": str(tmp_path),
@@ -691,7 +691,7 @@ async def test_starts_realtime_thread_with_danger_full_access_no_approval_profil
     assert rpc.requests[0] == (
         "thread/start",
         {
-            "ephemeral": True,
+            "ephemeral": False,
             "sandbox": "danger-full-access",
             "approvalPolicy": "never",
             "cwd": str(tmp_path),
@@ -715,7 +715,7 @@ async def test_starts_realtime_thread_with_inherited_codex_profile(tmp_path: Pat
 
     assert rpc.requests[0] == (
         "thread/start",
-        {"ephemeral": True, "cwd": str(tmp_path)},
+        {"ephemeral": False, "cwd": str(tmp_path)},
     )
     await session.close()
 

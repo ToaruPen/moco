@@ -66,7 +66,7 @@ Computer Useのようにホスト側実装を要する能力は、Codex Desktop�
 - CloudflareまたはTailscale経由の遠隔承認
 - 遠隔画面を使ったComputer Use
 - Codex Desktopの非公開実装、バンドル内部契約、private IPCの複製
-- 長期記憶、会話をまたぐRealtime Thread永続化、transcript保存
+- 長期記憶、過去Realtime Threadの自動再開、moco独自のtranscript保存
 - Windows ServiceまたはScheduled Taskによる自動起動
 - 音声だけによる破壊的操作の承認
 - `inherit_codex` が global 設定から `danger-full-access` と `approvalPolicy=never` を継承する音声起動turn
@@ -79,7 +79,7 @@ BrowserとComputer Useのホストアダプターは後続段階で扱う。本�
 
 ### 採用: 一つのapp-server接続と一つのRealtime Thread
 
-一つのapp-serverプロセスと双方向RPC接続を共有し、ephemeralなRealtime Threadを会話leaseの
+一つのapp-serverプロセスと双方向RPC接続を共有し、永続化するRealtime Threadを会話leaseの
 所有単位にする。`clientManagedHandoffs: false`でFrameless Bidiの自動delegationを使い、Codexの
 commentaryとfinalを同じ会話へ返す。設定、承認、進捗、接続監視、能力発見もこのThreadへ結び付ける。
 
@@ -292,16 +292,21 @@ mocoが自動実行しない。
 
 ### threadの所有権
 
-app-server接続ごとにephemeralなRealtime Threadを一つ作る。Realtimeはmicrophone音声、VAD、
+app-server接続ごとに`ephemeral: false`のRealtime Threadを一つ作る。Realtimeはmicrophone音声、VAD、
 transcript、会話文脈を所有し、必要な作業をCodexへ自動delegationする。mocoはuser transcriptを
 別Agent Threadへ渡さず、Codex結果を`appendText`や`appendSpeech`で再注入しない。
+
+セッションデータの保存は通常のCodexと同じくapp-serverが所有する。会話leaseの終了は
+保存済み履歴の削除を意味しない。独立したAgent Threadを作る経路も同じく永続化する。
+mocoによる過去Threadの自動再開や長期記憶の取り込みは、この保存方針には含めない。
 
 `delegationAckFiller: true`によりacknowledgementを有効にし、`codexResponseHandoffMode: "bemTags"`で
 commentaryとfinalを同じ会話へ戻す。`codexResponsesAsItems: false`とし、読み上げのsource of truthは
 Realtimeのassistant transcriptだけにする。
 
 Realtime Threadは同じmoco会話中で継続する。Voice接続だけを張り直す場合も同じapp-server接続と
-Threadを維持し、daemon再起動や会話終了を越えて保存しない。
+Threadを維持する。daemon再起動や会話終了後も履歴はCodex側に保存されるが、mocoは
+過去のThreadを自動再開しない。
 
 ### 状態model
 
